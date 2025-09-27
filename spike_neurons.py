@@ -399,6 +399,9 @@ class PLIFNode(BaseNode):
 
         self.neuro_states_init = False
 
+    def detach(self):
+        self.v = self.v.detach()
+    
     def forward(self, dv: torch.Tensor, time_step):
         if time_step == 0:
             if self.neuro_states_init == False:
