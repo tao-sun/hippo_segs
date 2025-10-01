@@ -312,9 +312,9 @@ class ConvBlock(nn.Module):
             nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
+            # nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+            # nn.BatchNorm2d(out_ch),
+            # nn.ReLU(inplace=True),
         )
         self.dropout = dropout
 
@@ -450,7 +450,8 @@ def dice_per_channel(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6
 def train_one_epoch(model, loader, opt, device, lambda_bce, lambda_dice, grad_clip: Optional[float] = None):
     model.train()
     running = 0.0
-    for x, y in tqdm(loader, desc="train", leave=False):
+    pbar = tqdm(loader, desc=f"train")
+    for x, y in pbar:
         x = x.to(device)  # (B,4,H,W)
         y = y.to(device)  # (B,3,H,W)
         opt.zero_grad(set_to_none=True)
@@ -461,6 +462,7 @@ def train_one_epoch(model, loader, opt, device, lambda_bce, lambda_dice, grad_cl
             nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         opt.step()
         running += loss.item() * x.size(0)
+        pbar.set_postfix({'loss': f"{loss.item():.4f}"})
     return running / len(loader.dataset)
 
 
