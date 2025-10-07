@@ -10,6 +10,8 @@ import numpy as np
 import nibabel as nib
 from tqdm import tqdm
 
+from PIL import Image
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -181,13 +183,16 @@ class BratsVolumeDataset(Dataset):
         # images
         D = len(next(iter(img_paths_by_mod.values())))
         frames = []
-        from PIL import Image
         for i in range(D):
             chans = []
             for m in MOD_ORDER:
-                t = np.array(Image.open(img_paths_by_mod[m][i]).convert("L"), dtype=np.float32) / 255.0
+                path = img_paths_by_mod[m][i]
+                # ensure file is closed after loading
+                with Image.open(path) as im:
+                    im = im.convert("L")
+                    t = np.array(im, dtype=np.float32) / 255.0
                 chans.append(t)
-            frames.append(np.stack(chans, axis=0))      # (4,H,W)
+            frames.append(np.stack(chans, axis=0))
         xs = np.stack(frames, axis=0)                   # (S,4,H,W)
 
         return torch.from_numpy(xs).float(), torch.from_numpy(ys).float(), {"sid": subj_dir.name, "xyz": xyz}
@@ -512,14 +517,16 @@ if __name__ == "__main__":
     # weight_decay = 1e-5
     # grad_clip = 1.0
     # Adam
-    lr = 0.01
+    lr = 0.001
     rho = None
     eps = None
     weight_decay = None
     grad_clip = None
     
-    # TBPTT window
-    k = 1  # number of slices per window
+    # FPTT
+    k = 1  # number of slices per window, not number of updates
+    alpha = 0.5
+
 
     # loss weights: L = λ_bce * BCEWithLogits + λ_dice * SoftDice
     lambda_bce = 0.5
@@ -542,6 +549,7 @@ if __name__ == "__main__":
         "weight_decay": weight_decay,
         "grad_clip": grad_clip,
         "tbptt_k": k,
+        "alpha": alpha,
         "lambda_bce": lambda_bce,
         "lambda_dice": lambda_dice,
         "eval_every": eval_every,
@@ -586,7 +594,7 @@ if __name__ == "__main__":
     print(f"Train subjects: {len(train_ds)} | Val subjects: {len(val_ds)}")
 
     train_loader = DataLoader(train_ds, batch_size=batch_size_subjects, shuffle=True,
-                              num_workers=4, pin_memory=True, drop_last=False)
+                              num_workers=2, pin_memory=False, drop_last=False)
     val_loader   = DataLoader(val_ds, batch_size=1, shuffle=False,
                               num_workers=2, pin_memory=True)
 
@@ -612,7 +620,7 @@ if __name__ == "__main__":
         print(f"\nEpoch {epoch}/{epochs}")
         tr_loss = train_epoch_snn_tbptt(model, train_loader, optimizer, device,
                                 k, lambda_bce, lambda_dice,
-                                grad_clip, spkmon)
+                                grad_clip, spkmon, alpha)
         scheduler.step(tr_loss)
         print(f"  train_loss: {tr_loss:.4f}")
 
