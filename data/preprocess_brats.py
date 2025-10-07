@@ -5,21 +5,21 @@ import json
 from pathlib import Path
 import numpy as np
 import nibabel as nib
-
+from tqdm import tqdm
 try:
     import imageio.v2 as imageio
 except Exception:
     import imageio
 
 # ==================== CONFIG ====================
-IN_ROOT  = Path("BRATS2017")                 # <- change me
-OUT_ROOT = Path("BRATS2017_preprocessed")    # <- will be created
+IN_ROOT  = Path(r"C:\Users\Aurora Pia Ghiardell\Downloads\\archive\BRATS2017")                 # <- change me
+OUT_ROOT = Path(r"C:\Users\Aurora Pia Ghiardell\Downloads\BRATS2017_preprocessed")
 TRAIN_DIR_NAME = "Brats17TrainingData"
 HGG_DIR_NAME   = "HGG"                                 # ONLY process HGG
 TARGET_SHAPE   = (160, 192, 152)                       # (x,y,z)
 SEED           = 2025                                  # 5-fold split seed
 FOLD_NAMES     = ["1", "2", "3", "4", "5"]
-# =================================================
+# =========================IN_ROOT  = Path(r"C:\Users\Aurora Pia Ghiardell\Downloads\archive\BRATS2017")
 
 def center_crop3d(arr: np.ndarray, tgt=(160,192,152)) -> np.ndarray:
     assert arr.ndim == 3
@@ -78,6 +78,9 @@ def save_png_views(norm_vol: np.ndarray, subject_out_dir: Path, stem: str) -> No
         imageio.imwrite(str(dir_axi / f"{stem}_axial_{i:03d}.png"), img)
 
 def process_modality_to_pngs(mod_path: Path, subject_out_dir: Path) -> None:
+    if mod_path.stat().st_size == 0:
+        print(f"[Warn] Empty file: {mod_path}")
+        return
     img = nib.load(str(mod_path))
     data = img.get_fdata(dtype=np.float32)               # load as float32
     cropped = center_crop3d(data, TARGET_SHAPE)
@@ -165,12 +168,12 @@ def main():
     count_mod = 0
     count_seg = 0
 
-    for fold_name, subj_dirs in folds.items():
+    for fold_name, subj_dirs in tqdm(folds.items()):
         print(f"Fold {fold_name} started")
         fold_out_root = out_train_root / fold_name
         fold_out_root.mkdir(parents=True, exist_ok=True)
 
-        for subj_dir in subj_dirs:
+        for subj_dir in tqdm(subj_dirs):
             subject_out_dir = fold_out_root / subj_dir.name
 
             # Segmentation first
