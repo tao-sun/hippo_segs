@@ -497,10 +497,10 @@ def evaluate_3d_snn(model,
 # -----------------------------
 if __name__ == "__main__":
     # ---- Config (edit here) ----
-    data_root = "data/BRATS2017_preprocessed/Brats17TrainingData"
+    data_root = "/home/apiaghiardelli/Brats17TrainingData"
 
     val_fold = 1              # int in {1..5}, used as validation
-    view = "axial"            # 'sagittal' | 'coronal' | 'axial'
+    view = "coronal"            # 'sagittal' | 'coronal' | 'axial'
 
     # training
     epochs = 100

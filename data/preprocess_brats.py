@@ -18,7 +18,9 @@ TRAIN_DIR_NAME = "Brats17TrainingData"
 HGG_DIR_NAME   = "HGG"                                 # ONLY process HGG
 TARGET_SHAPE   = (160, 192, 152)                       # (x,y,z)
 SEED           = 2025                                  # 5-fold split seed
+# FOLD_NAMES     = ["1", "2", "3", "4", "5"]
 FOLD_NAMES     = ["1", "2", "3", "4", "5"]
+
 # =========================IN_ROOT  = Path(r"C:\Users\Aurora Pia Ghiardell\Downloads\archive\BRATS2017")
 
 def center_crop3d(arr: np.ndarray, tgt=(160,192,152)) -> np.ndarray:
