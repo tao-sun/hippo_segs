@@ -551,8 +551,8 @@ if __name__ == "__main__":
     lr = 0.001
     rho = None
     eps = None
-    weight_decay = None
-    grad_clip = None
+    weight_decay = 1e-5
+    grad_clip = 0.3
     
     # FPTT
     k = 1  # number of slices per window, not number of updates
