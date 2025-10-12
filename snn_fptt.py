@@ -2,6 +2,7 @@
 # dnn_3ch.py — SNN (TBPTT) 2D-train / 3D-eval for BraTS (ET/TC/WT multilabel)
 
 import os
+import random
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 import json
@@ -20,6 +21,36 @@ from torch.utils.data import Dataset, DataLoader, ConcatDataset
 # ==== use your spiking UNet-like model ====
 # SNNBraTS: forward(x_win[B,k,4,H,W], t0) -> (B, out_channels, k, H, W)
 from model import SNNBraTS  # mirrors your SNN implementation with PLIF nodes
+
+# ------------------ SEEDING ------------------
+SEED = 2025
+
+# Python random
+random.seed(SEED)
+
+# NumPy
+np.random.seed(SEED)
+
+# PyTorch
+torch.manual_seed(SEED)
+torch.cuda.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+
+# Make sure deterministic algorithms are used
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+torch.use_deterministic_algorithms(True, warn_only=True)
+
+# Ensure reproducible hashing (affects dataloader shuffling, etc.)
+os.environ["PYTHONHASHSEED"] = str(SEED)
+
+# For dataloaders with multiple workers
+def seed_worker(worker_id):
+    worker_seed = SEED + worker_id
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+# --------------------------------------------
+
 
 # -----------------------------
 # Constants & helpers
@@ -505,7 +536,7 @@ if __name__ == "__main__":
     data_root = "data/BRATS2017_preprocessed/Brats17TrainingData"
 
     val_fold = 1              # int in {1..5}, used as validation
-    view = "axial"            # 'sagittal' | 'coronal' | 'axial'
+    view = "coronal"            # 'sagittal' | 'coronal' | 'axial'
 
     # training
     epochs = 100
@@ -593,8 +624,16 @@ if __name__ == "__main__":
     val_ds = BratsVolumeDataset(root=data_root, val_fold=val_fold, view=view)
     print(f"Train subjects: {len(train_ds)} | Val subjects: {len(val_ds)}")
 
+    # seeded train loader
+    g = torch.Generator()
+    g.manual_seed(SEED)
+
     train_loader = DataLoader(train_ds, batch_size=batch_size_subjects, shuffle=True,
-                              num_workers=2, pin_memory=False, drop_last=False)
+                              num_workers=2, pin_memory=False, drop_last=False,
+                              worker_init_fn=seed_worker, generator=g)
+
+    # train_loader = DataLoader(train_ds, batch_size=batch_size_subjects, shuffle=True,
+    #                           num_workers=2, pin_memory=False, drop_last=False)
     val_loader   = DataLoader(val_ds, batch_size=1, shuffle=False,
                               num_workers=2, pin_memory=True)
 
