@@ -536,7 +536,7 @@ if __name__ == "__main__":
     data_root = "data/BRATS2017_preprocessed/Brats17TrainingData"
 
     val_fold = 1              # int in {1..5}, used as validation
-    view = "coronal"            # 'sagittal' | 'coronal' | 'axial'
+    view = "sagittal"            # 'sagittal' | 'coronal' | 'axial'
 
     # training
     epochs = 100
@@ -556,8 +556,10 @@ if __name__ == "__main__":
     
     # FPTT
     k = 1  # number of slices per window, not number of updates
-    alpha = 0.5
-
+    alpha_fptt = 0.1
+    beta_fptt = 0.15
+    rho_fptt = 0.0
+    lambda_fptt = 1.5
 
     # loss weights: L = λ_bce * BCEWithLogits + λ_dice * SoftDice
     lambda_bce = 0.5
@@ -580,7 +582,10 @@ if __name__ == "__main__":
         "weight_decay": weight_decay,
         "grad_clip": grad_clip,
         "tbptt_k": k,
-        "alpha": alpha,
+        "alpha_fptt": alpha_fptt,
+        "beta_fptt": beta_fptt,
+        "rho_fptt" : rho_fptt,
+        "lambda_fptt": lambda_fptt,
         "lambda_bce": lambda_bce,
         "lambda_dice": lambda_dice,
         "eval_every": eval_every,
@@ -651,6 +656,7 @@ if __name__ == "__main__":
 
     # ---- Train/Eval Loop ----
     best_dice = -1.0
+    best_dice_epoch = 0
     
     # ---- fptt ----
     init_running_params(model)
@@ -659,7 +665,9 @@ if __name__ == "__main__":
         print(f"\nEpoch {epoch}/{epochs}")
         tr_loss = train_epoch_snn_tbptt(model, train_loader, optimizer, device,
                                 k, lambda_bce, lambda_dice,
-                                grad_clip, spkmon, alpha)
+                                grad_clip, spkmon, 
+                                alpha_fptt, beta_fptt,
+                                rho_fptt, lambda_fptt)
         scheduler.step(tr_loss)
         print(f"  train_loss: {tr_loss:.4f}")
 
@@ -682,6 +690,7 @@ if __name__ == "__main__":
             # save best checkpoint
             if metrics["dice_mean"] > best_dice:
                 best_dice = metrics["dice_mean"]
+                best_dice_epoch = epoch
                 ckpt_path = f"checkpoint_snn_fold{val_fold}_{view}.pt"
                 torch.save({
                     "model": model.state_dict(),
@@ -691,4 +700,5 @@ if __name__ == "__main__":
                 }, ckpt_path)
                 print(f"  Saved best model -> {ckpt_path}")
 
+    print(f"\nBest dice: {best_dice}, epoch {best_dice_epoch}")  
     print("Done.")
