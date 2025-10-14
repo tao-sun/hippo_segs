@@ -10,6 +10,7 @@ import json
 import numpy as np
 import nibabel as nib
 from tqdm import tqdm
+from datetime import datetime
 
 from PIL import Image
 
@@ -532,6 +533,9 @@ def evaluate_3d_snn(model,
 # Main / Config
 # -----------------------------
 if __name__ == "__main__":
+    start_time = datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
+    print(f"Start time: {start_time}")
+    
     # ---- Config (edit here) ----
     data_root = "data/BRATS2017_preprocessed/Brats17TrainingData"
 
@@ -691,7 +695,7 @@ if __name__ == "__main__":
             if metrics["dice_mean"] > best_dice:
                 best_dice = metrics["dice_mean"]
                 best_dice_epoch = epoch
-                ckpt_path = f"checkpoint_snn_fold{val_fold}_{view}.pt"
+                ckpt_path = f"checkpoints/checkpoint_snn_fold{val_fold}_{view}_{start_time}.pt"
                 torch.save({
                     "model": model.state_dict(),
                     "epoch": epoch,
@@ -700,5 +704,8 @@ if __name__ == "__main__":
                 }, ckpt_path)
                 print(f"  Saved best model -> {ckpt_path}")
 
-    print(f"\nBest dice: {best_dice}, epoch {best_dice_epoch}")  
+    print(f"\nBest dice: {best_dice}, epoch {best_dice_epoch}")
+    
+    end_time = datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
+    print(f"End time: {end_time}")
     print("Done.")
