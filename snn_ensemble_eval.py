@@ -109,7 +109,7 @@ def infer_view_volumes_and_metrics(
     loader = DataLoader(dset, batch_size=1, shuffle=False, num_workers=2, pin_memory=True)
     results: Dict[str, Dict[str, np.ndarray | float]] = {}
 
-    for xs, ys, meta in tqdm(loader, desc=f"eval_{view}", leave=False):
+    for xs, ys, meta in tqdm(loader, desc=f"eval_{view}", leave=True):
         # (1,S,4,H,W), (1,S,3,H,W)
         xs = xs.to(device)
         S = xs.shape[1]
@@ -292,13 +292,25 @@ def main():
 
     if overall_ens_means:
         def _m(arrs): return np.stack(arrs, axis=0).mean(axis=0)
+        def _std(arrs): return np.stack(arrs, axis=0).std(axis=0)
 
         print("\n========== Overall (across folds) ==========")
         for tag in ["sag", "cor", "axi", "ens"]:
             m = _m(overall_view_sums[tag])
-            n = np.mean(overall_view_nlls[tag])
-            print(f"{tag.upper():>7} Dice: ET={m[0]:.4f} TC={m[1]:.4f} WT={m[2]:.4f}  NLL={n:.5f}")
-        print(f"Ensemble MEAN Dice across folds: {np.mean(overall_ens_means):.4f}")
+            s = _std(overall_view_sums[tag])
+            n_mean = np.mean(overall_view_nlls[tag])
+            n_std = np.std(overall_view_nlls[tag])
+            print(
+                f"{tag.upper():>7} Dice: "
+                f"ET={m[0]:.4f}±{s[0]:.4f}  "
+                f"TC={m[1]:.4f}±{s[1]:.4f}  "
+                f"WT={m[2]:.4f}±{s[2]:.4f}  "
+                f"NLL={n_mean:.5f}±{n_std:.5f}"
+            )
+
+        ens_mean = np.mean(overall_ens_means)
+        ens_std = np.std(overall_ens_means)
+        print(f"\nEnsemble MEAN Dice across folds: {ens_mean:.4f} ± {ens_std:.4f}")
 
 
 if __name__ == "__main__":

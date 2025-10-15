@@ -3,6 +3,7 @@
 
 import os
 import random
+import argparse
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 import json
@@ -533,14 +534,21 @@ def evaluate_3d_snn(model,
 # Main / Config
 # -----------------------------
 if __name__ == "__main__":
-    start_time = datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
+    start_time = datetime.now().strftime("%Y%m%d_%H%M%S")
     print(f"Start time: {start_time}")
-    
+
+    ap = argparse.ArgumentParser(description="3-view SNN training.")
+    ap.add_argument("--val-fold", type=int, required=True,
+                    help="1,2,3,4,5")
+    ap.add_argument("--view", type=str, required=True,
+                    help="'sagittal', 'coronal','axial'")
+    args = ap.parse_args()
+
     # ---- Config (edit here) ----
     data_root = "data/BRATS2017_preprocessed/Brats17TrainingData"
 
-    val_fold = 1              # int in {1..5}, used as validation
-    view = "sagittal"            # 'sagittal' | 'coronal' | 'axial'
+    val_fold = args.val_fold              # int in {1..5}, used as validation
+    view = args.view            # 'sagittal' | 'coronal' | 'axial'
 
     # training
     epochs = 100
@@ -706,6 +714,6 @@ if __name__ == "__main__":
 
     print(f"\nBest dice: {best_dice}, epoch {best_dice_epoch}")
     
-    end_time = datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
+    end_time = datetime.now().strftime("%Y%m%d_%H%M%S")
     print(f"End time: {end_time}")
     print("Done.")
