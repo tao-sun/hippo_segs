@@ -22,7 +22,7 @@ from torch.utils.data import Dataset, DataLoader, ConcatDataset
 
 # ==== use your spiking UNet-like model ====
 # SNNBraTS: forward(x_win[B,k,4,H,W], t0) -> (B, out_channels, k, H, W)
-from model import SNNBraTS  # mirrors your SNN implementation with PLIF nodes
+from model import SNNBraTS, SNNBraTSDeep  # mirrors your SNN implementation with PLIF nodes
 
 # ------------------ SEEDING ------------------
 SEED = 2025
@@ -542,6 +542,8 @@ if __name__ == "__main__":
                     help="1,2,3,4,5")
     ap.add_argument("--view", type=str, required=True,
                     help="'sagittal', 'coronal','axial'")
+    ap.add_argument("--model", choices=["orig", "deep"], default="orig",
+                    help="Choose the BraTS model architecture")
     args = ap.parse_args()
 
     # ---- Config (edit here) ----
@@ -657,7 +659,10 @@ if __name__ == "__main__":
     print(f"Loss weights -> lambda_bce={lambda_bce}, lambda_dice={lambda_dice}")
 
     # ---- Model/Optim ----
-    model = SNNBraTS(out_channels=3).to(device)  # ET/TC/WT
+    if args.model == "orig":
+        model = SNNBraTS(out_channels=3).to(device)  # ET/TC/WT
+    elif args.model == "deep":
+        model = SNNBraTSDeep(out_channels=3).to(device)  # ET/TC/WT
     # optimizer = torch.optim.Adadelta(model.parameters(), lr=lr, rho=rho, eps=eps, weight_decay=weight_decay)
     
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
