@@ -1,9 +1,45 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 import surrogate
 from spike_neurons import PLIFNode
+
+
+def print_model_info(model: nn.Module):
+    """
+    Print a concise summary of the model, similar to PyTorch Lightning,
+    but without input/output shapes. Shows parameter counts with K/M units.
+    """
+    def human_readable(num):
+        if num >= 1e6:
+            return f"{num/1e6:.2f} M"
+        elif num >= 1e3:
+            return f"{num/1e3:.2f} K"
+        return str(num)
+
+    print("=" * 60)
+    print(f"{'Layer (type)':35s} {'Param #':>12s}")
+    print("=" * 60)
+    total_params = 0
+    trainable_params = 0
+
+    for name, module in model.named_modules():
+        # Skip container modules
+        if len(list(module.children())) > 0 and not isinstance(module, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)):
+            continue
+
+        params = sum(p.numel() for p in module.parameters() if p.requires_grad)
+        if params > 0:
+            print(f"{name:35s} {human_readable(params):>12s}")
+            total_params += params
+            trainable_params += params
+
+    print("=" * 60)
+    print(f"{'Total trainable params:':35s} {human_readable(trainable_params):>12s}")
+    print("=" * 60)
 
 
 class ConvBlock(nn.Module):
@@ -141,160 +177,158 @@ class SNNBraTS(nn.Module):
                 m.detach()
 
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+# ───────── helpers (shared) ─────────
+def _pad_needed(H: int, W: int, multiple: int):
+    return (multiple - (H % multiple)) % multiple, (multiple - (W % multiple)) % multiple
 
-# Reuses your existing ConvBlock and DeconvBlock definitions
+def _pad_rb(x: torch.Tensor, ph: int, pw: int):
+    return x if (ph | pw) == 0 else F.pad(x, (0, pw, 0, ph))  # (left,right,top,bottom)
 
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-# NOTE: This class REUSES your existing ConvBlock and DeconvBlock from model.py
-# (the ones that use GroupNorm + PLIFNode). Do NOT redefine them here.
-# Just import/keep them in the same module and put this class below them.
-
-
-class SNNBraTSDeep(nn.Module):
+# =========================
+# Deep U-Net — 4 pools (×16)
+# =========================
+class SNNBraTSUNetDeep(nn.Module):
     """
-    Deeper variant of your *original* SNNBraTS that robustly accepts ANY H×W.
-
-    Strategy (systematic + size-agnostic):
-      1) Compute the number of pooling operations (num_pools). For this deeper
-         model we use 5 pools (→ bottleneck 512). Required stride multiple M=2**num_pools=32.
-      2) For each window slice, pad on the *right* and *bottom* so (H,W) become
-         multiples of M. This guarantees exact halves/doubles through pool/deconv.
-      3) Run the network unchanged (no per-level padding/cropping needed).
-      4) After the classifier, crop logits back to the original (H,W).
-
-    Input (windowed):
-        x_win: (B, k, 4, H, W)
-        t0   : absolute start time (no neuron reset inside the window)
-    Output:
-        logits: (B, out_channels, k, H, W)
+    L1: 32→32 | pool
+    L2: 64→64 | pool
+    L3: 128→128 | pool
+    L4: 256→256 | pool
+    Bottom: 512→512
+    Up: 512→256 →128 →64 →32 (skip x4,x3,x2,x1), head 1×1
     """
-    def __init__(self, out_channels: int = 4, dropout: float = 0.1, num_pools: int = 5):
+    def __init__(self, out_channels: int = 4, dropout: float = 0.1):
         super().__init__()
-        assert num_pools >= 1, "num_pools must be >= 1"
-        self.out_channels = int(out_channels)
-        self.num_pools = int(num_pools)
-        self.multiple = 2 ** self.num_pools  # e.g., 32 for 5 pools
+        self.out_channels, self.multiple = int(out_channels), 16
+        # encoder
+        self.enc1a = ConvBlock(4,   32, padding=1, dropout=dropout); self.enc1b = ConvBlock(32,  32, padding=1, dropout=dropout)
+        self.enc2a = ConvBlock(32,  64, padding=1, dropout=dropout); self.enc2b = ConvBlock(64,  64, padding=1, dropout=dropout)
+        self.enc3a = ConvBlock(64, 128, padding=1, dropout=dropout); self.enc3b = ConvBlock(128,128, padding=1, dropout=dropout)
+        self.enc4a = ConvBlock(128,256, padding=1, dropout=dropout); self.enc4b = ConvBlock(256,256, padding=1, dropout=dropout)
+        self.pool = nn.MaxPool2d(2,2)
+        # bottom
+        self.bot_a = ConvBlock(256,512, padding=1, dropout=dropout); self.bot_b = ConvBlock(512,512, padding=1, dropout=dropout)
+        # decoder
+        self.up4   = DeconvBlock(512,256,dropout=dropout); self.dec4a = ConvBlock(256+256,256,padding=1,dropout=dropout); self.dec4b = ConvBlock(256,256,padding=1,dropout=dropout)
+        self.up3   = DeconvBlock(256,128,dropout=dropout); self.dec3a = ConvBlock(128+128,128,padding=1,dropout=dropout); self.dec3b = ConvBlock(128,128,padding=1,dropout=dropout)
+        self.up2   = DeconvBlock(128, 64,dropout=dropout); self.dec2a = ConvBlock( 64+ 64, 64,padding=1,dropout=dropout); self.dec2b = ConvBlock( 64, 64,padding=1,dropout=dropout)
+        self.up1   = DeconvBlock( 64, 32,dropout=dropout); self.dec1a = ConvBlock( 32+ 32, 32,padding=1,dropout=dropout); self.dec1b = ConvBlock( 32, 32,padding=1,dropout=dropout)
+        self.class_conv = ConvBlock(32, self.out_channels, kernel_size=1, padding=0, dropout=0.0, normalization=False, spiking=False)
 
-        # ---------------- Encoder (single conv per level) ----------------
-        # Channels: 32 → 64 → 128 → 256 → 512 (5 levels before bottom out)
-        self.conv_block1 = ConvBlock(4,   32, padding=1, dropout=dropout)
-        self.conv_block2 = ConvBlock(32,  64, padding=1, dropout=dropout)
-        self.conv_block3 = ConvBlock(64, 128, padding=1, dropout=dropout)
-        self.conv_block4 = ConvBlock(128,256, padding=1, dropout=dropout)
-        self.conv_block5 = ConvBlock(256,512, padding=1, dropout=dropout)
-        self.pool = nn.MaxPool2d(2, 2)
-
-        # ---------------- Decoder (mirror; keep 512 like your original kept 128) ----------------
-        self.deconv_block1 = DeconvBlock(512, 512, dropout=dropout)
-        self.deconv1_conv  = ConvBlock(512, 512, padding=1, dropout=dropout)
-        self.concat1_conv  = ConvBlock(512 + 256, 512, padding=1, dropout=dropout)
-
-        self.deconv_block2 = DeconvBlock(512, 512, dropout=dropout)
-        self.deconv2_conv  = ConvBlock(512, 512, padding=1, dropout=dropout)
-        self.concat2_conv  = ConvBlock(512 + 128, 512, padding=1, dropout=dropout)
-
-        self.deconv_block3 = DeconvBlock(512, 512, dropout=dropout)
-        self.deconv3_conv  = ConvBlock(512, 512, padding=1, dropout=dropout)
-        self.concat3_conv  = ConvBlock(512 +  64, 512, padding=1, dropout=dropout)
-
-        self.deconv_block4 = DeconvBlock(512, 512, dropout=dropout)
-        self.deconv4_conv  = ConvBlock(512, 512, padding=1, dropout=dropout)
-        self.concat4_conv  = ConvBlock(512 +  32, 512, padding=1, dropout=dropout)
-
-        self.deconv_block5 = DeconvBlock(512, 512, dropout=dropout)
-        self.deconv5_conv  = ConvBlock(512, 512, padding=1, dropout=dropout)
-
-        # ---------------- Classifier (non-spiking) ----------------
-        self.class_conv = ConvBlock(
-            512, self.out_channels,
-            padding=1, dropout=0.0,
-            normalization=False, spiking=False
-        )
-
-    # ---------------- internal helpers ----------------
-    @staticmethod
-    def _pad_right_bottom(x: torch.Tensor, pad_h: int, pad_w: int) -> torch.Tensor:
-        """Pad (right,bottom) only to keep alignment semantics of U-Net-style models."""
-        if pad_h == 0 and pad_w == 0:
-            return x
-        return F.pad(x, (0, pad_w, 0, pad_h))  # (left,right,top,bottom)
-
-    def _required_padding(self, H: int, W: int) -> tuple[int, int]:
-        M = self.multiple
-        pad_h = (M - (H % M)) % M
-        pad_w = (M - (W % M)) % M
-        return pad_h, pad_w
-
-    # ---------------- forward (windowed; size-agnostic) ----------------
     def forward(self, x_win: torch.Tensor, t0: int = 0) -> torch.Tensor:
-        B, k, C, H, W = x_win.shape
-        pad_h, pad_w = self._required_padding(H, W)  # compute ONCE per window
-        Hp, Wp = H + pad_h, W + pad_w
-
-        logits = []
+        B,k,C,H,W = x_win.shape
+        ph,pw = _pad_needed(H,W,self.multiple)
+        logits=[]
         for i in range(k):
-            time_step = t0 + i
-            x = x_win[:, i, :, :, :]                    # (B,4,H,W)
-            if pad_h or pad_w:
-                x = self._pad_right_bottom(x, pad_h, pad_w)  # (B,4,Hp,Wp)
+            t=t0+i; x = x_win[:,i];  x = _pad_rb(x,ph,pw)
+            x1=self.enc1a(x,t); x1=self.enc1b(x1,t); p1=self.pool(x1)
+            x2=self.enc2a(p1,t); x2=self.enc2b(x2,t); p2=self.pool(x2)
+            x3=self.enc3a(p2,t); x3=self.enc3b(x3,t); p3=self.pool(x3)
+            x4=self.enc4a(p3,t); x4=self.enc4b(x4,t); p4=self.pool(x4)
+            xb=self.bot_a(p4,t); xb=self.bot_b(xb,t)
+            y4=self.up4(xb,t); y4=torch.cat([x4,y4],1); y4=self.dec4a(y4,t); y4=self.dec4b(y4,t)
+            y3=self.up3(y4,t); y3=torch.cat([x3,y3],1); y3=self.dec3a(y3,t); y3=self.dec3b(y3,t)
+            y2=self.up2(y3,t); y2=torch.cat([x2,y2],1); y2=self.dec2a(y2,t); y2=self.dec2b(y2,t)
+            y1=self.up1(y2,t); y1=torch.cat([x1,y1],1); y1=self.dec1a(y1,t); y1=self.dec1b(y1,t)
+            out=self.class_conv(y1,t); out=out[...,:H,:W]; logits.append(out)
+        return torch.stack(logits,2)
 
-            # -------- Encoder --------
-            x1 = self.conv_block1(x, time_step)     # (B,32,Hp,Wp)
-            p1 = self.pool(x1)                      # (B,32,Hp/2,Wp/2)
+    def detach_states(self): 
+        for m in self.modules():
+            if hasattr(m,"detach") and callable(m.detach): m.detach()
 
-            x2 = self.conv_block2(p1, time_step)    # (B,64,Hp/2,Wp/2)
-            p2 = self.pool(x2)                      # (B,64,Hp/4,Wp/4)
 
-            x3 = self.conv_block3(p2, time_step)    # (B,128,Hp/4,Wp/4)
-            p3 = self.pool(x3)                      # (B,128,Hp/8,Wp/8)
+# =========================
+# 4L U-Net — 3 pools (×8)
+# =========================
+class SNNBraTSUNetMedium(nn.Module):
+    """
+    L1: 32→32 | pool
+    L2: 64→64 | pool
+    L3: 128→128 | pool
+    L4: 256→256 (NO pool)  ← 4 layers, 3 pools total
+    Bottom: 512→512
+    Up: 512→128 →64 →32 (skips x3,x2,x1). L4 acts as extra capacity at H/8.
+    """
+    def __init__(self, out_channels: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.out_channels, self.multiple = int(out_channels), 8
+        # encoder
+        self.enc1a = ConvBlock(4,   32, padding=1, dropout=dropout); self.enc1b = ConvBlock(32,  32, padding=1, dropout=dropout)
+        self.enc2a = ConvBlock(32,  64, padding=1, dropout=dropout); self.enc2b = ConvBlock(64,  64, padding=1, dropout=dropout)
+        self.enc3a = ConvBlock(64, 128, padding=1, dropout=dropout); self.enc3b = ConvBlock(128,128, padding=1, dropout=dropout)
+        self.enc4a = ConvBlock(128,256, padding=1, dropout=dropout); self.enc4b = ConvBlock(256,256, padding=1, dropout=dropout)
+        self.pool = nn.MaxPool2d(2,2)
+        # bottom (no extra pool; operates at H/8)
+        self.bot_a = ConvBlock(256,512, padding=1, dropout=dropout); self.bot_b = ConvBlock(512,512, padding=1, dropout=dropout)
+        # decoder (3 ups, skips x3,x2,x1)
+        self.up3   = DeconvBlock(512,128,dropout=dropout); self.dec3a = ConvBlock(128+128,128,padding=1,dropout=dropout); self.dec3b = ConvBlock(128,128,padding=1,dropout=dropout)
+        self.up2   = DeconvBlock(128, 64,dropout=dropout); self.dec2a = ConvBlock( 64+ 64, 64,padding=1,dropout=dropout); self.dec2b = ConvBlock( 64, 64,padding=1,dropout=dropout)
+        self.up1   = DeconvBlock( 64, 32,dropout=dropout); self.dec1a = ConvBlock( 32+ 32, 32,padding=1,dropout=dropout); self.dec1b = ConvBlock( 32, 32,padding=1,dropout=dropout)
+        self.class_conv = ConvBlock(32, self.out_channels, kernel_size=1, padding=0, dropout=0.0, normalization=False, spiking=False)
 
-            x4 = self.conv_block4(p3, time_step)    # (B,256,Hp/8,Wp/8)
-            p4 = self.pool(x4)                      # (B,256,Hp/16,Wp/16)
+    def forward(self, x_win: torch.Tensor, t0: int = 0) -> torch.Tensor:
+        B,k,C,H,W = x_win.shape
+        ph,pw = _pad_needed(H,W,self.multiple)
+        logits=[]
+        for i in range(k):
+            t=t0+i; x=x_win[:,i]; x=_pad_rb(x,ph,pw)
+            x1=self.enc1a(x,t); x1=self.enc1b(x1,t); p1=self.pool(x1)
+            x2=self.enc2a(p1,t); x2=self.enc2b(x2,t); p2=self.pool(x2)
+            x3=self.enc3a(p2,t); x3=self.enc3b(x3,t); p3=self.pool(x3)  # H/8
+            x4=self.enc4a(p3,t); x4=self.enc4b(x4,t)                     # H/8 (no pool)
+            xb=self.bot_a(x4,t); xb=self.bot_b(xb,t)                      # H/8 bottom
+            y3=self.up3(xb,t); y3=torch.cat([x3,y3],1); y3=self.dec3a(y3,t); y3=self.dec3b(y3,t)
+            y2=self.up2(y3,t); y2=torch.cat([x2,y2],1); y2=self.dec2a(y2,t); y2=self.dec2b(y2,t)
+            y1=self.up1(y2,t); y1=torch.cat([x1,y1],1); y1=self.dec1a(y1,t); y1=self.dec1b(y1,t)
+            out=self.class_conv(y1,t); out=out[...,:H,:W]; logits.append(out)
+        return torch.stack(logits,2)
 
-            x5 = self.conv_block5(p4, time_step)    # (B,512,Hp/16,Wp/16)
-            p5 = self.pool(x5)                      # (B,512,Hp/32,Wp/32)
-
-            # -------- Decoder --------
-            y = self.deconv_block1(p5, time_step)   # (B,512,Hp/16,Wp/16)
-            y = self.deconv1_conv(y, time_step)
-            y = torch.cat([p4, y], dim=1)           # (B,256+512,Hp/16,Wp/16)
-            y = self.concat1_conv(y, time_step)     # (B,512,Hp/16,Wp/16)
-
-            y = self.deconv_block2(y, time_step)    # (B,512,Hp/8,Wp/8)
-            y = self.deconv2_conv(y, time_step)
-            y = torch.cat([p3, y], dim=1)           # (B,128+512,Hp/8,Wp/8)
-            y = self.concat2_conv(y, time_step)     # (B,512,Hp/8,Wp/8)
-
-            y = self.deconv_block3(y, time_step)    # (B,512,Hp/4,Wp/4)
-            y = self.deconv3_conv(y, time_step)
-            y = torch.cat([p2, y], dim=1)           # (B,64+512,Hp/4,Wp/4)
-            y = self.concat3_conv(y, time_step)     # (B,512,Hp/4,Wp/4)
-
-            y = self.deconv_block4(y, time_step)    # (B,512,Hp/2,Wp/2)
-            y = self.deconv4_conv(y, time_step)
-            y = torch.cat([p1, y], dim=1)           # (B,32+512,Hp/2,Wp/2)
-            y = self.concat4_conv(y, time_step)     # (B,512,Hp/2,Wp/2)
-
-            y = self.deconv_block5(y, time_step)    # (B,512,Hp,Wp)
-            y = self.deconv5_conv(y, time_step)     # (B,512,Hp,Wp)
-
-            out_t = self.class_conv(y, time_step)   # (B,out_channels,Hp,Wp)
-
-            # crop back to original (H,W)
-            out_t = out_t[..., :H, :W]
-            logits.append(out_t)
-
-        return torch.stack(logits, dim=2)  # (B,out_channels,k,H,W)
-
-    # TBPTT helper (parity with your original)
     def detach_states(self):
         for m in self.modules():
-            if hasattr(m, "detach") and callable(m.detach):
-                m.detach()
+            if hasattr(m,"detach") and callable(m.detach): m.detach()
+
+
+# =========================
+# 3L U-Net — 2 pools (×4)
+# =========================
+class SNNBraTSUNetShallow(nn.Module):
+    """
+    L1: 32→32 | pool
+    L2: 64→64 | pool
+    L3: 128→128 (NO pool)  ← 3 layers, 2 pools total
+    Bottom: 256→512
+    Up: 512→64 →32 (skips x2,x1), head 1×1
+    """
+    def __init__(self, out_channels: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.out_channels, self.multiple = int(out_channels), 4
+        # encoder
+        self.enc1a = ConvBlock(4,   32, padding=1, dropout=dropout); self.enc1b = ConvBlock(32,  32, padding=1, dropout=dropout)
+        self.enc2a = ConvBlock(32,  64, padding=1, dropout=dropout); self.enc2b = ConvBlock(64,  64, padding=1, dropout=dropout)
+        self.enc3a = ConvBlock(64, 128, padding=1, dropout=dropout); self.enc3b = ConvBlock(128,128, padding=1, dropout=dropout)
+        self.pool = nn.MaxPool2d(2,2)
+        # bottom (works at H/4)
+        self.bot_a = ConvBlock(128,256, padding=1, dropout=dropout); self.bot_b = ConvBlock(256,512, padding=1, dropout=dropout)
+        # decoder (2 ups, skips x2,x1)
+        self.up2   = DeconvBlock(512, 64,dropout=dropout); self.dec2a = ConvBlock( 64+ 64, 64,padding=1,dropout=dropout); self.dec2b = ConvBlock( 64, 64,padding=1,dropout=dropout)
+        self.up1   = DeconvBlock( 64, 32,dropout=dropout); self.dec1a = ConvBlock( 32+ 32, 32,padding=1,dropout=dropout); self.dec1b = ConvBlock( 32, 32,padding=1,dropout=dropout)
+        self.class_conv = ConvBlock(32, self.out_channels, kernel_size=1, padding=0, dropout=0.0, normalization=False, spiking=False)
+
+    def forward(self, x_win: torch.Tensor, t0: int = 0) -> torch.Tensor:
+        B,k,C,H,W = x_win.shape
+        ph,pw = _pad_needed(H,W,self.multiple)
+        logits=[]
+        for i in range(k):
+            t=t0+i; x=x_win[:,i]; x=_pad_rb(x,ph,pw)
+            x1=self.enc1a(x,t); x1=self.enc1b(x1,t); p1=self.pool(x1)   # H/2
+            x2=self.enc2a(p1,t); x2=self.enc2b(x2,t); p2=self.pool(x2)   # H/4
+            x3=self.enc3a(p2,t); x3=self.enc3b(x3,t)                     # H/4 (no pool)
+            xb=self.bot_a(x3,t); xb=self.bot_b(xb,t)                      # H/4 bottom
+            y2=self.up2(xb,t); y2=torch.cat([x2,y2],1); y2=self.dec2a(y2,t); y2=self.dec2b(y2,t)
+            y1=self.up1(y2,t); y1=torch.cat([x1,y1],1); y1=self.dec1a(y1,t); y1=self.dec1b(y1,t)
+            out=self.class_conv(y1,t); out=out[...,:H,:W]; logits.append(out)
+        return torch.stack(logits,2)
+
+    def detach_states(self):
+        for m in self.modules():
+            if hasattr(m,"detach") and callable(m.detach): m.detach()
