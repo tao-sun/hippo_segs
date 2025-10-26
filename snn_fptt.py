@@ -562,7 +562,7 @@ if __name__ == "__main__":
     # weight_decay = 1e-5
     # grad_clip = 1.0
     # Adam
-    lr = 0.0005
+    lr = 0.001
     rho = None
     eps = None
     weight_decay = 1e-5
