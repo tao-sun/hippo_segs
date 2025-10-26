@@ -22,7 +22,7 @@ from torch.utils.data import Dataset, DataLoader, ConcatDataset
 
 # ==== use your spiking UNet-like model ====
 # SNNBraTS: forward(x_win[B,k,4,H,W], t0) -> (B, out_channels, k, H, W)
-from model import SNNBraTS, SNNBraTSDeep  # mirrors your SNN implementation with PLIF nodes
+from model import SNNBraTS, SNNBraTSUNetShallow, SNNBraTSUNetMedium, SNNBraTSUNetDeep, print_model_info  # mirrors your SNN implementation with PLIF nodes
 
 # ------------------ SEEDING ------------------
 SEED = 2025
@@ -542,7 +542,7 @@ if __name__ == "__main__":
                     help="1,2,3,4,5")
     ap.add_argument("--view", type=str, required=True,
                     help="'sagittal', 'coronal','axial'")
-    ap.add_argument("--model", choices=["orig", "deep"], default="orig",
+    ap.add_argument("--model", choices=["orig", "shallow", "medium", "deep"], default="orig",
                     help="Choose the BraTS model architecture")
     args = ap.parse_args()
 
@@ -562,7 +562,7 @@ if __name__ == "__main__":
     # weight_decay = 1e-5
     # grad_clip = 1.0
     # Adam
-    lr = 0.001
+    lr = 0.0005
     rho = None
     eps = None
     weight_decay = 1e-5
@@ -661,9 +661,14 @@ if __name__ == "__main__":
     # ---- Model/Optim ----
     if args.model == "orig":
         model = SNNBraTS(out_channels=3).to(device)  # ET/TC/WT
+    elif args.model == "shallow":
+        model = SNNBraTSUNetShallow(out_channels=3).to(device)  # ET/TC/WT
+    elif args.model == "medium":
+        model = SNNBraTSUNetMedium(out_channels=3).to(device)  # ET/TC/WT
     elif args.model == "deep":
-        model = SNNBraTSDeep(out_channels=3).to(device)  # ET/TC/WT
+        model = SNNBraTSUNetDeep(out_channels=3).to(device)  # ET/TC/WT
     # optimizer = torch.optim.Adadelta(model.parameters(), lr=lr, rho=rho, eps=eps, weight_decay=weight_decay)
+    print_model_info(model)
     
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min')
