@@ -2,6 +2,7 @@
 # dnn_3ch.py — SNN (TBPTT) 2D-train / 3D-eval for BraTS (ET/TC/WT multilabel)
 
 import os
+import re
 import random
 import argparse
 from pathlib import Path
@@ -59,6 +60,13 @@ def seed_worker(worker_id):
 # -----------------------------
 VALID_VIEWS = {"sagittal", "coronal", "axial"}
 MOD_ORDER = ["t1", "t1ce", "t2", "flair"]   # 4 input channels
+MOD_ORDER = ["t1", "t1ce", "t2", "flair"]  # keep canonical names
+ALIASES = {
+    "t1":   ["t1", "t1n"],
+    "t1ce": ["t1ce", "t1c"],   # <- handle both spellings
+    "t2":   ["t2", "t2w"],
+    "flair":["flair", "t2f"],
+}
 OUT_TOKENS = ["et", "tc", "wt"]             # 3 output channels
 TARGET_SHAPE = (160, 192, 152)              # (x,y,z) used by preprocessing
 FOLD_NAMES = {"1", "2", "3", "4", "5"}
@@ -108,6 +116,11 @@ def brats_to_multilabel(mask3d: np.ndarray) -> np.ndarray:
     return np.stack([et, tc, wt], axis=0).astype(np.float32)
 
 
+def match_modality(p: Path, m: str) -> bool:
+    """Return True if file name contains modality m with flexible separators."""
+    return re.search(rf"[\-_]{m}[\-_]", p.stem.lower()) is not None
+
+
 def load_subject_nii_and_pngs(subj_dir: Path, view: str) -> Tuple[Dict[str, List[Path]], Path]:
     """
     For one subject folder, return:
@@ -119,12 +132,20 @@ def load_subject_nii_and_pngs(subj_dir: Path, view: str) -> Tuple[Dict[str, List
         raise RuntimeError(f"Missing view dir: {view_dir}")
 
     img_paths_by_mod: Dict[str, List[Path]] = {
-        m: sorted(view_dir.glob(f"Brats17_*_{m}_*.png")) for m in MOD_ORDER
+        m: sorted([
+            p for p in view_dir.glob("*.[Pp][Nn][Gg]")
+            if p.stem.startswith(("Bra", "bra")) and     # only match filenames starting with "Bra"
+            any(
+                re.search(rf"(?<![A-Za-z0-9]){alias}(?![A-Za-z0-9])", p.stem.lower())
+                for alias in ALIASES[m]
+            )
+        ])
+        for m in MOD_ORDER
     }
     if not all(img_paths_by_mod[m] for m in MOD_ORDER):
         raise RuntimeError(f"Incomplete modalities in {view_dir}")
 
-    seg_candidates = list(subj_dir.glob("*_seg.nii")) + list(subj_dir.glob("*_seg.nii.gz"))
+    seg_candidates = list(subj_dir.glob("*_seg.nii")) + list(subj_dir.glob("*_seg.nii.gz")) + list(subj_dir.glob("*-seg.nii.gz"))
     if not seg_candidates:
         raise RuntimeError(f"No *_seg.nii in {subj_dir}")
     seg_path = seg_candidates[0]
@@ -321,7 +342,7 @@ def dice_per_channel(vol_pred_bin: np.ndarray, vol_gt_bin: np.ndarray, eps: floa
 # FPTT
 # -----------------------------
 
-# init before training
+# init before training, lambdas is the gradient \Delta l_t(W_{t+1}, avg_weights is \overline{w}_t.
 def init_running_params(model):
         model.avg_weights = {}
         model.lambdas = {}
@@ -544,10 +565,17 @@ if __name__ == "__main__":
                     help="'sagittal', 'coronal','axial'")
     ap.add_argument("--model", choices=["orig", "shallow", "medium", "deep"], default="orig",
                     help="Choose the BraTS model architecture")
+    ap.add_argument("--lr", type=float, required=True, default=1e-3,
+                    help="1e-3 or 5e-4")
+    ap.add_argument("--year", type=str, required=True,
+                    help="'sagittal', 'coronal','axial'")
     args = ap.parse_args()
 
     # ---- Config (edit here) ----
-    data_root = "data/BRATS2017_preprocessed/Brats17TrainingData"
+    if args.year == "17":
+        data_root = "data/BRATS2017_preprocessed/Brats17TrainingData"
+    elif args.year == "23":
+        data_root = "data/BRATS2023_preprocessed/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData"
 
     val_fold = args.val_fold              # int in {1..5}, used as validation
     view = args.view            # 'sagittal' | 'coronal' | 'axial'
@@ -562,7 +590,7 @@ if __name__ == "__main__":
     # weight_decay = 1e-5
     # grad_clip = 1.0
     # Adam
-    lr = 0.001
+    lr = args.lr
     rho = None
     eps = None
     weight_decay = 1e-5
