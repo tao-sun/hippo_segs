@@ -10,15 +10,15 @@ mkdir -p logs
 timestamp=$(date +"%Y%m%d_%H%M%S")
 
 # Loop over folds (run in parallel)
-for fold in "${folds[@]}"; do
+for view in "${views[@]}"; do
 {
-    echo "=== Starting fold ${fold} at $(date) ==="
-    for view in "${views[@]}"; do
+    echo "=== Starting view ${view} at $(date) ==="
+    for fold in "${folds[@]}"; do
         echo "Running fold=${fold}, view=${view} at $(date)"
-        log_name="logs/snn_fptt_${fold}_${view}_${timestamp}.log"
-        python -u snn_fptt.py --val-fold "$fold" --view "$view" > "$log_name" 2>&1
+        log_name="logs/snn_deep_fptt_${fold}_${view}_${timestamp}.log"
+        python -u snn_fptt.py --val-fold "$fold" --view "$view" --model "deep" --lr "0.0005" > "$log_name" 2>&1
     done
-    echo "=== Finished fold ${fold} at $(date) ==="
+    echo "=== Finished view ${view} at $(date) ==="
 } &
 done
 
