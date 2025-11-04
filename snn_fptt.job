@@ -1,0 +1,45 @@
+#!/bin/bash
+#SBATCH --job-name=TrainAxial
+#SBATCH --output=slurm_output_coronal_fptt_%j.out # Specifico per la vista
+#SBATCH --error=slurm_output_coronal_fptt_%j.err   # Specifico per la vista
+#SBATCH --time=12:00:00
+#SBATCH --partition=gpu_h100
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=18
+#SBATCH --mem=64G
+#SBATCH --nodes=1
+
+# === 1. Load environment ===
+echo "Loading modules..."
+module purge
+module load python/3.9
+module load cuda/11.8
+module load cudnn/8.2.4
+echo "Modules loaded."
+
+
+# === 2. Define and Create Output Directory ===
+# I percorsi sono rtrain_h100_np.jobelativi a $SLURM_SUBMIT_DIR (la directory da cui sottometti il job)
+OUTPUT_DIR_PERSISTENT="experiments/run_coronal_${SLURM_JOB_ID}"
+mkdir -p "$OUTPUT_DIR_PERSISTENT"
+echo "Output will be saved to: $SLURM_SUBMIT_DIR/$OUTPUT_DIR_PERSISTENT"
+
+# === 3. Define Data Directory ===
+# Assicurati che questo percorso sia corretto rispetto a $SLURM_SUBMIT_DIR
+# e a come train_h100_np.py si aspetta di trovare i dati.
+# Se train_h100_np.py costruisce 'slices_output_png/coronal' da args.data_dir,
+# allora args.data_dir dovrebbe essere la directory genitore di 'slices_output_png'.
+# Esempio: se i tuoi dati sono in $SLURM_SUBMIT_DIR/data_root/slices_output_png/...
+# DATA_INPUT_DIR="data_root"
+# Se i tuoi dati sono in $SLURM_SUBMIT_DIR/data/BraTS-GLI-2024/slices_output_png/...
+DATA_INPUT_DIR="data/" # Come nel tuo script originale
+echo "Data input directory assumed to be: $SLURM_SUBMIT_DIR/$DATA_INPUT_DIR"
+
+
+# === 4. Run your script ===
+echo "Starting Python training script..."
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+python -u snn_fptt.py \
+
+
