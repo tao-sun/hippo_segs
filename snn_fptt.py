@@ -565,10 +565,11 @@ if __name__ == "__main__":
                     help="'sagittal', 'coronal','axial'")
     ap.add_argument("--model", choices=["orig", "shallow", "medium", "deep"], default="orig",
                     help="Choose the BraTS model architecture")
-    ap.add_argument("--lr", type=float, required=True, default=1e-3,
+    ap.add_argument("--batch", type=int, default=8, help="8 or 16")
+    ap.add_argument("--lr", type=float, default=1e-3,
                     help="1e-3 or 5e-4")
     ap.add_argument("--year", type=str, required=True,
-                    help="'sagittal', 'coronal','axial'")
+                    help="17 or 23")
     args = ap.parse_args()
 
     # ---- Config (edit here) ----
@@ -582,7 +583,7 @@ if __name__ == "__main__":
 
     # training
     epochs = 100
-    batch_size_subjects = 8   # subjects per batch (each provides a sequence of slices)
+    batch_size_subjects = args.batch   # subjects per batch (each provides a sequence of slices)
     # Adadelta defaults from your prior config (works well with TBPTT)
     # lr = 1.0
     # rho = 0.95
