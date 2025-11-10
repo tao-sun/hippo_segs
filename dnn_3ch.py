@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # dnn.py — Train 2D / Eval 3D for BraTS (no train.txt; folds discovery)
 # Architecture mirrors current SNNBraTS but without spiking.
-
+import re
 import os
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 import json
-
+import argparse
 import numpy as np
 import nibabel as nib
 from tqdm import tqdm
-
+from datetime import datetime
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,7 +21,15 @@ from torch.utils.data import Dataset, DataLoader
 # Constants & helpers
 # -----------------------------
 VALID_VIEWS = {"sagittal", "coronal", "axial"}
-MOD_ORDER = ["t1", "t1ce", "t2", "flair"]   # 4 input channels
+MOD_ORDER = ["t1c", "t1n", "t2f", "t2w"]   # 4 input channels
+OUT_TOKENS = ["et", "tc", "wt"]             # 3 output channels
+MOD_ALIASES = {
+    "t1c": ["t1c", "t1ce", "t1"],
+    "t1n": ["t1n", "t1"],
+    "t2f": ["t2f", "flair", "t2"],
+    "t2w": ["t2w", "t2"],
+}
+
 OUT_TOKENS = ["et", "tc", "wt"]             # 3 output channels
 TARGET_SHAPE = (160, 192, 152)              # (x,y,z) used by preprocessing
 FOLD_NAMES = {"1", "2", "3", "4", "5"}
@@ -65,11 +73,14 @@ def brats_to_multilabel(mask3d: np.ndarray) -> np.ndarray:
     Returns (3, X, Y, Z) float32 in {0,1}.
     """
     m = mask3d.astype(np.int32)
-    et = (m == 4)
-    tc = (m == 1) | (m == 4)
-    wt = (m == 1) | (m == 2) | (m == 4)
+    et = (m == 3)
+    tc = (m == 1) | (m == 3)
+    wt = (m == 1) | (m == 2) | (m == 3)
     return np.stack([et, tc, wt], axis=0).astype(np.float32)
 
+def match_modality(p: Path, m: str) -> bool:
+    """Return True if file name contains modality m with flexible separators."""
+    return re.search(rf"[\-_]{m}[\-_]", p.stem.lower()) is not None
 
 def load_subject_nii_and_pngs(subj_dir: Path, view: str) -> Tuple[Dict[str, List[Path]], Path]:
     """
@@ -82,24 +93,31 @@ def load_subject_nii_and_pngs(subj_dir: Path, view: str) -> Tuple[Dict[str, List
         raise RuntimeError(f"Missing view dir: {view_dir}")
 
     img_paths_by_mod: Dict[str, List[Path]] = {
-        m: sorted(view_dir.glob(f"Brats17_*_{m}_*.png")) for m in MOD_ORDER
+        m: sorted([
+            p for p in view_dir.glob("*.[Pp][Nn][Gg]")
+            if p.stem.lower().startswith("bra") and
+            any(
+                re.search(rf"(?<![A-Za-z0-9]){alias}(?![A-Za-z0-9])", p.stem.lower())
+                for alias in MOD_ALIASES.get(m, [m])
+            )
+        ])
+        for m in MOD_ORDER
     }
     if not all(img_paths_by_mod[m] for m in MOD_ORDER):
         raise RuntimeError(f"Incomplete modalities in {view_dir}")
 
-    # find seg
-    seg_candidates = list(subj_dir.glob("*_seg.nii")) + list(subj_dir.glob("*_seg.nii.gz"))
+    # robust seg detection: match any .nii / .nii.gz file containing 'seg' in the stem
+    # search recursively in subject dir (handles nested subfolders)
+    seg_candidates = sorted([p for p in subj_dir.rglob("*seg*.nii*") if p.suffix in (".nii", ".gz")])
     if not seg_candidates:
-        raise RuntimeError(f"No *_seg.nii in {subj_dir}")
+        raise RuntimeError(f"No *_seg.nii(.gz) in {subj_dir}")
     seg_path = seg_candidates[0]
 
-    # quick consistency check (all modalities same #slices)
     counts = [len(v) for v in img_paths_by_mod.values()]
     if len(set(counts)) != 1:
         raise RuntimeError(f"Unequal slice counts across modalities in {view_dir}: {counts}")
 
     return img_paths_by_mod, seg_path
-
 
 def expected_DHW_for_view(view: str) -> Tuple[int, int, int]:
     if view == "sagittal":
@@ -107,8 +125,7 @@ def expected_DHW_for_view(view: str) -> Tuple[int, int, int]:
     if view == "coronal":
         return (TARGET_SHAPE[1], TARGET_SHAPE[0], TARGET_SHAPE[2])  # (192,160,152)
     return (TARGET_SHAPE[2], TARGET_SHAPE[0], TARGET_SHAPE[1])      # (152,160,192)
-
-
+    
 def take_view(arr: np.ndarray, view: str) -> np.ndarray:
     """
     Reorder dims to slice along the first spatial axis for the chosen view.
@@ -174,7 +191,15 @@ class BratsSliceDataset(Dataset):
                     continue
 
                 img_paths_by_mod: Dict[str, List[Path]] = {
-                    m: sorted(view_dir.glob(f"Brats17_*_{m}_*.png")) for m in MOD_ORDER
+                    m: sorted([
+                        p for p in view_dir.glob("*.[Pp][Nn][Gg]")
+                        if p.stem.lower().startswith("bra") and
+                        any(
+                            re.search(rf"(?<![A-Za-z0-9]){alias}(?![A-Za-z0-9])", p.stem.lower())
+                            for alias in MOD_ALIASES.get(m, [m])
+                        )
+                    ])
+                    for m in MOD_ORDER
                 }
                 if not all(img_paths_by_mod[m] for m in MOD_ORDER):
                     print(f"[SKIP] Missing modality PNGs in {view_dir} (modalities with 0 files: "
@@ -189,7 +214,9 @@ class BratsSliceDataset(Dataset):
                     continue
                 D = counts[0]
 
-                seg_candidates = list(subj_dir.glob("*_seg.nii")) + list(subj_dir.glob("*_seg.nii.gz"))
+                # robust seg detection: match any .nii / .nii.gz file containing 'seg' in the stem
+                # search recursively in subject dir (handles nested subfolders)
+                seg_candidates = sorted([p for p in subj_dir.rglob("*seg*.nii*") if p.suffix in (".nii", ".gz")])
                 if not seg_candidates:
                     print(f"[SKIP] No *_seg.nii(.gz) in {subj_dir}")
                     skipped += 1
@@ -513,26 +540,45 @@ if __name__ == "__main__":
     # Point to either:
     #   data/BRATS2017_preprocessed/Brats17TrainingData
     # or data/BRATS2017_preprocessed  (the code will append Brats17TrainingData automatically)
-    data_root = "data/BRATS2017_preprocessed/Brats17TrainingData"
+    start_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+    print(f"Start time: {start_time}")
 
-    val_fold = 1              # int in {1..5}, used as validation
-    view = "axial"            # 'sagittal' | 'coronal' | 'axial'
+    ap = argparse.ArgumentParser(description="3-view SNN training.")
+    ap.add_argument("--val-fold", type=int, required=True,
+                    help="1,2,3,4,5")
+    ap.add_argument("--view", type=str, required=True,
+                    help="'sagittal', 'coronal','axial'")
+    ap.add_argument("--model", choices=["orig", "shallow", "medium", "deep"], default="orig",
+                    help="Choose the BraTS model architecture")
+    ap.add_argument("--batch", type=int, default=8, help="8 or 16")
+    ap.add_argument("--lr", type=float, default=1e-3,
+                    help="1e-3 or 5e-4")
+    ap.add_argument("--year", type=str, required=True,
+                    help="17 or 23")
+    args = ap.parse_args()
 
+    # ---- Config (edit here) ----
+    if args.year == "17":
+        data_root = "data/BRATS2017_preprocessed/Brats17TrainingData"
+    elif args.year == "23":
+        data_root = "/gpfs/scratch1/shared/apiaghiardelli/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData"
+    val_fold = args.val_fold              # int in {1..5}, used as validation
+    view = args.view            # 'sagittal' | 'coronal' | 'axial'
     # training
     epochs = 100
-    batch_size = 16
+    batch_size = args.batch   # subjects per batch (each provides a sequence of slices)
     # Adadelta (as requested): lr=1.0, rho=0.95, eps=1e-8
-    lr = 1.0
-    rho = 0.95
-    eps = 1e-8
-
+    lr = args.lr
+    rho = None
+    eps = None
     weight_decay = 1e-5
-    grad_clip = 1.0
+    grad_clip = 0.3
+
     drop_empty_slices = True  # skip all-zero GT slices in training
 
     # loss weights: L = λ_bce * BCEWithLogits + λ_dice * SoftDice
-    lambda_bce = 0.0
-    lambda_dice = 1.0
+    lambda_bce = 0.5
+    lambda_dice = 0.5
 
     # evaluation
     eval_every = 1
@@ -561,7 +607,8 @@ if __name__ == "__main__":
     print("\n=== CONFIG ===")
     print(json.dumps(config, indent=2))
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+    device = torch.device(device)
     print(f"Using device: {device}")
 
     # ---- Fold selection (no train.txt) ----

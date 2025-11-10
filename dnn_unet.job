@@ -1,0 +1,29 @@
+#!/bin/bash
+#SBATCH --job-name=TrainAxial_array
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=a.ghiardelli@student.maastrichtuniversity.nl
+#SBATCH --output=slurm_output_coronal_fptt_%A_%a.out
+#SBATCH --error=slurm_output_coronal_fptt_%A_%a.err
+#SBATCH --time=2-00:00:00
+#SBATCH --partition=cbuild
+#SBATCH --cpus-per-task=4
+#SBATCH --nodes=1
+#SBATCH --array=1-5%5    
+
+VIEW="coronal"
+MODEL="orig"
+BATCH=16
+LR=1e-3
+YEAR="23"
+
+# map array index to fold (se vuoi mappare esplicitamente, altrimenti usa SLURM_ARRAY_TASK_ID come fold)
+VAL_FOLD=${SLURM_ARRAY_TASK_ID}
+
+echo "Starting fold $VAL_FOLD"
+python -u dnn_3ch.py \
+    --val-fold ${VAL_FOLD} \
+    --view ${VIEW} \
+    --model ${MODEL} \
+    --batch ${BATCH} \
+    --lr ${LR} \
+    --year ${YEAR}
