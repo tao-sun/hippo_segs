@@ -116,6 +116,30 @@ def brats_to_multilabel(mask3d: np.ndarray) -> np.ndarray:
     return np.stack([et, tc, wt], axis=0).astype(np.float32)
 
 
+def brats_to_multilabel(mask3d: np.ndarray) -> np.ndarray:
+    """
+    Convert BraTS integer labels to multilabel [ET, TC, WT].
+    Automatically detects BraTS17 ({0,1,2,4}) or BraTS23 ({0,1,2,3,4}) format.
+    Returns (3, X, Y, Z) float32 in {0,1}.
+    """
+    m = mask3d.astype(np.int32)
+    unique_labels = np.unique(m)
+
+    # --- detect version ---
+    if 3 in unique_labels:
+        # BraTS23
+        et = (m == 3)
+        tc = (m == 1) | (m == 3)    
+        wt = (m == 1) | (m == 2) | (m == 3)
+    else:
+        # BraTS17
+        et = (m == 4)
+        tc = (m == 1) | (m == 4)
+        wt = (m == 1) | (m == 2) | (m == 4)
+
+    return np.stack([et, tc, wt], axis=0).astype(np.float32)
+
+
 def match_modality(p: Path, m: str) -> bool:
     """Return True if file name contains modality m with flexible separators."""
     return re.search(rf"[\-_]{m}[\-_]", p.stem.lower()) is not None
