@@ -35,7 +35,7 @@ from model import SNNBraTS
 from dnn_3ch import UNetLike2D
 
 # Use the exact per-subject dataset & stacking used by evaluate_3d_snn(). :contentReference[oaicite:2]{index=2}
-from snn_fptt import BratsVolumeDataset, stack_back   # :contentReference[oaicite:3]{index=3}
+from dnn_3ch import BratsVolumeDataset, stack_back   # :contentReference[oaicite:3]{index=3}
 
 # ------------------ utils ------------------
 
@@ -52,29 +52,30 @@ def get_device(arg: str) -> torch.device:
     return torch.device("cpu")
 
 
-def load_model(ckpt: Path, device: torch.device) -> DNNBraTS:
+def load_model(ckpt: Path, device: torch.device) -> UNetLike2D:
     m = UNetLike2D(in_channels=4, out_channels=3).to(device)
     sd = torch.load(str(ckpt), map_location=device)
     # Your checkpoints from snn_fptt.py save {"model": state_dict, ...}. :contentReference[oaicite:4]{index=4}
-    if isinstance(sd, dict) and "model" in sd and isinstance(sd["model"], dict):
-        sd = sd["model"]
+    sd = sd["model"]
     m.load_state_dict(sd, strict=True)
     m.eval()
     return m
 
-
-def dice_per_channel(pred_bin: np.ndarray, gt_bin: np.ndarray) -> np.ndarray:
-    """pred_bin, gt_bin: (3, X, Y, Z) in {0,1} -> returns (3,) Dice."""
-    eps = 1e-6
-    dices = []
-    for c in range(pred_bin.shape[0]):
-        p = pred_bin[c].astype(np.uint8).reshape(-1)
-        g = gt_bin[c].astype(np.uint8).reshape(-1)
-        inter = int((p & g).sum())
-        denom = int(p.sum()) + int(g.sum())
-        dices.append((2 * inter + eps) / (denom + eps))
-    return np.array(dices, dtype=np.float64)
-
+@torch.no_grad()
+def dice_per_channel(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> np.ndarray:
+    """
+    pred, target: (K, X, Y, Z) in {0,1}
+    returns (K,) dice
+    """
+    K = pred.shape[0]
+    d = []
+    for k in range(K):
+        p = pred[k].reshape(-1).astype(np.uint8)
+        t = target[k].reshape(-1).astype(np.uint8)
+        inter = (p & t).sum()
+        denom = p.sum() + t.sum()
+        d.append(float((2 * inter + eps) / (denom + eps)))
+    return np.array(d)
 
 def nll_from_probs(prob: np.ndarray, gt: np.ndarray) -> float:
     """
@@ -91,7 +92,7 @@ def nll_from_probs(prob: np.ndarray, gt: np.ndarray) -> float:
 
 @torch.no_grad()
 def infer_view_volumes_and_metrics(
-    model: DNNBraTS,
+    model: UNetLike2D,
     dset: BratsVolumeDataset,
     device: torch.device,
     k: int,
@@ -108,12 +109,12 @@ def infer_view_volumes_and_metrics(
       }
     Windowing and stack_back match your reference eval path. :contentReference[oaicite:5]{index=5}
     """
-    loader = DataLoader(dset, batch_size=1, shuffle=False, num_workers=2, pin_memory=True)
+    loader = DataLoader(dset, batch_size=1, shuffle=False, num_workers=2, pin_memory=False)
     results: Dict[str, Dict[str, np.ndarray | float]] = {}
 
     for xs, ys, meta in tqdm(loader, desc="eval", leave=False):
-        xs = xs[0].to(device)   # (S,4,H,W)
-        ys = ys[0].to(device)   # (S,3,H,W)
+        xs = xs[0]   # (S,4,H,W)
+        ys = ys[0]   # (S,3,H,W)
         S = xs.shape[0]
 
         preds = []
@@ -121,20 +122,24 @@ def infer_view_volumes_and_metrics(
         xyz = meta["xyz"]
         sid = meta["sid"][0] if isinstance(meta["sid"], list) else meta["sid"]
 
-        for i in range(0, S, 16):
-            xb = xs[i:i+16]
+        # Use k as a slice-batch size to control GPU memory.
+        batch_slices = max(int(k), 1)
+        for i in tqdm(range(0, S, batch_slices)):
+            xb = xs[i:i+batch_slices].to(device, non_blocking=True)
             pb = torch.sigmoid(model(xb))
-            print(pb.shape)
             preds.append(pb.cpu())
         preds = torch.cat(preds, dim=0).numpy()  # (S,3,H,W)
-        target_np = ys.cpu().numpy()
+        print(f"Subject {sid} - stacked preds shape: {preds.shape}")
+        print(f"Subject {sid} - stacked gt shape: {ys.shape}")
+        print(f"Subject {sid} - view: {view}, xyz: {xyz}")
+        target_np = ys.numpy()
 
-        vol_pred = stack_back(preds, loader.dataset.view, xyz)  # (3,X,Y,Z)
-        vol_gt = stack_back(target_np, loader.dataset.view, xyz)
+        vol_pred = stack_back(preds, view, xyz)  # (3,X,Y,Z)
+        vol_gt = stack_back(target_np, view, xyz)
      
         # Metrics (per view)
-        vol_bin = (vol_pred >= threshold).astype(np.uint8)
-        vol_gtb = vol_gt.astype(np.uint8)
+        vol_bin = (vol_pred >= 0.5).astype(np.uint8)
+        vol_gtb = np.rint(vol_gt).astype(np.uint8)
         d = dice_per_channel(vol_bin, vol_gtb)           # (3,)
         nll = nll_from_probs(vol_pred, vol_gt)           # scalar
 
@@ -241,9 +246,9 @@ def main():
                     help="Fold(s) to evaluate.")
     ap.add_argument("--ckpt-sag", type=str, required=True,
                     help="Checkpoint path/pattern for sagittal (allow '{fold}').")
-    ap.add_argument("--ckpt-cor", type=str, required=True,
+    ap.add_argument("--ckpt-cor", type=str, required=False,
                     help="Checkpoint path/pattern for coronal (allow '{fold}').")
-    ap.add_argument("--ckpt-axi", type=str, required=True,
+    ap.add_argument("--ckpt-axi", type=str, required=False,
                     help="Checkpoint path/pattern for axial (allow '{fold}').")
     ap.add_argument("--k", type=int, default=1, help="TBPTT window size for inference.")
     ap.add_argument("--threshold", type=float, default=0.5, help="Binarization threshold.")
@@ -261,27 +266,27 @@ def main():
     overall_ens_means = []
     # # --- Scenario 1: Sagittal, Coronal, Axial on Fold 1 ---
     print("\n\n========== SCENARIO 1: Sag+Cor+Axi on Fold 1 ==========")
-    # if all([args.ckpt_sag, args.ckpt_cor, args.ckpt_axi]):
-    #     ckpts_sc1 = {
-    #         "sag": Path(args.ckpt_sag.format(fold=1)),
-    #         "cor": Path(args.ckpt_cor.format(fold=1)),
-    #         "axi": Path(args.ckpt_axi.format(fold=1)),
-    #     }
-    #     res = evaluate_fold(args.data_root, 1, ckpts_sc1, args.k, args.threshold, device)
+    if all([args.ckpt_sag, args.ckpt_cor, args.ckpt_axi]):
+        ckpts_sc1 = {
+            "sag": Path(args.ckpt_sag.format(fold=1)),
+            "cor": Path(args.ckpt_cor.format(fold=1)),
+            "axi": Path(args.ckpt_axi.format(fold=1)),
+        }
+        res = evaluate_fold(args.data_root, 1, ckpts_sc1, args.k, args.threshold, device)
 
-    #     overall_view_sums["sag"].append(np.array([res["sag_ET"], res["sag_TC"], res["sag_WT"]]))
-    #     overall_view_sums["axi"].append(np.array([res["axi_ET"], res["axi_TC"], res["axi_WT"]]))
-    #     overall_view_sums["cor"].append(np.array([res["cor_ET"], res["cor_TC"], res["cor_WT"]]))
-    #     overall_view_sums["ens"].append(np.array([res["ens_ET"], res["ens_TC"], res["ens_WT"]]))
+        overall_view_sums["sag"].append(np.array([res["sag_ET"], res["sag_TC"], res["sag_WT"]]))
+        overall_view_sums["axi"].append(np.array([res["axi_ET"], res["axi_TC"], res["axi_WT"]]))
+        overall_view_sums["cor"].append(np.array([res["cor_ET"], res["cor_TC"], res["cor_WT"]]))
+        overall_view_sums["ens"].append(np.array([res["ens_ET"], res["ens_TC"], res["ens_WT"]]))
 
-    #     overall_view_nlls["axi"].append(res["axi_NLL"])
-    #     overall_view_nlls["sag"].append(res["sag_NLL"])
-    #     overall_view_nlls["cor"].append(res["cor_NLL"])
-    #     overall_view_nlls["ens"].append(res["ens_NLL"])
+        overall_view_nlls["axi"].append(res["axi_NLL"])
+        overall_view_nlls["sag"].append(res["sag_NLL"])
+        overall_view_nlls["cor"].append(res["cor_NLL"])
+        overall_view_nlls["ens"].append(res["ens_NLL"])
 
-    #     overall_ens_means.append(res["ens_MEAN"])
-    # else:
-    #     print("Skipping Scenario 1: Missing one or more required checkpoints (sag, cor, axi).")
+        overall_ens_means.append(res["ens_MEAN"])
+    else:
+        print("Skipping Scenario 1: Missing one or more required checkpoints (sag, cor, axi).")
     # --- Scenario 2: Coronal, Sagittal on Folds 1, 2, 3 ---
     print("\n\n========== SCENARIO 2: Cor+Sag on Folds 1, 2, 3 ==========")
     if all([args.ckpt_cor, args.ckpt_sag]):
@@ -306,7 +311,7 @@ def main():
     # --- Scenario 3: Axial, Sagittal on Folds 1, 4, 5 ---
     print("\n\n========== SCENARIO 3: Axi+Sag on Folds 1, 4, 5 ==========")
     if all([args.ckpt_axi, args.ckpt_sag]):
-        for fold in [4, 5]:
+        for fold in [4]:
             ckpts_sc3 = {
                 "axi": Path(args.ckpt_axi.format(fold=fold)),
                 "sag": Path(args.ckpt_sag.format(fold=fold)),

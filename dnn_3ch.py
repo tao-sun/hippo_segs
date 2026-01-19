@@ -182,7 +182,7 @@ class BratsSliceDataset(Dataset):
         kept, skipped = 0, 0
         xs_all, ys_all = [], []
 
-        for subj_dir in subjects:
+        for subj_dir in tqdm(subjects):
             try:
                 view_dir = subj_dir / view
                 if not view_dir.exists():
@@ -286,13 +286,41 @@ class BratsVolumeDataset(Dataset):
       x_vol: (S, 4, H, W) float32
       y_vol: (S, 3, H, W) float32
       meta:  dict with 'sid' and 'xyz'
+
+    Optional RAM guard: set max_ram_gb to emit a warning (default) or raise if the
+    estimated in-memory size exceeds the threshold. The estimate assumes float32
+    tensors for both inputs (4 channels) and labels (3 channels).
     """
-    def __init__(self, root: str, val_fold: int, view: str):
+    def __init__(self, root: str, val_fold: int, view: str,
+                 max_ram_gb: Optional[float] = None, raise_if_exceeds: bool = False):
         rootp = ensure_train_root(Path(root))
         self.view = view
         if view not in VALID_VIEWS:
             raise ValueError(f"view must be one of {VALID_VIEWS}")
         self.subjects = find_subject_dirs(rootp, [val_fold])
+
+        # Lightweight estimate of how much RAM the whole dataset would occupy if fully materialized.
+        self.estimated_total_gb = 0.0
+        self.estimated_per_subject_gb = 0.0
+        if self.subjects:
+            est_total_gb, est_per_subj_gb, slices, hw = self._estimate_ram_gb()
+            self.estimated_total_gb = est_total_gb
+            self.estimated_per_subject_gb = est_per_subj_gb
+            print(
+                f"[INFO] BratsVolumeDataset ≈ {est_total_gb:.2f} GB "
+                f"({est_per_subj_gb:.2f} GB/subject, {len(self.subjects)} subjects, "
+                f"S={slices}, HxW={hw[0]}x{hw[1]})"
+            )
+
+            if max_ram_gb is not None and est_total_gb > max_ram_gb:
+                msg = (
+                    f"Estimated RAM {est_total_gb:.2f} GB exceeds limit {max_ram_gb:.2f} GB "
+                    f"for fold {val_fold} ({len(self.subjects)} subjects, view={view})."
+                )
+                if raise_if_exceeds:
+                    raise MemoryError(msg)
+                else:
+                    print(f"[WARN] {msg}")
 
     def __len__(self):
         return len(self.subjects)
@@ -310,7 +338,7 @@ class BratsVolumeDataset(Dataset):
             tx, ty, tz = TARGET_SHAPE
             xs, ys, zs = ((x - tx)//2, (y - ty)//2, (z - tz)//2)
             seg = seg[xs:xs+tx, ys:ys+ty, zs:zs+tz]
-        ml = brats_to_multilabel(seg)    # (3,X,Y,Z)
+        ml = brats_to_multilabel(seg).astype(np.float16)    # (3,X,Y,Z)
         xyz = ml.shape[1:]
         ys = take_view(ml, self.view)    # (S,3,H,W)
 
@@ -321,12 +349,30 @@ class BratsVolumeDataset(Dataset):
         for i in range(D):
             chans = []
             for m in MOD_ORDER:
-                t = np.array(Image.open(img_paths_by_mod[m][i]).convert("L"), dtype=np.float32) / 255.0
+                t = np.array(Image.open(img_paths_by_mod[m][i]).convert("L"), dtype=np.float16) / np.float16(255.0)
                 chans.append(t)
             frames.append(np.stack(chans, axis=0))      # (4,H,W)
         xs = np.stack(frames, axis=0)                   # (S,4,H,W)
 
         return torch.from_numpy(xs).float(), torch.from_numpy(ys).float(), {"sid": subj_dir.name, "xyz": xyz}
+
+    def _estimate_ram_gb(self):
+        """Return (total_gb, per_subject_gb, num_slices, (H, W)) estimate without loading data."""
+        # Default to target shape if probing fails.
+        slices, H, W = expected_DHW_for_view(self.view)
+        try:
+            img_paths_by_mod, _ = load_subject_nii_and_pngs(self.subjects[0], self.view)
+            slices = len(next(iter(img_paths_by_mod.values()))) or slices
+            from PIL import Image
+            sample_w, sample_h = Image.open(img_paths_by_mod[MOD_ORDER[0]][0]).size
+            H, W = sample_h, sample_w
+        except Exception:
+            pass
+
+        per_subject_bytes = slices * H * W * (len(MOD_ORDER) + len(OUT_TOKENS)) * 4  # float32
+        total_bytes = per_subject_bytes * len(self.subjects)
+        to_gb = lambda b: b / (1024 ** 3)
+        return to_gb(total_bytes), to_gb(per_subject_bytes), slices, (H, W)
 
 
 # -----------------------------
@@ -632,13 +678,13 @@ if __name__ == "__main__":
     print(f"Train slices: {len(train_ds)} | Val subjects: {len(val_ds)}")
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=2, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0, pin_memory=False)
 
     print(f"Loss weights -> lambda_bce={lambda_bce}, lambda_dice={lambda_dice}")
 
     # ---- Model/Optim ----
     model = UNetLike2D(in_channels=4, out_channels=3).to(device)
-    optimizer = torch.optim.Adadelta(model.parameters(), lr=lr, rho=rho, eps=eps, weight_decay=weight_decay)
+    optimizer = torch.optim.Adadelta(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     # ---- Train/Eval Loop ----
     best_dice = -1.0
