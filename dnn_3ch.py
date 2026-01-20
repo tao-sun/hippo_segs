@@ -338,7 +338,7 @@ class BratsVolumeDataset(Dataset):
             tx, ty, tz = TARGET_SHAPE
             xs, ys, zs = ((x - tx)//2, (y - ty)//2, (z - tz)//2)
             seg = seg[xs:xs+tx, ys:ys+ty, zs:zs+tz]
-        ml = brats_to_multilabel(seg).astype(np.float16)    # (3,X,Y,Z)
+        ml = brats_to_multilabel(seg).astype(np.float32)    # (3,X,Y,Z)
         xyz = ml.shape[1:]
         ys = take_view(ml, self.view)    # (S,3,H,W)
 
@@ -349,7 +349,7 @@ class BratsVolumeDataset(Dataset):
         for i in range(D):
             chans = []
             for m in MOD_ORDER:
-                t = np.array(Image.open(img_paths_by_mod[m][i]).convert("L"), dtype=np.float16) / np.float16(255.0)
+                t = np.array(Image.open(img_paths_by_mod[m][i]).convert("L"), dtype=np.float32) / np.float32(255.0)
                 chans.append(t)
             frames.append(np.stack(chans, axis=0))      # (4,H,W)
         xs = np.stack(frames, axis=0)                   # (S,4,H,W)
