@@ -3,3 +3,7 @@ tqdm
 nibabel
 imageio
 torchinfo
+PyYAML
+torch
+torchaudio
+torchvision

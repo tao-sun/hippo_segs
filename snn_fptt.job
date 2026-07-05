@@ -17,12 +17,19 @@ module load cuda/11.8
 module load cudnn/8.2.4
 echo "Modules loaded."
 
+# === 1.1 Activate virtual environment ===
+source "$SLURM_SUBMIT_DIR/.venv/bin/activate"
+echo "Virtual environment activated: $VIRTUAL_ENV"
+
 
 # === 2. Define and Create Output Directory ===
 # I percorsi sono rtrain_h100_np.jobelativi a $SLURM_SUBMIT_DIR (la directory da cui sottometti il job)
-OUTPUT_DIR_PERSISTENT="experiments/run_coronal_${SLURM_JOB_ID}"
+RUN_ID="brats23_axial_fold1_orig_${SLURM_JOB_ID}"
+OUTPUT_DIR_PERSISTENT="experiments/$RUN_ID"
 mkdir -p "$OUTPUT_DIR_PERSISTENT"
-echo "Output will be saved to: $SLURM_SUBMIT_DIR/$OUTPUT_DIR_PERSISTENT"
+export SNN_FPTT_RUN_ID="$RUN_ID"
+export SNN_FPTT_RUN_DIR="$SLURM_SUBMIT_DIR/$OUTPUT_DIR_PERSISTENT"
+echo "Output will be saved to: $SNN_FPTT_RUN_DIR"
 
 # === 3. Define Data Directory ===
 # Assicurati che questo percorso sia corretto rispetto a $SLURM_SUBMIT_DIR
@@ -41,5 +48,6 @@ echo "Starting Python training script..."
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 python -u snn_fptt.py \
+	--config "$SLURM_SUBMIT_DIR/experiments_snn_fptt.yaml"
 
 

@@ -5,14 +5,18 @@ import os
 import re
 import random
 import argparse
+import sys
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 import json
+import csv
+import shutil
 
 import numpy as np
 import nibabel as nib
 from tqdm import tqdm
 from datetime import datetime
+import yaml
 
 from PIL import Image
 
@@ -70,6 +74,23 @@ ALIASES = {
 OUT_TOKENS = ["et", "tc", "wt"]             # 3 output channels
 TARGET_SHAPE = (160, 192, 152)              # (x,y,z) used by preprocessing
 FOLD_NAMES = {"1", "2", "3", "4", "5"}
+
+DEFAULT_EXPERIMENTS_YAML = "experiments_snn_fptt.yaml"
+RUNS_ROOT = Path("experiments")
+
+
+class TeeWriter:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for stream in self.streams:
+            stream.write(data)
+            stream.flush()
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
 
 
 def ensure_train_root(p: Path) -> Path:
@@ -362,6 +383,277 @@ def dice_per_channel(vol_pred_bin: np.ndarray, vol_gt_bin: np.ndarray, eps: floa
         d.append(float((2 * inter + eps) / (denom + eps)))
     return np.array(d)
 
+
+def load_experiment_from_yaml(config_path: str) -> Dict:
+    with open(config_path, "r", encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle)
+
+    if not isinstance(raw, dict):
+        raise ValueError("YAML config must be a mapping at the top level")
+
+    required_keys = {
+        "name",
+        "data_root",
+        "val_fold",
+        "view",
+        "model",
+        "batch_size_subjects",
+        "lr",
+        "epochs",
+        "weight_decay",
+        "grad_clip",
+        "tbptt_k",
+        "alpha_fptt",
+        "beta_fptt",
+        "rho_fptt",
+        "lambda_fptt",
+        "lambda_bce",
+        "lambda_dice",
+        "eval_every",
+        "eval_batch_slices",
+        "prob_threshold",
+    }
+
+    missing = sorted(required_keys - set(raw))
+    if missing:
+        raise ValueError(f"YAML config is missing keys: {', '.join(missing)}")
+
+    return raw
+
+
+def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
+    start_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+    exp_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", exp_cfg["name"])
+    run_id = os.environ.get("SNN_FPTT_RUN_ID", f"{exp_name}_{start_time}")
+    run_dir = Path(os.environ.get("SNN_FPTT_RUN_DIR", RUNS_ROOT / run_id))
+    run_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = run_dir / "epoch_metrics.csv"
+    hyperparams_path = run_dir / "hyperparameters.yaml"
+    log_path = run_dir / "train.out"
+    log_file = open(log_path, "a", encoding="utf-8")
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    sys.stdout = TeeWriter(original_stdout, log_file)
+    sys.stderr = TeeWriter(original_stderr, log_file)
+
+    print(f"\n=== Experiment: {exp_name} ===")
+    print(f"Start time: {start_time}")
+    print(f"Run directory: {run_dir.resolve()}")
+    print(json.dumps(exp_cfg, indent=2, default=str))
+
+    data_root = exp_cfg["data_root"]
+    val_fold = int(exp_cfg["val_fold"])
+    view = exp_cfg["view"]
+    model_name = exp_cfg["model"]
+    epochs = int(exp_cfg["epochs"])
+    batch_size_subjects = int(exp_cfg["batch_size_subjects"])
+    lr = float(exp_cfg["lr"])
+    weight_decay = float(exp_cfg["weight_decay"])
+    grad_clip = float(exp_cfg["grad_clip"])
+    k = int(exp_cfg["tbptt_k"])
+    alpha_fptt = float(exp_cfg["alpha_fptt"])
+    beta_fptt = float(exp_cfg["beta_fptt"])
+    rho_fptt = float(exp_cfg["rho_fptt"])
+    lambda_fptt = float(exp_cfg["lambda_fptt"])
+    lambda_bce = float(exp_cfg["lambda_bce"])
+    lambda_dice = float(exp_cfg["lambda_dice"])
+    eval_every = int(exp_cfg["eval_every"])
+    eval_batch_slices = int(exp_cfg["eval_batch_slices"])
+    prob_threshold = float(exp_cfg["prob_threshold"])
+
+    config = {
+        "name": exp_name,
+        "run_id": run_id,
+        "data_root": data_root,
+        "val_fold": val_fold,
+        "view": view,
+        "model": model_name,
+        "epochs": epochs,
+        "batch_size_subjects": batch_size_subjects,
+        "lr": lr,
+        "weight_decay": weight_decay,
+        "grad_clip": grad_clip,
+        "tbptt_k": k,
+        "alpha_fptt": alpha_fptt,
+        "beta_fptt": beta_fptt,
+        "rho_fptt": rho_fptt,
+        "lambda_fptt": lambda_fptt,
+        "lambda_bce": lambda_bce,
+        "lambda_dice": lambda_dice,
+        "eval_every": eval_every,
+        "eval_batch_slices": eval_batch_slices,
+        "prob_threshold": prob_threshold,
+    }
+
+    print("\n=== CONFIG (SNN) ===")
+    print(json.dumps(config, indent=2))
+
+    with open(hyperparams_path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(config, handle, sort_keys=False)
+
+    source_files = []
+    job_file = Path(__file__).with_suffix(".job")
+    if job_file.exists():
+        source_files.append(job_file)
+    if config_path is not None:
+        config_file = Path(config_path)
+        if config_file.exists():
+            source_files.append(config_file)
+
+    copied_sources = []
+    for source_file in source_files:
+        if source_file.exists():
+            destination = run_dir / source_file.name
+            shutil.copy2(source_file, destination)
+            copied_sources.append(destination.name)
+    if copied_sources:
+        print(f"Copied source files: {', '.join(copied_sources)}")
+
+    device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+    device = torch.device(device)
+    print(f"Using device: {device}")
+
+    all_folds = {1, 2, 3, 4, 5}
+    if val_fold not in all_folds:
+        raise ValueError("val_fold must be in {1,2,3,4,5}")
+    train_folds = sorted(list(all_folds - {val_fold}))
+    print(f"Train folds: {train_folds} | Val fold: {val_fold}")
+
+    _train_root = ensure_train_root(Path(data_root))
+    for f in train_folds + [val_fold]:
+        fdir = _train_root / str(f)
+        n_subj = len([p for p in fdir.iterdir() if p.is_dir()]) if fdir.exists() else 0
+        tag = "VAL" if f == val_fold else "TRN"
+        print(f"[SCAN] Fold {f} ({tag}): {n_subj} subject dirs under {fdir}")
+
+    train_subjects = []
+    for f in train_folds:
+        dset = BratsVolumeDataset(root=data_root, val_fold=f, view=view)
+        train_subjects.append(dset)
+    if not train_subjects:
+        raise RuntimeError("No training subjects found.")
+    from torch.utils.data import ConcatDataset
+    train_ds = ConcatDataset(train_subjects)
+
+    val_ds = BratsVolumeDataset(root=data_root, val_fold=val_fold, view=view)
+    print(f"Train subjects: {len(train_ds)} | Val subjects: {len(val_ds)}")
+
+    g = torch.Generator()
+    g.manual_seed(SEED)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size_subjects, shuffle=True,
+                              num_workers=2, pin_memory=False, drop_last=False,
+                              worker_init_fn=seed_worker, generator=g)
+    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False,
+                            num_workers=2, pin_memory=True)
+
+    print(f"Loss weights -> lambda_bce={lambda_bce}, lambda_dice={lambda_dice}")
+
+    if model_name == "orig":
+        model = SNNBraTS(out_channels=3).to(device)
+    elif model_name == "shallow":
+        model = SNNBraTSUNetShallow(out_channels=3).to(device)
+    elif model_name == "medium":
+        model = SNNBraTSUNetMedium(out_channels=3).to(device)
+    elif model_name == "deep":
+        model = SNNBraTSUNetDeep(out_channels=3).to(device)
+    else:
+        raise ValueError(f"Unknown model: {model_name}")
+
+    print_model_info(model)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min')
+
+    spkmon = FiringRateMonitor(model)
+
+    best_dice = -1.0
+    best_dice_epoch = 0
+
+    with open(metrics_path, "w", newline="", encoding="utf-8") as metrics_file:
+        metrics_writer = csv.DictWriter(metrics_file, fieldnames=[
+            "epoch",
+            "train_loss",
+            "dice_ET",
+            "dice_TC",
+            "dice_WT",
+            "dice_mean",
+            "n_subjects",
+            "best_dice_mean",
+            "best_dice_epoch",
+            "checkpoint_path",
+        ])
+        metrics_writer.writeheader()
+
+        init_running_params(model)
+
+        for epoch in range(1, epochs + 1):
+            print(f"\nEpoch {epoch}/{epochs}")
+            tr_loss = train_epoch_snn_tbptt(model, train_loader, optimizer, device,
+                                    k, lambda_bce, lambda_dice,
+                                    grad_clip, spkmon,
+                                    alpha_fptt, beta_fptt,
+                                    rho_fptt, lambda_fptt)
+            scheduler.step(tr_loss)
+            print(f"  train_loss: {tr_loss:.4f}")
+
+            epoch_metrics = {
+                "epoch": epoch,
+                "train_loss": float(tr_loss),
+                "dice_ET": None,
+                "dice_TC": None,
+                "dice_WT": None,
+                "dice_mean": None,
+                "n_subjects": 0,
+                "best_dice_mean": float(best_dice),
+                "best_dice_epoch": int(best_dice_epoch),
+                "checkpoint_path": "",
+            }
+
+            if epoch % eval_every == 0:
+                metrics = evaluate_3d_snn(model,
+                                        val_loader,
+                                        device,
+                                        prob_threshold=prob_threshold,
+                                        k=k,
+                                        spkmon=spkmon)
+
+                print(f"  val dice: "
+                    f"ET={metrics['dice_ET']:.4f}  "
+                    f"TC={metrics['dice_TC']:.4f}  "
+                    f"WT={metrics['dice_WT']:.4f}  "
+                    f"mean={metrics['dice_mean']:.4f}  "
+                    f"(N={metrics['n_subjects']})")
+
+                epoch_metrics.update({
+                    "dice_ET": metrics["dice_ET"],
+                    "dice_TC": metrics["dice_TC"],
+                    "dice_WT": metrics["dice_WT"],
+                    "dice_mean": metrics["dice_mean"],
+                    "n_subjects": metrics["n_subjects"],
+                })
+
+                if metrics["dice_mean"] > best_dice:
+                    best_dice = metrics["dice_mean"]
+                    best_dice_epoch = epoch
+                    ckpt_path = run_dir / f"checkpoint_{run_id}.pt"
+                    torch.save({
+                        "model": model.state_dict(),
+                        "epoch": epoch,
+                        "dice_mean": best_dice,
+                        "config": config
+                    }, ckpt_path)
+                    epoch_metrics["checkpoint_path"] = str(ckpt_path)
+                    print(f"  Saved best model -> {ckpt_path}")
+
+            epoch_metrics["best_dice_mean"] = float(best_dice)
+            epoch_metrics["best_dice_epoch"] = int(best_dice_epoch)
+            metrics_writer.writerow(epoch_metrics)
+            metrics_file.flush()
+
+    print(f"\nBest dice: {best_dice}, epoch {best_dice_epoch}")
+    log_file.flush()
+
 # -----------------------------
 # FPTT
 # -----------------------------
@@ -579,204 +871,12 @@ def evaluate_3d_snn(model,
 # Main / Config
 # -----------------------------
 if __name__ == "__main__":
-    start_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-    print(f"Start time: {start_time}")
-
-    ap = argparse.ArgumentParser(description="3-view SNN training.")
-    ap.add_argument("--val-fold", type=int, required=True,
-                    help="1,2,3,4,5")
-    ap.add_argument("--view", type=str, required=True,
-                    help="'sagittal', 'coronal','axial'")
-    ap.add_argument("--model", choices=["orig", "shallow", "medium", "deep"], default="orig",
-                    help="Choose the BraTS model architecture")
-    ap.add_argument("--batch", type=int, default=8, help="8 or 16")
-    ap.add_argument("--lr", type=float, default=1e-3,
-                    help="1e-3 or 5e-4")
-    ap.add_argument("--year", type=str, required=True,
-                    help="17 or 23")
+    ap = argparse.ArgumentParser(description="3-view SNN training driven by a YAML experiment file.")
+    ap.add_argument("--config", type=str, default=DEFAULT_EXPERIMENTS_YAML,
+                    help="Path to YAML experiment file")
     args = ap.parse_args()
 
-    # ---- Config (edit here) ----
-    if args.year == "17":
-        data_root = "data/BRATS2017_preprocessed/Brats17TrainingData"
-    elif args.year == "23":
-        data_root = "data/BRATS2023_preprocessed/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData"
+    exp_cfg = load_experiment_from_yaml(args.config)
+    run_experiment(exp_cfg, args.config)
 
-    val_fold = args.val_fold              # int in {1..5}, used as validation
-    view = args.view            # 'sagittal' | 'coronal' | 'axial'
-
-    # training
-    epochs = 100
-    batch_size_subjects = args.batch   # subjects per batch (each provides a sequence of slices)
-    # Adadelta defaults from your prior config (works well with TBPTT)
-    # lr = 1.0
-    # rho = 0.95
-    # eps = 1e-8
-    # weight_decay = 1e-5
-    # grad_clip = 1.0
-    # Adam
-    lr = args.lr
-    rho = None
-    eps = None
-    weight_decay = 1e-5
-    grad_clip = 0.3
-    
-    # FPTT
-    k = 1  # number of slices per window, not number of updates
-    alpha_fptt = 0.1
-    beta_fptt = 0.15
-    rho_fptt = 0.0
-    lambda_fptt = 1.5
-
-    # loss weights: L = λ_bce * BCEWithLogits + λ_dice * SoftDice
-    lambda_bce = 0.5
-    lambda_dice = 0.5
-
-    # evaluation
-    eval_every = 1
-    eval_batch_slices = 16
-    prob_threshold = 0.5
-
-    config = {
-        "data_root": data_root,
-        "val_fold": val_fold,
-        "view": view,
-        "epochs": epochs,
-        "batch_size_subjects": batch_size_subjects,
-        "lr": lr,
-        "rho": rho,
-        "eps": eps,
-        "weight_decay": weight_decay,
-        "grad_clip": grad_clip,
-        "tbptt_k": k,
-        "alpha_fptt": alpha_fptt,
-        "beta_fptt": beta_fptt,
-        "rho_fptt" : rho_fptt,
-        "lambda_fptt": lambda_fptt,
-        "lambda_bce": lambda_bce,
-        "lambda_dice": lambda_dice,
-        "eval_every": eval_every,
-        "eval_batch_slices": eval_batch_slices,
-        "prob_threshold": prob_threshold
-    }
-
-    print("\n=== CONFIG (SNN) ===")
-    print(json.dumps(config, indent=2))
-
-    device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
-    device = torch.device(device)
-    print(f"Using device: {device}")
-
-    # ---- Fold selection (no train.txt) ----
-    all_folds = {1, 2, 3, 4, 5}
-    if val_fold not in all_folds:
-        raise ValueError("val_fold must be in {1,2,3,4,5}")
-    train_folds = sorted(list(all_folds - {val_fold}))
-    print(f"Train folds: {train_folds} | Val fold: {val_fold}")
-
-    # ---- Quick preflight: how many subjects per fold? ----
-    _train_root = ensure_train_root(Path(data_root))
-    for f in train_folds + [val_fold]:
-        fdir = _train_root / str(f)
-        n_subj = len([p for p in fdir.iterdir() if p.is_dir()]) if fdir.exists() else 0
-        tag = "VAL" if f == val_fold else "TRN"
-        print(f"[SCAN] Fold {f} ({tag}): {n_subj} subject dirs under {fdir}")
-
-    # ---- Data ----
-    # For SNN TBPTT, use per-subject sequences (BratsVolumeDataset) for both train and val.
-    train_subjects = []
-    for f in train_folds:
-        dset = BratsVolumeDataset(root=data_root, val_fold=f, view=view)
-        train_subjects.append(dset)
-    if not train_subjects:
-        raise RuntimeError("No training subjects found.")
-    from torch.utils.data import ConcatDataset
-    train_ds = ConcatDataset(train_subjects)
-
-    val_ds = BratsVolumeDataset(root=data_root, val_fold=val_fold, view=view)
-    print(f"Train subjects: {len(train_ds)} | Val subjects: {len(val_ds)}")
-
-    # seeded train loader
-    g = torch.Generator()
-    g.manual_seed(SEED)
-
-    train_loader = DataLoader(train_ds, batch_size=batch_size_subjects, shuffle=True,
-                              num_workers=2, pin_memory=False, drop_last=False,
-                              worker_init_fn=seed_worker, generator=g)
-
-    # train_loader = DataLoader(train_ds, batch_size=batch_size_subjects, shuffle=True,
-    #                           num_workers=2, pin_memory=False, drop_last=False)
-    val_loader   = DataLoader(val_ds, batch_size=1, shuffle=False,
-                              num_workers=2, pin_memory=True)
-
-    print(f"Loss weights -> lambda_bce={lambda_bce}, lambda_dice={lambda_dice}")
-
-    # ---- Model/Optim ----
-    if args.model == "orig":
-        model = SNNBraTS(out_channels=3).to(device)  # ET/TC/WT
-    elif args.model == "shallow":
-        model = SNNBraTSUNetShallow(out_channels=3).to(device)  # ET/TC/WT
-    elif args.model == "medium":
-        model = SNNBraTSUNetMedium(out_channels=3).to(device)  # ET/TC/WT
-    elif args.model == "deep":
-        model = SNNBraTSUNetDeep(out_channels=3).to(device)  # ET/TC/WT
-    # optimizer = torch.optim.Adadelta(model.parameters(), lr=lr, rho=rho, eps=eps, weight_decay=weight_decay)
-    print_model_info(model)
-    
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min')
-    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20)
-
-    spkmon = FiringRateMonitor(model)
-
-    # ---- Train/Eval Loop ----
-    best_dice = -1.0
-    best_dice_epoch = 0
-    
-    # ---- fptt ----
-    init_running_params(model)
-
-    for epoch in range(1, epochs + 1):
-        print(f"\nEpoch {epoch}/{epochs}")
-        tr_loss = train_epoch_snn_tbptt(model, train_loader, optimizer, device,
-                                k, lambda_bce, lambda_dice,
-                                grad_clip, spkmon, 
-                                alpha_fptt, beta_fptt,
-                                rho_fptt, lambda_fptt)
-        scheduler.step(tr_loss)
-        print(f"  train_loss: {tr_loss:.4f}")
-
-        # ---- Validation ----
-        if epoch % eval_every == 0:
-            metrics = evaluate_3d_snn(model,
-                                    val_loader,
-                                    device,
-                                    prob_threshold=prob_threshold,
-                                    k=k,
-                                    spkmon=spkmon)   # <- pass the monitor here
-
-            print(f"  val dice: "
-                f"ET={metrics['dice_ET']:.4f}  "
-                f"TC={metrics['dice_TC']:.4f}  "
-                f"WT={metrics['dice_WT']:.4f}  "
-                f"mean={metrics['dice_mean']:.4f}  "
-                f"(N={metrics['n_subjects']})")
-
-            # save best checkpoint
-            if metrics["dice_mean"] > best_dice:
-                best_dice = metrics["dice_mean"]
-                best_dice_epoch = epoch
-                ckpt_path = f"checkpoints/checkpoint_snn_fold{val_fold}_{view}_{start_time}.pt"
-                torch.save({
-                    "model": model.state_dict(),
-                    "epoch": epoch,
-                    "dice_mean": best_dice,
-                    "config": config
-                }, ckpt_path)
-                print(f"  Saved best model -> {ckpt_path}")
-
-    print(f"\nBest dice: {best_dice}, epoch {best_dice_epoch}")
-    
-    end_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-    print(f"End time: {end_time}")
     print("Done.")

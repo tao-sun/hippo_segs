@@ -10,7 +10,7 @@
 #SBATCH --nodes=1
 #SBATCH --array=1-5%5    
 
-VIEW="coronal"
+VIEW="sagittal"
 MODEL="orig"
 BATCH=16
 LR=1e-3
