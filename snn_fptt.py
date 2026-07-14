@@ -296,6 +296,40 @@ class BratsVolumeDataset(Dataset):
 
         return torch.from_numpy(xs).float(), torch.from_numpy(ys).float(), {"sid": subj_dir.name, "xyz": xyz}
 
+
+class ViewSubset(Dataset):
+    """Subset wrapper that preserves the view attribute required by 3D evaluation."""
+    def __init__(self, dataset: Dataset, indices: List[int], view: str):
+        if not indices:
+            raise ValueError("ViewSubset requires at least one index")
+        self.dataset = dataset
+        self.indices = list(indices)
+        self.view = view
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx: int):
+        return self.dataset[self.indices[idx]]
+
+
+def make_overfit_datasets(train_ds: Dataset, view: str, n_subjects: int) -> Tuple[Dataset, Dataset]:
+    """
+    Build train/validation datasets from the same first N training subjects.
+
+    This intentionally evaluates on the same examples used for training. It is
+    meant only as a fast sanity check that the model, loss, labels, and optimizer
+    can memorize a tiny dataset.
+    """
+    n_subjects = int(n_subjects)
+    if n_subjects <= 0:
+        raise ValueError("overfit_subjects must be a positive integer")
+    if n_subjects > len(train_ds):
+        raise ValueError(f"overfit_subjects={n_subjects} exceeds train subjects={len(train_ds)}")
+
+    indices = list(range(n_subjects))
+    return ViewSubset(train_ds, indices, view), ViewSubset(train_ds, indices, view)
+
 # -----------------------------
 # Firing-rate monitor
 # -----------------------------
@@ -460,6 +494,11 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
     eval_every = int(exp_cfg["eval_every"])
     eval_batch_slices = int(exp_cfg["eval_batch_slices"])
     prob_threshold = float(exp_cfg["prob_threshold"])
+    overfit_subjects = exp_cfg.get("overfit_subjects")
+    if overfit_subjects is not None:
+        overfit_subjects = int(overfit_subjects)
+        if overfit_subjects <= 0:
+            raise ValueError("overfit_subjects must be a positive integer when set")
 
     config = {
         "name": exp_name,
@@ -483,6 +522,7 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
         "eval_every": eval_every,
         "eval_batch_slices": eval_batch_slices,
         "prob_threshold": prob_threshold,
+        "overfit_subjects": overfit_subjects,
     }
 
     print("\n=== CONFIG (SNN) ===")
@@ -537,6 +577,14 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
 
     val_ds = BratsVolumeDataset(root=data_root, val_fold=val_fold, view=view)
     print(f"Train subjects: {len(train_ds)} | Val subjects: {len(val_ds)}")
+    if overfit_subjects is not None:
+        train_ds, val_ds = make_overfit_datasets(train_ds, view, overfit_subjects)
+        print(
+            "\n=== OVERFIT DEBUG MODE ===\n"
+            f"Training and evaluating on the same {overfit_subjects} subject(s).\n"
+            "Use this only to verify that the model can memorize a tiny dataset.\n"
+        )
+        print(f"Overfit train subjects: {len(train_ds)} | Overfit val subjects: {len(val_ds)}")
 
     g = torch.Generator()
     g.manual_seed(SEED)

@@ -1,13 +1,14 @@
 #!/bin/bash
 #SBATCH --job-name=TrainAxial
-#SBATCH --output=slurm_output_coronal_fptt_%j.out # Specifico per la vista
-#SBATCH --error=slurm_output_coronal_fptt_%j.err   # Specifico per la vista
-#SBATCH --time=12:00:00
-#SBATCH --partition=gpu_h100
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=18
-#SBATCH --mem=64G
+#SBATCH --output=slurm_output_axial_fptt_%j.out
+#SBATCH --error=slurm_output_axial_fptt_%j.err
+#SBATCH --time=5-00:00:00
+#SBATCH --partition=gpu_a100
 #SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=18
+#SBATCH --gpus=1
+#SBATCH --mem=64G
 
 # === 1. Load environment ===
 echo "Loading modules..."

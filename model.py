@@ -103,6 +103,66 @@ class DeconvBlock(nn.Module):
         return out
 
 
+class SSMBlock2D(nn.Module):
+    """
+    Generic 2D state-space block for a single SNN time step.
+
+    Expected input/output shape: (B, C, H, W)
+
+    This block intentionally does NOT include pooling, so it can be inserted
+    between an existing convolutional block and the pooling operation in the
+    main network.
+
+    The actual SSM/SS2D operator can be injected via `ssm_module`. If none is
+    provided, the block raises a clear error the first time it is used.
+    """
+    def __init__(self,
+                 channels: int,
+                 ssm_module: nn.Module = None,
+                 init_tau: float = 2.0,
+                 dropout: float = 0.0,
+                 normalization: bool = True):
+        super().__init__()
+        self.channels = int(channels)
+        self.dropout = float(dropout)
+        self.normalization = normalization
+        self.ssm_module = ssm_module if ssm_module is not None else nn.Identity()
+
+        self.norm = nn.GroupNorm(1, self.channels)
+        self.spike_neurons = PLIFNode(
+            init_tau=init_tau,
+            surrogate_function=surrogate.ATan(),
+            detach_reset=True,
+            no_spiking=False,
+        )
+
+    def _apply_ssm(self, x: torch.Tensor) -> torch.Tensor:
+        return self.ssm_module(x)
+
+    def forward(self, x: torch.Tensor, time_step: int) -> torch.Tensor:
+        # Allow a lightweight adapter for SS2D implementations that expect
+        # channel-last tensors: (B, H, W, C).
+        if x.ndim != 4:
+            raise ValueError(f"SSMBlock2D expects a 4D tensor (B, C, H, W), got shape={tuple(x.shape)}")
+
+        out = self._apply_ssm(x)
+
+        if out.shape != x.shape:
+            raise ValueError(
+                f"SSMBlock2D must preserve shape (B, C, H, W); got input={tuple(x.shape)} output={tuple(out.shape)}"
+            )
+
+        if self.normalization:
+            out = self.norm(out)
+
+        out, _ = self.spike_neurons(out, time_step)
+
+        if self.dropout > 0:
+            out = F.dropout(out, p=self.dropout, training=self.training)
+
+        return out
+
+
 class SNNBraTS(nn.Module):
     """
     Forward takes a window x_win: (B, k, 4, H, W) and an absolute starting time t0.
@@ -115,6 +175,7 @@ class SNNBraTS(nn.Module):
         self.conv_block1 = ConvBlock(4, 32, padding=1, dropout=0.1)
         self.conv_block2 = ConvBlock(32, 64, padding=1, dropout=0.1)
         self.conv_block3 = ConvBlock(64, 128, padding=1, dropout=0.1)
+        self.ssm_block3 = SSMBlock2D(128, dropout=0.0, normalization=True)
 
         # Decoder
         self.deconv_block1 = DeconvBlock(128, 128, dropout=0.1)
@@ -148,6 +209,7 @@ class SNNBraTS(nn.Module):
             pool2 = self.pool(x)
 
             x = self.conv_block3(pool2, time_step)
+            x = self.ssm_block3(x, time_step)
             x = self.pool(x)
 
             x = self.deconv_block1(x, time_step)

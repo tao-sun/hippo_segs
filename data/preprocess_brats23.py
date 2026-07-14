@@ -12,8 +12,8 @@ except Exception:
     import imageio
 
 # ==================== CONFIG ====================
-IN_ROOT  = Path("BRATS2023")                 # <- change me
-OUT_ROOT = Path("BRATS2023_preprocessed")    # <- will be created
+IN_ROOT = Path("/home/apiaghiardelli")
+OUT_ROOT = Path("/gpfs/scratch1/shared/apiaghiardelli/BRATS2023_preprocessed")
 TRAIN_DIR_NAME = "ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData"
 # HGG_DIR_NAME   = "HGG"                                 # ONLY process HGG
 TARGET_SHAPE   = (160, 192, 152)                       # (x,y,z)
