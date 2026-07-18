@@ -2,16 +2,20 @@
 
 ## Goal
 
-Make `snn_fptt.py` run with Hugging Face Accelerate using data-parallel
-training on one Slurm node with one or more GPUs. Preserve the existing SNN,
+Make `snn_fptt.py` run using only the public Hugging Face Accelerate API for
+data-parallel training on one Slurm node with one or more GPUs. The project
+code must not import or configure `torch.distributed`,
+`DistributedDataParallel`, or `DistributedSampler` directly; Accelerate owns
+the distributed backend. Preserve the existing SNN,
 TBPTT, FPTT, validation, metrics CSV, and checkpoint format. A normal
 single-process Python launch must remain usable.
 
 ## Considered approaches
 
-1. **Accelerate with DistributedDataParallel (selected).** One process runs
-   per GPU. Accelerate shards the data loaders and synchronizes gradients.
-   This is the smallest maintainable change and matches the requested API.
+1. **Hugging Face Accelerate only (selected).** One process runs per GPU.
+   Project code interacts only with Accelerate, which internally shards data
+   loaders and synchronizes gradients. This is the smallest maintainable
+   change and matches the requested API.
 2. **PyTorch DistributedDataParallel directly.** It offers more low-level
    control, but requires custom process setup, samplers, collectives, and
    checkpoint coordination that Accelerate already supplies.
@@ -29,10 +33,12 @@ four GPUs, the effective global batch is therefore four times the configured
 value. This gives conventional DDP semantics and avoids silently changing the
 amount of data processed by each GPU.
 
-The wrapped DDP model performs forward passes, while Accelerate's unwrapped
-model is used for FPTT state (`avg_weights` and `lambdas`), custom state
-detachment, firing-rate hooks, and serialization. This prevents the `module.`
-wrapper from changing parameter names used by the FPTT dictionaries.
+The model returned by `accelerator.prepare` performs forward passes, while
+the model returned by `accelerator.unwrap_model` is used for FPTT state
+(`avg_weights` and `lambdas`), custom state detachment, firing-rate hooks, and
+serialization. Project code does not access or depend on the underlying
+distributed wrapper. This prevents wrapper-specific parameter names from
+changing the keys used by the FPTT dictionaries.
 
 The training loop uses `accelerator.backward(loss)` and
 `accelerator.clip_grad_norm_`. Epoch loss is reduced across processes using
