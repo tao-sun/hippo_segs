@@ -103,6 +103,235 @@ class DeconvBlock(nn.Module):
         return out
 
 
+class SimpleSSM2D(nn.Module):
+    """
+    Lightweight 2D state-space module for feature maps shaped (B, C, H, W).
+
+    It applies four independent per-channel recurrent scans over the spatial
+    axes (left-to-right, right-to-left, top-to-bottom, bottom-to-top), then
+    combines them with a gated projection. The recurrent state is continuous;
+    SSMBlock2D applies the spiking neuron after this module.
+    """
+    def __init__(self,
+                 channels: int,
+                 hidden_channels: int = None,
+                 conv_kernel: int = 3,
+                 dropout: float = 0.0):
+        super().__init__()
+        self.channels = int(channels)
+        self.hidden_channels = int(hidden_channels or channels)
+        self.dropout = float(dropout)
+
+        padding = conv_kernel // 2
+        self.in_proj = nn.Conv2d(self.channels, 2 * self.hidden_channels, kernel_size=1, bias=False)
+        self.depthwise_conv = nn.Conv2d(
+            self.hidden_channels,
+            self.hidden_channels,
+            kernel_size=conv_kernel,
+            padding=padding,
+            groups=self.hidden_channels,
+            bias=True,
+        )
+        self.decay_logit = nn.Parameter(torch.zeros(4, self.hidden_channels))
+        self.input_scale_logit = nn.Parameter(torch.zeros(4, self.hidden_channels))
+        self.skip_scale = nn.Parameter(torch.full((self.hidden_channels,), 0.1))
+        self.out_norm = nn.GroupNorm(1, self.hidden_channels)
+        self.out_proj = nn.Conv2d(self.hidden_channels, self.channels, kernel_size=1, bias=False)
+
+    def _scan_width(self, x: torch.Tensor, decay: torch.Tensor,
+                    input_scale: torch.Tensor, reverse: bool = False) -> torch.Tensor:
+        B, C, H, W = x.shape
+        state = x.new_zeros(B, C, H)
+        outputs = []
+        indices = range(W - 1, -1, -1) if reverse else range(W)
+
+        decay = decay.view(1, C, 1)
+        input_scale = input_scale.view(1, C, 1)
+        for idx in indices:
+            state = decay * state + input_scale * x[:, :, :, idx]
+            outputs.append(state.unsqueeze(-1))
+
+        if reverse:
+            outputs.reverse()
+        return torch.cat(outputs, dim=-1)
+
+    def _scan_height(self, x: torch.Tensor, decay: torch.Tensor,
+                     input_scale: torch.Tensor, reverse: bool = False) -> torch.Tensor:
+        B, C, H, W = x.shape
+        state = x.new_zeros(B, C, W)
+        outputs = []
+        indices = range(H - 1, -1, -1) if reverse else range(H)
+
+        decay = decay.view(1, C, 1)
+        input_scale = input_scale.view(1, C, 1)
+        for idx in indices:
+            state = decay * state + input_scale * x[:, :, idx, :]
+            outputs.append(state.unsqueeze(2))
+
+        if reverse:
+            outputs.reverse()
+        return torch.cat(outputs, dim=2)
+
+    def _scan_2d(self, x: torch.Tensor) -> torch.Tensor:
+        decays = torch.sigmoid(self.decay_logit)
+        input_scales = F.softplus(self.input_scale_logit)
+
+        scans = [
+            self._scan_width(x, decays[0], input_scales[0], reverse=False),
+            self._scan_width(x, decays[1], input_scales[1], reverse=True),
+            self._scan_height(x, decays[2], input_scales[2], reverse=False),
+            self._scan_height(x, decays[3], input_scales[3], reverse=True),
+        ]
+        return sum(scans) * 0.25
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 4:
+            raise ValueError(f"SimpleSSM2D expects a 4D tensor (B, C, H, W), got shape={tuple(x.shape)}")
+
+        u, gate = self.in_proj(x).chunk(2, dim=1)
+        u = F.silu(self.depthwise_conv(u))
+
+        y = self._scan_2d(u)
+        y = y + self.skip_scale.view(1, -1, 1, 1) * u
+        y = self.out_norm(y)
+        y = y * torch.sigmoid(gate)
+        y = self.out_proj(y)
+
+        if self.dropout > 0:
+            y = F.dropout(y, p=self.dropout, training=self.training)
+
+        return y
+
+
+class BCHWLayerNorm(nn.Module):
+    """LayerNorm over channels for tensors shaped (B, C, H, W)."""
+    def __init__(self, channels: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(int(channels))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.permute(0, 2, 3, 1).contiguous()
+        x = self.norm(x)
+        return x.permute(0, 3, 1, 2).contiguous()
+
+
+class SS2D(nn.Module):
+    """
+    Spatial selective-scan core used inside VSSBlock2D.
+
+    The scan is diagonal-free and channel-wise: each channel learns four decay
+    and input-scale parameters for horizontal and vertical bidirectional scans.
+    """
+    def __init__(self, channels: int):
+        super().__init__()
+        self.channels = int(channels)
+        self.decay_logit = nn.Parameter(torch.zeros(4, self.channels))
+        self.input_scale_logit = nn.Parameter(torch.zeros(4, self.channels))
+
+    def _scan_width(self, x: torch.Tensor, decay: torch.Tensor,
+                    input_scale: torch.Tensor, reverse: bool = False) -> torch.Tensor:
+        B, C, H, W = x.shape
+        state = x.new_zeros(B, C, H)
+        outputs = []
+        indices = range(W - 1, -1, -1) if reverse else range(W)
+
+        decay = decay.view(1, C, 1)
+        input_scale = input_scale.view(1, C, 1)
+        for idx in indices:
+            state = decay * state + input_scale * x[:, :, :, idx]
+            outputs.append(state.unsqueeze(-1))
+
+        if reverse:
+            outputs.reverse()
+        return torch.cat(outputs, dim=-1)
+
+    def _scan_height(self, x: torch.Tensor, decay: torch.Tensor,
+                     input_scale: torch.Tensor, reverse: bool = False) -> torch.Tensor:
+        B, C, H, W = x.shape
+        state = x.new_zeros(B, C, W)
+        outputs = []
+        indices = range(H - 1, -1, -1) if reverse else range(H)
+
+        decay = decay.view(1, C, 1)
+        input_scale = input_scale.view(1, C, 1)
+        for idx in indices:
+            state = decay * state + input_scale * x[:, :, idx, :]
+            outputs.append(state.unsqueeze(2))
+
+        if reverse:
+            outputs.reverse()
+        return torch.cat(outputs, dim=2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 4:
+            raise ValueError(f"SS2D expects a 4D tensor (B, C, H, W), got shape={tuple(x.shape)}")
+
+        decays = torch.sigmoid(self.decay_logit)
+        input_scales = F.softplus(self.input_scale_logit)
+        scans = [
+            self._scan_width(x, decays[0], input_scales[0], reverse=False),
+            self._scan_width(x, decays[1], input_scales[1], reverse=True),
+            self._scan_height(x, decays[2], input_scales[2], reverse=False),
+            self._scan_height(x, decays[3], input_scales[3], reverse=True),
+        ]
+        return sum(scans) * 0.25
+
+
+class VSSBlock2D(nn.Module):
+    """
+    Vision State-Space block for tensors shaped (B, C, H, W).
+
+    Layout adapted to BCHW tensors:
+      x + Linear(LN(x)) -> DWConv -> activation -> SS2D -> LN
+          multiplied by activation(Linear(LN(x))) -> Linear
+    """
+    def __init__(self,
+                 channels: int,
+                 hidden_channels: int = None,
+                 conv_kernel: int = 3,
+                 dropout: float = 0.0):
+        super().__init__()
+        self.channels = int(channels)
+        self.hidden_channels = int(hidden_channels or channels)
+        self.dropout = float(dropout)
+
+        padding = conv_kernel // 2
+        self.norm = BCHWLayerNorm(self.channels)
+        self.in_proj = nn.Conv2d(self.channels, self.hidden_channels, kernel_size=1, bias=False)
+        self.gate_proj = nn.Conv2d(self.channels, self.hidden_channels, kernel_size=1, bias=False)
+        self.depthwise_conv = nn.Conv2d(
+            self.hidden_channels,
+            self.hidden_channels,
+            kernel_size=conv_kernel,
+            padding=padding,
+            groups=self.hidden_channels,
+            bias=True,
+        )
+        self.ss2d = SS2D(self.hidden_channels)
+        self.ss2d_norm = BCHWLayerNorm(self.hidden_channels)
+        self.out_proj = nn.Conv2d(self.hidden_channels, self.channels, kernel_size=1, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 4:
+            raise ValueError(f"VSSBlock2D expects a 4D tensor (B, C, H, W), got shape={tuple(x.shape)}")
+
+        residual = x
+        x_norm = self.norm(x)
+
+        u = self.in_proj(x_norm)
+        u = F.silu(self.depthwise_conv(u))
+        u = self.ss2d(u)
+        u = self.ss2d_norm(u)
+
+        gate = F.silu(self.gate_proj(x_norm))
+        out = self.out_proj(u * gate)
+
+        if self.dropout > 0:
+            out = F.dropout(out, p=self.dropout, training=self.training)
+
+        return residual + out
+
+
 class SSMBlock2D(nn.Module):
     """
     Generic 2D state-space block for a single SNN time step.
@@ -113,8 +342,8 @@ class SSMBlock2D(nn.Module):
     between an existing convolutional block and the pooling operation in the
     main network.
 
-    The actual SSM/SS2D operator can be injected via `ssm_module`. If none is
-    provided, the block raises a clear error the first time it is used.
+    A custom SSM/SS2D operator can be injected via `ssm_module`. If none is
+    provided, the block uses VSSBlock2D.
     """
     def __init__(self,
                  channels: int,
@@ -126,7 +355,7 @@ class SSMBlock2D(nn.Module):
         self.channels = int(channels)
         self.dropout = float(dropout)
         self.normalization = normalization
-        self.ssm_module = ssm_module if ssm_module is not None else nn.Identity()
+        self.ssm_module = VSSBlock2D(self.channels)
 
         self.norm = nn.GroupNorm(1, self.channels)
         self.spike_neurons = PLIFNode(

@@ -125,16 +125,17 @@ def find_subject_dirs(train_root: Path, folds: List[int], verbose: bool = True) 
     return subjects
 
 
-def brats_to_multilabel(mask3d: np.ndarray) -> np.ndarray:
-    """
-    BraTS integer labels {0,1,2,4} -> multilabel [ET,TC,WT]
-    Returns (3, X, Y, Z) float32 in {0,1}.
-    """
-    m = mask3d.astype(np.int32)
-    et = (m == 4)
-    tc = (m == 1) | (m == 4)
-    wt = (m == 1) | (m == 2) | (m == 4)
-    return np.stack([et, tc, wt], axis=0).astype(np.float32)
+def limit_subject_dirs(subjects: List[Path], limit: Optional[int], label: str) -> List[Path]:
+    """Return the first `limit` sorted subject directories, or all subjects when limit is None."""
+    if limit is None:
+        return subjects
+
+    limit = int(limit)
+    if limit <= 0:
+        raise ValueError("subjects_per_fold must be a positive integer when set")
+    if limit > len(subjects):
+        raise ValueError(f"subjects_per_fold={limit} exceeds available subjects={len(subjects)} for {label}")
+    return subjects[:limit]
 
 
 def brats_to_multilabel(mask3d: np.ndarray) -> np.ndarray:
@@ -252,12 +253,13 @@ class BratsVolumeDataset(Dataset):
       y_vol: (S, 3, H, W) float32
       meta:  dict with 'sid' and 'xyz'
     """
-    def __init__(self, root: str, val_fold: int, view: str):
+    def __init__(self, root: str, val_fold: int, view: str, subjects_per_fold: Optional[int] = None):
         rootp = ensure_train_root(Path(root))
         self.view = view
         if view not in VALID_VIEWS:
             raise ValueError(f"view must be one of {VALID_VIEWS}")
-        self.subjects = find_subject_dirs(rootp, [val_fold])
+        subjects = find_subject_dirs(rootp, [val_fold])
+        self.subjects = limit_subject_dirs(subjects, subjects_per_fold, f"fold {val_fold}")
 
     def __len__(self):
         return len(self.subjects)
@@ -494,6 +496,11 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
     eval_every = int(exp_cfg["eval_every"])
     eval_batch_slices = int(exp_cfg["eval_batch_slices"])
     prob_threshold = float(exp_cfg["prob_threshold"])
+    subjects_per_fold = exp_cfg.get("subjects_per_fold")
+    if subjects_per_fold is not None:
+        subjects_per_fold = int(subjects_per_fold)
+        if subjects_per_fold <= 0:
+            raise ValueError("subjects_per_fold must be a positive integer when set")
     overfit_subjects = exp_cfg.get("overfit_subjects")
     if overfit_subjects is not None:
         overfit_subjects = int(overfit_subjects)
@@ -522,6 +529,7 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
         "eval_every": eval_every,
         "eval_batch_slices": eval_batch_slices,
         "prob_threshold": prob_threshold,
+        "subjects_per_fold": subjects_per_fold,
         "overfit_subjects": overfit_subjects,
     }
 
@@ -566,16 +574,19 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
         tag = "VAL" if f == val_fold else "TRN"
         print(f"[SCAN] Fold {f} ({tag}): {n_subj} subject dirs under {fdir}")
 
+    if subjects_per_fold is not None:
+        print(f"[SUBSET] Using first {subjects_per_fold} subject(s) from each train/val fold")
+
     train_subjects = []
     for f in train_folds:
-        dset = BratsVolumeDataset(root=data_root, val_fold=f, view=view)
+        dset = BratsVolumeDataset(root=data_root, val_fold=f, view=view, subjects_per_fold=subjects_per_fold)
         train_subjects.append(dset)
     if not train_subjects:
         raise RuntimeError("No training subjects found.")
     from torch.utils.data import ConcatDataset
     train_ds = ConcatDataset(train_subjects)
 
-    val_ds = BratsVolumeDataset(root=data_root, val_fold=val_fold, view=view)
+    val_ds = BratsVolumeDataset(root=data_root, val_fold=val_fold, view=view, subjects_per_fold=subjects_per_fold)
     print(f"Train subjects: {len(train_ds)} | Val subjects: {len(val_ds)}")
     if overfit_subjects is not None:
         train_ds, val_ds = make_overfit_datasets(train_ds, view, overfit_subjects)
@@ -610,7 +621,7 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
 
     print_model_info(model)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min')
 
     spkmon = FiringRateMonitor(model)

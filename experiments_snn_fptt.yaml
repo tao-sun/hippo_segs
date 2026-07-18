@@ -1,4 +1,4 @@
-name: brats23_axial_fold1_orig_ssm_deeplayer
+name: brats23_axial_fold1_ssm
 data_root: /gpfs/scratch1/shared/apiaghiardelli/BRATS2023_preprocessed/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData
 val_fold: 1
 view: axial
@@ -18,4 +18,5 @@ lambda_dice: 0.5
 eval_every: 1
 eval_batch_slices: 16
 prob_threshold: 0.5
-# overfit_subjects: 10
+subjects_per_fold: null  # null/commented = use all subjects; otherwise first n per train/val fold
+# overfit_subjects: 5

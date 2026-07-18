@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=TrainAxial
-#SBATCH --output=slurm_output_axial_fptt_%j.out
-#SBATCH --error=slurm_output_axial_fptt_%j.err
-#SBATCH --time=5-00:00:00
+#SBATCH --output=slurm_output_axial_fptt_ssm_%j.out
+#SBATCH --error=slurm_output_axial_fptt_ssm_%j.err
+#SBATCH --time=4-00:00:00
 #SBATCH --partition=gpu_a100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -25,7 +25,7 @@ echo "Virtual environment activated: $VIRTUAL_ENV"
 
 # === 2. Define and Create Output Directory ===
 # I percorsi sono rtrain_h100_np.jobelativi a $SLURM_SUBMIT_DIR (la directory da cui sottometti il job)
-RUN_ID="brats23_axial_fold1_orig_${SLURM_JOB_ID}"
+RUN_ID="brats23_axial_fold1_orig_ssm_${SLURM_JOB_ID}"
 OUTPUT_DIR_PERSISTENT="experiments/$RUN_ID"
 mkdir -p "$OUTPUT_DIR_PERSISTENT"
 export SNN_FPTT_RUN_ID="$RUN_ID"
