@@ -24,6 +24,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
+from accelerate import Accelerator
+from accelerate.utils import broadcast_object_list
 
 # ==== use your spiking UNet-like model ====
 # SNNBraTS: forward(x_win[B,k,4,H,W], t0) -> (B, out_channels, k, H, W)
@@ -77,6 +79,46 @@ FOLD_NAMES = {"1", "2", "3", "4", "5"}
 
 DEFAULT_EXPERIMENTS_YAML = "experiments_snn_fptt.yaml"
 RUNS_ROOT = Path("experiments")
+
+
+def reduce_loss_totals(accelerator: Accelerator,
+                       loss_sum: torch.Tensor,
+                       update_count: torch.Tensor) -> float:
+    global_loss_sum = accelerator.reduce(loss_sum, reduction="sum")
+    global_update_count = accelerator.reduce(update_count, reduction="sum")
+    return (global_loss_sum / global_update_count.clamp_min(1)).item()
+
+
+def reduce_dice_totals(accelerator: Accelerator,
+                       dice_sum: torch.Tensor,
+                       subject_count: torch.Tensor) -> Dict[str, float]:
+    global_dice_sum = accelerator.reduce(dice_sum, reduction="sum")
+    global_subject_count = accelerator.reduce(subject_count, reduction="sum")
+    mean_per_class = global_dice_sum / global_subject_count.clamp_min(1)
+    return {
+        "dice_ET": mean_per_class[0].item(),
+        "dice_TC": mean_per_class[1].item(),
+        "dice_WT": mean_per_class[2].item(),
+        "dice_mean": mean_per_class.mean().item(),
+        "n_subjects": int(global_subject_count.item()),
+    }
+
+
+def save_checkpoint_if_main(accelerator: Accelerator,
+                            model: nn.Module,
+                            checkpoint_path: Path,
+                            epoch: int,
+                            dice_mean: float,
+                            config: Dict) -> bool:
+    if not accelerator.is_main_process:
+        return False
+    accelerator.save({
+        "model": accelerator.unwrap_model(model).state_dict(),
+        "epoch": epoch,
+        "dice_mean": dice_mean,
+        "config": config,
+    }, checkpoint_path)
+    return True
 
 
 class TeeWriter:
@@ -458,19 +500,33 @@ def load_experiment_from_yaml(config_path: str) -> Dict:
 
 
 def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
-    start_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+    accelerator = Accelerator()
     exp_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", exp_cfg["name"])
-    run_id = os.environ.get("SNN_FPTT_RUN_ID", f"{exp_name}_{start_time}")
+    run_metadata = [
+        datetime.now().strftime("%Y%m%d_%H%M%S")
+        if accelerator.is_main_process else None,
+        os.environ.get("SNN_FPTT_RUN_ID")
+        if accelerator.is_main_process else None,
+    ]
+    broadcast_object_list(run_metadata, from_process=0)
+    start_time, configured_run_id = run_metadata
+    run_id = configured_run_id or f"{exp_name}_{start_time}"
     run_dir = Path(os.environ.get("SNN_FPTT_RUN_DIR", RUNS_ROOT / run_id))
-    run_dir.mkdir(parents=True, exist_ok=True)
+    if accelerator.is_main_process:
+        run_dir.mkdir(parents=True, exist_ok=True)
+    accelerator.wait_for_everyone()
     metrics_path = run_dir / "epoch_metrics.csv"
     hyperparams_path = run_dir / "hyperparameters.yaml"
     log_path = run_dir / "train.out"
-    log_file = open(log_path, "a", encoding="utf-8")
+    log_file = None
     original_stdout = sys.stdout
     original_stderr = sys.stderr
-    sys.stdout = TeeWriter(original_stdout, log_file)
-    sys.stderr = TeeWriter(original_stderr, log_file)
+    if accelerator.is_main_process:
+        log_file = open(log_path, "a", encoding="utf-8")
+        sys.stdout = TeeWriter(original_stdout, log_file)
+        sys.stderr = TeeWriter(original_stderr, log_file)
+
+    print = accelerator.print
 
     print(f"\n=== Experiment: {exp_name} ===")
     print(f"Start time: {start_time}")
@@ -536,8 +592,9 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
     print("\n=== CONFIG (SNN) ===")
     print(json.dumps(config, indent=2))
 
-    with open(hyperparams_path, "w", encoding="utf-8") as handle:
-        yaml.safe_dump(config, handle, sort_keys=False)
+    if accelerator.is_main_process:
+        with open(hyperparams_path, "w", encoding="utf-8") as handle:
+            yaml.safe_dump(config, handle, sort_keys=False)
 
     source_files = []
     job_file = Path(__file__).with_suffix(".job")
@@ -549,17 +606,16 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
             source_files.append(config_file)
 
     copied_sources = []
-    for source_file in source_files:
-        if source_file.exists():
-            destination = run_dir / source_file.name
-            shutil.copy2(source_file, destination)
-            copied_sources.append(destination.name)
+    if accelerator.is_main_process:
+        for source_file in source_files:
+            if source_file.exists():
+                destination = run_dir / source_file.name
+                shutil.copy2(source_file, destination)
+                copied_sources.append(destination.name)
     if copied_sources:
         print(f"Copied source files: {', '.join(copied_sources)}")
 
-    device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
-    device = torch.device(device)
-    print(f"Using device: {device}")
+    print(f"Using device: {accelerator.device} | processes: {accelerator.num_processes}")
 
     all_folds = {1, 2, 3, 4, 5}
     if val_fold not in all_folds:
@@ -609,27 +665,32 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
     print(f"Loss weights -> lambda_bce={lambda_bce}, lambda_dice={lambda_dice}")
 
     if model_name == "orig":
-        model = SNNBraTS(out_channels=3).to(device)
+        model = SNNBraTS(out_channels=3)
     elif model_name == "shallow":
-        model = SNNBraTSUNetShallow(out_channels=3).to(device)
+        model = SNNBraTSUNetShallow(out_channels=3)
     elif model_name == "medium":
-        model = SNNBraTSUNetMedium(out_channels=3).to(device)
+        model = SNNBraTSUNetMedium(out_channels=3)
     elif model_name == "deep":
-        model = SNNBraTSUNetDeep(out_channels=3).to(device)
+        model = SNNBraTSUNetDeep(out_channels=3)
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
-    print_model_info(model)
+    if accelerator.is_main_process:
+        print_model_info(model)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min')
 
     spkmon = FiringRateMonitor(model)
+    model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
+        model, optimizer, train_loader, val_loader, scheduler
+    )
 
     best_dice = -1.0
     best_dice_epoch = 0
 
-    with open(metrics_path, "w", newline="", encoding="utf-8") as metrics_file:
+    metrics_target = metrics_path if accelerator.is_main_process else os.devnull
+    with open(metrics_target, "w", newline="", encoding="utf-8") as metrics_file:
         metrics_writer = csv.DictWriter(metrics_file, fieldnames=[
             "epoch",
             "train_loss",
@@ -642,13 +703,14 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
             "best_dice_epoch",
             "checkpoint_path",
         ])
-        metrics_writer.writeheader()
+        if accelerator.is_main_process:
+            metrics_writer.writeheader()
 
-        init_running_params(model)
+        init_running_params(accelerator.unwrap_model(model))
 
         for epoch in range(1, epochs + 1):
             print(f"\nEpoch {epoch}/{epochs}")
-            tr_loss = train_epoch_snn_tbptt(model, train_loader, optimizer, device,
+            tr_loss = train_epoch_snn_tbptt(model, train_loader, optimizer, accelerator,
                                     k, lambda_bce, lambda_dice,
                                     grad_clip, spkmon,
                                     alpha_fptt, beta_fptt,
@@ -672,7 +734,7 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
             if epoch % eval_every == 0:
                 metrics = evaluate_3d_snn(model,
                                         val_loader,
-                                        device,
+                                        accelerator,
                                         prob_threshold=prob_threshold,
                                         k=k,
                                         spkmon=spkmon)
@@ -696,22 +758,26 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
                     best_dice = metrics["dice_mean"]
                     best_dice_epoch = epoch
                     ckpt_path = run_dir / f"checkpoint_{run_id}.pt"
-                    torch.save({
-                        "model": model.state_dict(),
-                        "epoch": epoch,
-                        "dice_mean": best_dice,
-                        "config": config
-                    }, ckpt_path)
-                    epoch_metrics["checkpoint_path"] = str(ckpt_path)
-                    print(f"  Saved best model -> {ckpt_path}")
+                    if save_checkpoint_if_main(
+                        accelerator, model, ckpt_path, epoch, best_dice, config
+                    ):
+                        epoch_metrics["checkpoint_path"] = str(ckpt_path)
+                        print(f"  Saved best model -> {ckpt_path}")
+                    accelerator.wait_for_everyone()
 
             epoch_metrics["best_dice_mean"] = float(best_dice)
             epoch_metrics["best_dice_epoch"] = int(best_dice_epoch)
-            metrics_writer.writerow(epoch_metrics)
-            metrics_file.flush()
+            if accelerator.is_main_process:
+                metrics_writer.writerow(epoch_metrics)
+                metrics_file.flush()
 
     print(f"\nBest dice: {best_dice}, epoch {best_dice_epoch}")
-    log_file.flush()
+    accelerator.wait_for_everyone()
+    if log_file is not None:
+        log_file.flush()
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        log_file.close()
 
 # -----------------------------
 # FPTT
@@ -752,7 +818,7 @@ def update_running_params(model, alpha, beta):
 def train_epoch_snn_tbptt(model,
                           loader,
                           optimizer,
-                          device,
+                          accelerator,
                           k: int,
                           lambda_bce: float,
                           lambda_dice: float,
@@ -767,7 +833,8 @@ def train_epoch_snn_tbptt(model,
         model: SNN model; forward(x_win[B,k,4,H,W], t0) -> logits[B,3,k,H,W]
         loader: DataLoader yielding (xs[S,4,H,W], ys[S,3,H,W], meta)
         optimizer: torch optimizer
-        device: torch.device
+        accelerator: Hugging Face Accelerator controlling device placement,
+            backward propagation, clipping, and global reductions
         k: TBPTT window size (slices per window)
         lambda_bce, lambda_dice: loss weights
         grad_clip: max grad-norm (None to disable)
@@ -777,15 +844,17 @@ def train_epoch_snn_tbptt(model,
         epoch_loss (float)
     """
     model.train()
+    base_model = accelerator.unwrap_model(model)
     if spkmon is not None:
         spkmon.reset()
 
-    running_loss = 0.0
-    update_count = 0
-    pbar = tqdm(loader, desc=f"train (TBPTT k={k})")
+    running_loss = torch.zeros((), device=accelerator.device)
+    update_count = torch.zeros((), device=accelerator.device)
+    pbar = tqdm(loader, desc=f"train (TBPTT k={k})",
+                disable=not accelerator.is_local_main_process)
     for xs, ys, meta in pbar:
-        xs = xs.to(device, non_blocking=True)  # (B,S,4,H,W)
-        ys = ys.to(device, non_blocking=True)  # (B,S,3,H,W)
+        xs = xs.to(accelerator.device, non_blocking=True)  # (B,S,4,H,W)
+        ys = ys.to(accelerator.device, non_blocking=True)  # (B,S,3,H,W)
         B, S, C, H, W = xs.shape
 
         # Walk along the sequence in windows of length k
@@ -810,35 +879,35 @@ def train_epoch_snn_tbptt(model,
             
             # fptt
             reg_loss_value = torch.zeros([]).type_as(logits)
-            reg_loss = regularizer_loss(model, reg_loss_value, alpha, rho, lmbda)
+            reg_loss = regularizer_loss(base_model, reg_loss_value, alpha, rho, lmbda)
             loss = lambda_bce * bce + lambda_dice * dice + reg_loss
             # --------------
 
-            loss.backward()
+            accelerator.backward(loss)
             if grad_clip is not None:
-                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                accelerator.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
-            update_count += 1
+            update_count += 1.0
             
             # fptt
-            update_running_params(model, alpha, beta)
-            if hasattr(model, "detach_states"):
-                model.detach_states()
+            update_running_params(base_model, alpha, beta)
+            if hasattr(base_model, "detach_states"):
+                base_model.detach_states()
 
             
 
-            running_loss += loss.item() * xs.size(0)
+            running_loss += loss.detach() * xs.size(0)
             pbar.set_postfix({'loss': f"{loss.item():.4f}"})
 
-    epoch_loss = running_loss / update_count
+    epoch_loss = reduce_loss_totals(accelerator, running_loss, update_count)
     
 
     # ---- firing-rate report ----
-    if spkmon is not None:
+    if spkmon is not None and accelerator.is_local_main_process:
         spkmon.report(tag="Train")
 
     # ---- fptt ----
-    reset_running_params(model)
+    reset_running_params(base_model)
 
     return epoch_loss
 
@@ -846,7 +915,7 @@ def train_epoch_snn_tbptt(model,
 @torch.no_grad()
 def evaluate_3d_snn(model,
                     loader,
-                    device,
+                    accelerator,
                     prob_threshold: float = 0.5,
                     k: int = 16,
                     spkmon: Optional[FiringRateMonitor] = None):
@@ -859,7 +928,8 @@ def evaluate_3d_snn(model,
     Args:
         model: SNN model; forward(x_win[B,k,4,H,W], t0) -> logits[B,3,k,H,W]
         loader: DataLoader yielding (xs[S,4,H,W], ys[S,3,H,W], meta{'xyz',...})
-        device: torch.device
+        accelerator: Hugging Face Accelerator controlling device placement
+            and distributed metric gathering
         prob_threshold: binarization threshold for predictions
         k: TBPTT window size
         spkmon: optional FiringRateMonitor to track firing rates
@@ -872,9 +942,10 @@ def evaluate_3d_snn(model,
         spkmon.reset()
 
     dices = []
-    for xs, ys, meta in tqdm(loader, desc="eval", leave=False):
-        xs = xs.to(device)   # (1,S,4,H,W)
-        ys = ys.to(device)   # (1,S,3,H,W)
+    for xs, ys, meta in tqdm(loader, desc="eval", leave=False,
+                             disable=not accelerator.is_local_main_process):
+        xs = xs.to(accelerator.device)   # (1,S,4,H,W)
+        ys = ys.to(accelerator.device)   # (1,S,3,H,W)
         S = xs.shape[1]
         xyz = meta["xyz"]
 
@@ -907,13 +978,16 @@ def evaluate_3d_snn(model,
             inter = (p & t).sum()
             denom = p.sum() + t.sum()
             d.append((2 * inter + 1e-6) / (denom + 1e-6))
-        dices.append(np.array(d, dtype=np.float64))
+        batch_dices = torch.tensor([d], dtype=torch.float64,
+                                    device=accelerator.device)
+        gathered_dices = accelerator.gather_for_metrics(batch_dices)
+        dices.extend(gathered_dices.cpu().numpy())
 
     dices = np.array(dices) if len(dices) else np.zeros((0, 3), dtype=np.float64)
     mean_per_class = dices.mean(axis=0) if len(dices) else np.array([0.0, 0.0, 0.0], dtype=np.float64)
 
     # ---- firing-rate report ----
-    if spkmon is not None:
+    if spkmon is not None and accelerator.is_local_main_process:
         spkmon.report(tag="Eval")
 
     return {

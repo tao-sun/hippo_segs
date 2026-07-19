@@ -404,7 +404,7 @@ class SNNBraTS(nn.Module):
         self.conv_block1 = ConvBlock(4, 32, padding=1, dropout=0.1)
         self.conv_block2 = ConvBlock(32, 64, padding=1, dropout=0.1)
         self.conv_block3 = ConvBlock(64, 128, padding=1, dropout=0.1)
-        self.ssm_block3 = SSMBlock2D(128, dropout=0.0, normalization=True)
+        # self.ssm_block3 = SSMBlock2D(128, dropout=0.0, normalization=True)
 
         # Decoder
         self.deconv_block1 = DeconvBlock(128, 128, dropout=0.1)
@@ -438,7 +438,7 @@ class SNNBraTS(nn.Module):
             pool2 = self.pool(x)
 
             x = self.conv_block3(pool2, time_step)
-            x = self.ssm_block3(x, time_step)
+            # x = self.ssm_block3(x, time_step)
             x = self.pool(x)
 
             x = self.deconv_block1(x, time_step)

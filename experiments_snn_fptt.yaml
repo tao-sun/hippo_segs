@@ -1,11 +1,11 @@
-name: brats23_axial_fold1_ssm
+name: brats23_coronal_fold1
 data_root: /gpfs/scratch1/shared/apiaghiardelli/BRATS2023_preprocessed/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData
 val_fold: 1
-view: axial
+view: coronal
 model: orig
 batch_size_subjects: 8
 lr: 0.001
-epochs: 100
+epochs: 200
 weight_decay: 0.00001
 grad_clip: 0.3
 tbptt_k: 1

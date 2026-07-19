@@ -7,3 +7,4 @@ PyYAML
 torch
 torchaudio
 torchvision
+accelerate>=1.10,<2

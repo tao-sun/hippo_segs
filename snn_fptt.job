@@ -1,13 +1,13 @@
 #!/bin/bash
-#SBATCH --job-name=TrainAxial
-#SBATCH --output=slurm_output_axial_fptt_ssm_%j.out
-#SBATCH --error=slurm_output_axial_fptt_ssm_%j.err
-#SBATCH --time=4-00:00:00
+#SBATCH --job-name=TrainCoronal
+#SBATCH --output=slurm_output_coronal_fptt%j.out
+#SBATCH --error=slurm_output_coronal_fptt%j.err
+#SBATCH --time=2-12:00:00
 #SBATCH --partition=gpu_a100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=18
-#SBATCH --gpus=1
+#SBATCH --gpus=2
 #SBATCH --mem=64G
 
 # === 1. Load environment ===
@@ -24,8 +24,8 @@ echo "Virtual environment activated: $VIRTUAL_ENV"
 
 
 # === 2. Define and Create Output Directory ===
-# I percorsi sono rtrain_h100_np.jobelativi a $SLURM_SUBMIT_DIR (la directory da cui sottometti il job)
-RUN_ID="brats23_axial_fold1_orig_ssm_${SLURM_JOB_ID}"
+# I percorsi sono relativi a $SLURM_SUBMIT_DIR (la directory da cui sottometti il job)
+RUN_ID="brats23_coronal_fold1_orig_${SLURM_JOB_ID}"
 OUTPUT_DIR_PERSISTENT="experiments/$RUN_ID"
 mkdir -p "$OUTPUT_DIR_PERSISTENT"
 export SNN_FPTT_RUN_ID="$RUN_ID"
@@ -47,8 +47,27 @@ echo "Data input directory assumed to be: $SLURM_SUBMIT_DIR/$DATA_INPUT_DIR"
 # === 4. Run your script ===
 echo "Starting Python training script..."
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PYTHONUNBUFFERED=1
 
-python -u snn_fptt.py \
-	--config "$SLURM_SUBMIT_DIR/experiments_snn_fptt.yaml"
+NUM_PROCESSES="${SLURM_GPUS_ON_NODE:-1}"
+case "$NUM_PROCESSES" in
+    ''|*[!0-9]*|0)
+        echo "Invalid SLURM_GPUS_ON_NODE='$NUM_PROCESSES'; using one process."
+        NUM_PROCESSES=1
+        ;;
+esac
 
+ACCELERATE_ARGS=(
+    --num_machines 1
+    --num_processes "$NUM_PROCESSES"
+    --mixed_precision no
+)
+if (( NUM_PROCESSES > 1 )); then
+    ACCELERATE_ARGS+=(--multi_gpu)
+fi
+
+echo "Launching Accelerate with $NUM_PROCESSES process(es)."
+accelerate launch "${ACCELERATE_ARGS[@]}" \
+    snn_fptt.py \
+    --config "$SLURM_SUBMIT_DIR/experiments_snn_fptt.yaml"
 
