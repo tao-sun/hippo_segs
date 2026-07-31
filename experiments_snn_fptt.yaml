@@ -1,7 +1,7 @@
-name: brats23_coronal_fold1
+name: brats23_sagittal_fold1_mamba
 data_root: /gpfs/scratch1/shared/apiaghiardelli/BRATS2023_preprocessed/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData
 val_fold: 1
-view: coronal
+view: sagittal
 model: orig
 batch_size_subjects: 8
 lr: 0.001

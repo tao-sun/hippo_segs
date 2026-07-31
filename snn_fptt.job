@@ -1,13 +1,13 @@
 #!/bin/bash
-#SBATCH --job-name=TrainCoronal
-#SBATCH --output=slurm_output_coronal_fptt%j.out
-#SBATCH --error=slurm_output_coronal_fptt%j.err
-#SBATCH --time=2-12:00:00
+#SBATCH --job-name=TrainSagittal
+#SBATCH --output=slurm_output_sagittal_mamba_fptt%j.out
+#SBATCH --error=slurm_output_sagittal_mamba_fptt%j.err
+#SBATCH --time=3-00:00:00
 #SBATCH --partition=gpu_a100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=18
-#SBATCH --gpus=2
+#SBATCH --gpus=4
 #SBATCH --mem=64G
 
 # === 1. Load environment ===
@@ -25,7 +25,7 @@ echo "Virtual environment activated: $VIRTUAL_ENV"
 
 # === 2. Define and Create Output Directory ===
 # I percorsi sono relativi a $SLURM_SUBMIT_DIR (la directory da cui sottometti il job)
-RUN_ID="brats23_coronal_fold1_orig_${SLURM_JOB_ID}"
+RUN_ID="brats23_sagittal_fold1_orig_${SLURM_JOB_ID}"
 OUTPUT_DIR_PERSISTENT="experiments/$RUN_ID"
 mkdir -p "$OUTPUT_DIR_PERSISTENT"
 export SNN_FPTT_RUN_ID="$RUN_ID"
@@ -35,7 +35,7 @@ echo "Output will be saved to: $SNN_FPTT_RUN_DIR"
 # === 3. Define Data Directory ===
 # Assicurati che questo percorso sia corretto rispetto a $SLURM_SUBMIT_DIR
 # e a come train_h100_np.py si aspetta di trovare i dati.
-# Se train_h100_np.py costruisce 'slices_output_png/coronal' da args.data_dir,
+# Se train_h100_np.py costruisce 'slices_output_png/sagittal' da args.data_dir,
 # allora args.data_dir dovrebbe essere la directory genitore di 'slices_output_png'.
 # Esempio: se i tuoi dati sono in $SLURM_SUBMIT_DIR/data_root/slices_output_png/...
 # DATA_INPUT_DIR="data_root"

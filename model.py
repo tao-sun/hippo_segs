@@ -7,6 +7,13 @@ import torch.nn.functional as F
 import surrogate
 from spike_neurons import PLIFNode
 
+try:
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+    _MAMBA_IMPORT_ERROR = None
+except ImportError as exc:
+    selective_scan_fn = None
+    _MAMBA_IMPORT_ERROR = exc
+
 
 def print_model_info(model: nn.Module):
     """
@@ -46,15 +53,23 @@ class ConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels,
                  kernel_size=3, stride=1, padding=0,
                  dropout=0.3, init_tau=2.0,
-                 normalization=True, spiking=True):
+                 normalization=True, spiking=True, ss2d=True):
         super().__init__()
         self.dropout = float(dropout)
         self.normalization = normalization
         self.spiking = spiking
+        self.ss2d = ss2d
 
         self.conv = nn.Conv2d(in_channels, out_channels,
                               kernel_size=kernel_size,
                               stride=stride, padding=padding, bias=False)
+        
+        if self.ss2d:
+            self.ssm_module = SS2D(
+                    channels=out_channels,
+                    d_state=16,
+                    dt_rank="auto")
+
         # self.norm = nn.BatchNorm2d(out_channels)
         self.norm = nn.GroupNorm(1, out_channels)
         self.spike_neurons = PLIFNode(
@@ -66,6 +81,8 @@ class ConvBlock(nn.Module):
 
     def forward(self, x, time_step: int):
         out = self.conv(x)
+        if self.ss2d:
+            out = self.ssm_module(out)
         if self.normalization:
             out = self.norm(out)
         if self.spiking:
@@ -103,293 +120,211 @@ class DeconvBlock(nn.Module):
         return out
 
 
-class SimpleSSM2D(nn.Module):
-    """
-    Lightweight 2D state-space module for feature maps shaped (B, C, H, W).
-
-    It applies four independent per-channel recurrent scans over the spatial
-    axes (left-to-right, right-to-left, top-to-bottom, bottom-to-top), then
-    combines them with a gated projection. The recurrent state is continuous;
-    SSMBlock2D applies the spiking neuron after this module.
-    """
-    def __init__(self,
-                 channels: int,
-                 hidden_channels: int = None,
-                 conv_kernel: int = 3,
-                 dropout: float = 0.0):
-        super().__init__()
-        self.channels = int(channels)
-        self.hidden_channels = int(hidden_channels or channels)
-        self.dropout = float(dropout)
-
-        padding = conv_kernel // 2
-        self.in_proj = nn.Conv2d(self.channels, 2 * self.hidden_channels, kernel_size=1, bias=False)
-        self.depthwise_conv = nn.Conv2d(
-            self.hidden_channels,
-            self.hidden_channels,
-            kernel_size=conv_kernel,
-            padding=padding,
-            groups=self.hidden_channels,
-            bias=True,
-        )
-        self.decay_logit = nn.Parameter(torch.zeros(4, self.hidden_channels))
-        self.input_scale_logit = nn.Parameter(torch.zeros(4, self.hidden_channels))
-        self.skip_scale = nn.Parameter(torch.full((self.hidden_channels,), 0.1))
-        self.out_norm = nn.GroupNorm(1, self.hidden_channels)
-        self.out_proj = nn.Conv2d(self.hidden_channels, self.channels, kernel_size=1, bias=False)
-
-    def _scan_width(self, x: torch.Tensor, decay: torch.Tensor,
-                    input_scale: torch.Tensor, reverse: bool = False) -> torch.Tensor:
-        B, C, H, W = x.shape
-        state = x.new_zeros(B, C, H)
-        outputs = []
-        indices = range(W - 1, -1, -1) if reverse else range(W)
-
-        decay = decay.view(1, C, 1)
-        input_scale = input_scale.view(1, C, 1)
-        for idx in indices:
-            state = decay * state + input_scale * x[:, :, :, idx]
-            outputs.append(state.unsqueeze(-1))
-
-        if reverse:
-            outputs.reverse()
-        return torch.cat(outputs, dim=-1)
-
-    def _scan_height(self, x: torch.Tensor, decay: torch.Tensor,
-                     input_scale: torch.Tensor, reverse: bool = False) -> torch.Tensor:
-        B, C, H, W = x.shape
-        state = x.new_zeros(B, C, W)
-        outputs = []
-        indices = range(H - 1, -1, -1) if reverse else range(H)
-
-        decay = decay.view(1, C, 1)
-        input_scale = input_scale.view(1, C, 1)
-        for idx in indices:
-            state = decay * state + input_scale * x[:, :, idx, :]
-            outputs.append(state.unsqueeze(2))
-
-        if reverse:
-            outputs.reverse()
-        return torch.cat(outputs, dim=2)
-
-    def _scan_2d(self, x: torch.Tensor) -> torch.Tensor:
-        decays = torch.sigmoid(self.decay_logit)
-        input_scales = F.softplus(self.input_scale_logit)
-
-        scans = [
-            self._scan_width(x, decays[0], input_scales[0], reverse=False),
-            self._scan_width(x, decays[1], input_scales[1], reverse=True),
-            self._scan_height(x, decays[2], input_scales[2], reverse=False),
-            self._scan_height(x, decays[3], input_scales[3], reverse=True),
-        ]
-        return sum(scans) * 0.25
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.ndim != 4:
-            raise ValueError(f"SimpleSSM2D expects a 4D tensor (B, C, H, W), got shape={tuple(x.shape)}")
-
-        u, gate = self.in_proj(x).chunk(2, dim=1)
-        u = F.silu(self.depthwise_conv(u))
-
-        y = self._scan_2d(u)
-        y = y + self.skip_scale.view(1, -1, 1, 1) * u
-        y = self.out_norm(y)
-        y = y * torch.sigmoid(gate)
-        y = self.out_proj(y)
-
-        if self.dropout > 0:
-            y = F.dropout(y, p=self.dropout, training=self.training)
-
-        return y
-
-
-class BCHWLayerNorm(nn.Module):
-    """LayerNorm over channels for tensors shaped (B, C, H, W)."""
-    def __init__(self, channels: int):
-        super().__init__()
-        self.norm = nn.LayerNorm(int(channels))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.permute(0, 2, 3, 1).contiguous()
-        x = self.norm(x)
-        return x.permute(0, 3, 1, 2).contiguous()
-
-
 class SS2D(nn.Module):
-    """
-    Spatial selective-scan core used inside VSSBlock2D.
+    """Four-direction S6 selective scan for BCHW feature maps."""
 
-    The scan is diagonal-free and channel-wise: each channel learns four decay
-    and input-scale parameters for horizontal and vertical bidirectional scans.
-    """
-    def __init__(self, channels: int):
-        super().__init__()
-        self.channels = int(channels)
-        self.decay_logit = nn.Parameter(torch.zeros(4, self.channels))
-        self.input_scale_logit = nn.Parameter(torch.zeros(4, self.channels))
-
-    def _scan_width(self, x: torch.Tensor, decay: torch.Tensor,
-                    input_scale: torch.Tensor, reverse: bool = False) -> torch.Tensor:
-        B, C, H, W = x.shape
-        state = x.new_zeros(B, C, H)
-        outputs = []
-        indices = range(W - 1, -1, -1) if reverse else range(W)
-
-        decay = decay.view(1, C, 1)
-        input_scale = input_scale.view(1, C, 1)
-        for idx in indices:
-            state = decay * state + input_scale * x[:, :, :, idx]
-            outputs.append(state.unsqueeze(-1))
-
-        if reverse:
-            outputs.reverse()
-        return torch.cat(outputs, dim=-1)
-
-    def _scan_height(self, x: torch.Tensor, decay: torch.Tensor,
-                     input_scale: torch.Tensor, reverse: bool = False) -> torch.Tensor:
-        B, C, H, W = x.shape
-        state = x.new_zeros(B, C, W)
-        outputs = []
-        indices = range(H - 1, -1, -1) if reverse else range(H)
-
-        decay = decay.view(1, C, 1)
-        input_scale = input_scale.view(1, C, 1)
-        for idx in indices:
-            state = decay * state + input_scale * x[:, :, idx, :]
-            outputs.append(state.unsqueeze(2))
-
-        if reverse:
-            outputs.reverse()
-        return torch.cat(outputs, dim=2)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.ndim != 4:
-            raise ValueError(f"SS2D expects a 4D tensor (B, C, H, W), got shape={tuple(x.shape)}")
-
-        decays = torch.sigmoid(self.decay_logit)
-        input_scales = F.softplus(self.input_scale_logit)
-        scans = [
-            self._scan_width(x, decays[0], input_scales[0], reverse=False),
-            self._scan_width(x, decays[1], input_scales[1], reverse=True),
-            self._scan_height(x, decays[2], input_scales[2], reverse=False),
-            self._scan_height(x, decays[3], input_scales[3], reverse=True),
-        ]
-        return sum(scans) * 0.25
-
-
-class VSSBlock2D(nn.Module):
-    """
-    Vision State-Space block for tensors shaped (B, C, H, W).
-
-    Layout adapted to BCHW tensors:
-      x + Linear(LN(x)) -> DWConv -> activation -> SS2D -> LN
-          multiplied by activation(Linear(LN(x))) -> Linear
-    """
     def __init__(self,
                  channels: int,
-                 hidden_channels: int = None,
-                 conv_kernel: int = 3,
-                 dropout: float = 0.0):
+                 d_state: int = 16,
+                 dt_rank="auto",
+                 dt_min: float = 0.001,
+                 dt_max: float = 0.1,
+                 dt_init: str = "random",
+                 dt_scale: float = 1.0,
+                 dt_init_floor: float = 1e-4,
+                 device=None,
+                 dtype=None,
+                 **kwargs):
         super().__init__()
+        factory_kwargs = {"device": device, "dtype": dtype}
         self.channels = int(channels)
-        self.hidden_channels = int(hidden_channels or channels)
-        self.dropout = float(dropout)
-
-        padding = conv_kernel // 2
-        self.norm = BCHWLayerNorm(self.channels)
-        self.in_proj = nn.Conv2d(self.channels, self.hidden_channels, kernel_size=1, bias=False)
-        self.gate_proj = nn.Conv2d(self.channels, self.hidden_channels, kernel_size=1, bias=False)
-        self.depthwise_conv = nn.Conv2d(
-            self.hidden_channels,
-            self.hidden_channels,
-            kernel_size=conv_kernel,
-            padding=padding,
-            groups=self.hidden_channels,
-            bias=True,
-        )
-        self.ss2d = SS2D(self.hidden_channels)
-        self.ss2d_norm = BCHWLayerNorm(self.hidden_channels)
-        self.out_proj = nn.Conv2d(self.hidden_channels, self.channels, kernel_size=1, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.ndim != 4:
-            raise ValueError(f"VSSBlock2D expects a 4D tensor (B, C, H, W), got shape={tuple(x.shape)}")
-
-        residual = x
-        x_norm = self.norm(x)
-
-        u = self.in_proj(x_norm)
-        u = F.silu(self.depthwise_conv(u))
-        u = self.ss2d(u)
-        u = self.ss2d_norm(u)
-
-        gate = F.silu(self.gate_proj(x_norm))
-        out = self.out_proj(u * gate)
-
-        if self.dropout > 0:
-            out = F.dropout(out, p=self.dropout, training=self.training)
-
-        return residual + out
-
-
-class SSMBlock2D(nn.Module):
-    """
-    Generic 2D state-space block for a single SNN time step.
-
-    Expected input/output shape: (B, C, H, W)
-
-    This block intentionally does NOT include pooling, so it can be inserted
-    between an existing convolutional block and the pooling operation in the
-    main network.
-
-    A custom SSM/SS2D operator can be injected via `ssm_module`. If none is
-    provided, the block uses VSSBlock2D.
-    """
-    def __init__(self,
-                 channels: int,
-                 ssm_module: nn.Module = None,
-                 init_tau: float = 2.0,
-                 dropout: float = 0.0,
-                 normalization: bool = True):
-        super().__init__()
-        self.channels = int(channels)
-        self.dropout = float(dropout)
-        self.normalization = normalization
-        self.ssm_module = VSSBlock2D(self.channels)
-
-        self.norm = nn.GroupNorm(1, self.channels)
-        self.spike_neurons = PLIFNode(
-            init_tau=init_tau,
-            surrogate_function=surrogate.ATan(),
-            detach_reset=True,
-            no_spiking=False,
+        self.d_state = int(d_state)
+        self.dt_rank = (
+            math.ceil(self.channels / 16) if dt_rank == "auto" else int(dt_rank)
         )
 
-    def _apply_ssm(self, x: torch.Tensor) -> torch.Tensor:
-        return self.ssm_module(x)
+        self.selective_scan = selective_scan_fn
 
-    def forward(self, x: torch.Tensor, time_step: int) -> torch.Tensor:
-        # Allow a lightweight adapter for SS2D implementations that expect
-        # channel-last tensors: (B, H, W, C).
-        if x.ndim != 4:
-            raise ValueError(f"SSMBlock2D expects a 4D tensor (B, C, H, W), got shape={tuple(x.shape)}")
-
-        out = self._apply_ssm(x)
-
-        if out.shape != x.shape:
-            raise ValueError(
-                f"SSMBlock2D must preserve shape (B, C, H, W); got input={tuple(x.shape)} output={tuple(out.shape)}"
+        x_projs = tuple(
+            nn.Linear(
+                self.channels,
+                self.dt_rank + 2 * self.d_state,
+                bias=False,
+                **factory_kwargs,
             )
+            for _ in range(4)
+        )
+        self.x_proj_weight = nn.Parameter(
+            torch.stack([projection.weight for projection in x_projs], dim=0)
+        )
 
-        if self.normalization:
-            out = self.norm(out)
+        dt_projs = tuple(
+            self.dt_init(
+                self.dt_rank,
+                self.channels,
+                dt_scale,
+                dt_init,
+                dt_min,
+                dt_max,
+                dt_init_floor,
+                **factory_kwargs,
+            )
+            for _ in range(4)
+        )
+        self.dt_projs_weight = nn.Parameter(
+            torch.stack([projection.weight for projection in dt_projs], dim=0)
+        )
+        self.dt_projs_bias = nn.Parameter(
+            torch.stack([projection.bias for projection in dt_projs], dim=0)
+        )
 
-        out, _ = self.spike_neurons(out, time_step)
+        self.A_logs = self.A_log_init(
+            self.d_state, self.channels, copies=4, merge=True, device=device
+        )
+        self.Ds = self.D_init(self.channels, copies=4, merge=True, device=device)
 
-        if self.dropout > 0:
-            out = F.dropout(out, p=self.dropout, training=self.training)
+    @staticmethod
+    def dt_init(dt_rank, d_inner, dt_scale=1.0, dt_init="random",
+                dt_min=0.001, dt_max=0.1, dt_init_floor=1e-4,
+                **factory_kwargs):
+        dt_proj = nn.Linear(dt_rank, d_inner, bias=True, **factory_kwargs)
+        dt_init_std = dt_rank ** -0.5 * dt_scale
+        if dt_init == "constant":
+            nn.init.constant_(dt_proj.weight, dt_init_std)
+        elif dt_init == "random":
+            nn.init.uniform_(dt_proj.weight, -dt_init_std, dt_init_std)
+        else:
+            raise NotImplementedError(f"unsupported dt_init={dt_init!r}")
 
-        return out
+        dt = torch.exp(
+            torch.rand(d_inner, **factory_kwargs)
+            * (math.log(dt_max) - math.log(dt_min))
+            + math.log(dt_min)
+        ).clamp(min=dt_init_floor)
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        with torch.no_grad():
+            dt_proj.bias.copy_(inv_dt)
+        dt_proj.bias._no_reinit = True
+        return dt_proj
+
+    @staticmethod
+    def A_log_init(d_state, d_inner, copies=1, device=None, merge=True):
+        base = torch.arange(1, d_state + 1, dtype=torch.float32, device=device)
+        A = base.unsqueeze(0).repeat(d_inner, 1)
+        A_log = torch.log(A)
+        if copies > 1:
+            A_log = A_log.unsqueeze(0).repeat(copies, 1, 1)
+            if merge:
+                A_log = A_log.flatten(0, 1)
+        parameter = nn.Parameter(A_log)
+        parameter._no_weight_decay = True
+        return parameter
+
+    @staticmethod
+    def D_init(d_inner, copies=1, device=None, merge=True):
+        D = torch.ones(d_inner, device=device)
+        if copies > 1:
+            D = D.unsqueeze(0).repeat(copies, 1)
+            if merge:
+                D = D.flatten(0, 1)
+        parameter = nn.Parameter(D)
+        parameter._no_weight_decay = True
+        return parameter
+
+    @staticmethod
+    def _cross_scan(x: torch.Tensor) -> torch.Tensor:
+        batch, channels, height, width = x.shape
+        length = height * width
+        horizontal_vertical = torch.stack(
+            [
+                x.view(batch, channels, length),
+                x.transpose(2, 3).contiguous().view(batch, channels, length),
+            ],
+            dim=1,
+        )
+        return torch.cat(
+            [horizontal_vertical, torch.flip(horizontal_vertical, dims=[-1])],
+            dim=1,
+        )
+
+    @staticmethod
+    def _align_scan_outputs(out_y: torch.Tensor, height: int, width: int):
+        batch, _, channels, length = out_y.shape
+        inverse = torch.flip(out_y[:, 2:4], dims=[-1])
+        width_height = (
+            out_y[:, 1]
+            .view(batch, channels, width, height)
+            .transpose(2, 3)
+            .contiguous()
+            .view(batch, channels, length)
+        )
+        inverse_width_height = (
+            inverse[:, 1]
+            .view(batch, channels, width, height)
+            .transpose(2, 3)
+            .contiguous()
+            .view(batch, channels, length)
+        )
+        return out_y[:, 0], inverse[:, 0], width_height, inverse_width_height
+
+    def forward_core(self, x: torch.Tensor):
+        batch, channels, height, width = x.shape
+        if channels != self.channels:
+            raise ValueError(
+                f"SS2D expects {self.channels} channels, got {channels}"
+            )
+        length = height * width
+        directions = 4
+        xs = self._cross_scan(x)
+        x_dbl = torch.einsum(
+            "b k d l, k c d -> b k c l", xs, self.x_proj_weight
+        )
+        dts, Bs, Cs = torch.split(
+            x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=2
+        )
+        dts = torch.einsum(
+            "b k r l, k d r -> b k d l", dts, self.dt_projs_weight
+        )
+
+        xs_packed = xs.float().view(batch, directions * channels, length)
+        dts_packed = dts.contiguous().float().view(
+            batch, directions * channels, length
+        )
+        Bs = Bs.float().view(batch, directions, self.d_state, length)
+        Cs = Cs.float().view(batch, directions, self.d_state, length)
+        Ds = self.Ds.float().view(-1)
+        As = -torch.exp(self.A_logs.float()).view(
+            directions * channels, self.d_state
+        )
+        dt_bias = self.dt_projs_bias.float().view(-1)
+
+        out_y = self.selective_scan(
+            xs_packed,
+            dts_packed,
+            As,
+            Bs,
+            Cs,
+            Ds,
+            z=None,
+            delta_bias=dt_bias,
+            delta_softplus=True,
+            return_last_state=False,
+        ).view(batch, directions, channels, length)
+        return self._align_scan_outputs(out_y, height, width)
+
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        if x.ndim != 4:
+            raise ValueError(
+                f"SS2D expects BCHW input, got shape={tuple(x.shape)}"
+            )
+        batch, channels, height, width = x.shape
+        if channels != self.channels:
+            raise ValueError(
+                f"SS2D expects {self.channels} channels, got {channels}"
+            )
+        scans = self.forward_core(x)
+        return sum(scans).view(batch, channels, height, width)
+
 
 
 class SNNBraTS(nn.Module):
@@ -398,28 +333,31 @@ class SNNBraTS(nn.Module):
     Enumerates time_step = t0, t0+1, ..., t0+k-1 (no resets inside a sequence).
     Returns logits: (B, out_channels, k, H, W).
     """
-    def __init__(self, out_channels: int = 4):
+    def __init__(self,
+                 out_channels: int = 4,
+                 selective_scan=None,
+                 ssm_d_state: int = 16,
+                 ssm_dt_rank="auto"):
         super().__init__()
         # Encoder
-        self.conv_block1 = ConvBlock(4, 32, padding=1, dropout=0.1)
+        self.conv_block1 = ConvBlock(4, 32, padding=1, dropout=0.1, ss2d=True)
         self.conv_block2 = ConvBlock(32, 64, padding=1, dropout=0.1)
         self.conv_block3 = ConvBlock(64, 128, padding=1, dropout=0.1)
-        # self.ssm_block3 = SSMBlock2D(128, dropout=0.0, normalization=True)
 
         # Decoder
         self.deconv_block1 = DeconvBlock(128, 128, dropout=0.1)
-        self.deconv1_conv  = ConvBlock(128, 128, padding=1, dropout=0.1)
-        self.concat1_conv  = ConvBlock(128 + 64, 128, padding=1, dropout=0.1)
+        self.deconv1_conv  = ConvBlock(128, 128, padding=1, dropout=0.1, ss2d = False)
+        self.concat1_conv  = ConvBlock(128 + 64, 128, padding=1, dropout=0.1, ss2d = False)
 
         self.deconv_block2 = DeconvBlock(128, 128, dropout=0.1)
-        self.deconv2_conv  = ConvBlock(128, 128, padding=1, dropout=0.1)
-        self.concat2_conv  = ConvBlock(128 + 32, 128, padding=1, dropout=0.1)
+        self.deconv2_conv  = ConvBlock(128, 128, padding=1, dropout=0.1, ss2d = False)
+        self.concat2_conv  = ConvBlock(128 + 32, 128, padding=1, dropout=0.1, ss2d = False)
 
         self.deconv_block3 = DeconvBlock(128, 128, dropout=0.1)
-        self.deconv3_conv  = ConvBlock(128, 128, padding=1, dropout=0.1)
+        self.deconv3_conv  = ConvBlock(128, 128, padding=1, dropout=0.1, ss2d = False)
 
         # Classifier head (non-spiking); out_channels = 4 classes {0,1,2,3} where 3 corresponds to BraTS label 4
-        self.class_conv = ConvBlock(128, out_channels, padding=1, dropout=0.0, normalization=False, spiking=False)
+        self.class_conv = ConvBlock(128, out_channels, padding=1, dropout=0.0, normalization=False, spiking=False, ss2d = False)
 
         self.pool = nn.MaxPool2d(2, 2)
 
@@ -435,10 +373,10 @@ class SNNBraTS(nn.Module):
             pool1 = self.pool(x)
 
             x = self.conv_block2(pool1, time_step)
+
             pool2 = self.pool(x)
 
             x = self.conv_block3(pool2, time_step)
-            # x = self.ssm_block3(x, time_step)
             x = self.pool(x)
 
             x = self.deconv_block1(x, time_step)
