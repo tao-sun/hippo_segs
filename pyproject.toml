@@ -1,0 +1,38 @@
+[project]
+name = "hippo-segs"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "auryghia", email = "auryghia05@gmail.com" }
+]
+requires-python = ">=3.9"
+dependencies = [
+    "accelerate>=1.10,<2",
+    "mamba-ssm",
+    "nibabel>=5.3.3",
+    "numpy>=2.0.2",
+    "pillow>=11.3.0",
+    "pyyaml>=6.0.3",
+    "scikit-learn>=1.6.1",
+    "torch==2.5.1",
+    "torchinfo>=1.8.0",
+    "torchmetrics>=1.8.2",
+    "torchvision>=0.20.1",
+    "tqdm>=4.70.0",
+]
+
+[project.scripts]
+hippo-segs = "hippo_segs:main"
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+]
+
+[tool.uv.sources]
+mamba-ssm = { url = "https://github.com/state-spaces/mamba/releases/download/v2.2.6.post3/mamba_ssm-2.2.6.post3%2Bcu12torch2.5cxx11abiFALSE-cp39-cp39-linux_x86_64.whl" }

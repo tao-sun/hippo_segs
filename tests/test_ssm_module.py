@@ -4,7 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model import SNNBraTS, SS2D, SSMBlock2D
+from model import ConvBlock, SNNBraTS, SpikMamba2D
+from spike_neurons import PLIFNode
 
 
 def selective_scan_test_double(u, delta, A, B, C, D=None, z=None,
@@ -66,109 +67,97 @@ class RecordingScan:
         return torch.zeros_like(u)
 
 
-class SS2DTest(unittest.TestCase):
-    def test_initialization_matches_selective_scan_dimensions(self):
-        module = SS2D(channels=8, d_state=4,
-                      selective_scan=selective_scan_test_double)
+class PassthroughPLIF(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.time_steps = []
+
+    def forward(self, x, time_step):
+        self.time_steps.append(time_step)
+        return x, x
+
+
+class SpikMamba2DConstructionTest(unittest.TestCase):
+    def test_constructor_builds_independent_spiking_scan_stages(self):
+        module = SpikMamba2D(
+            channels=8,
+            d_state=4,
+            selective_scan=selective_scan_test_double,
+        )
 
         self.assertEqual(module.channels, 8)
         self.assertEqual(module.dt_rank, 1)
+        self.assertEqual(module.linear_m.in_features, 8)
+        self.assertEqual(module.linear_m.out_features, 8)
+        self.assertIsInstance(module.lif_1, PLIFNode)
+        self.assertIsInstance(module.lif_2, PLIFNode)
+        self.assertIsInstance(module.lif_ssm, PLIFNode)
+        self.assertIsNot(module.lif_1, module.lif_2)
+        self.assertIsNot(module.lif_1, module.lif_ssm)
+        self.assertIsNot(module.lif_2, module.lif_ssm)
+        self.assertEqual(module.scan_conv1d.in_channels, 32)
+        self.assertEqual(module.scan_conv1d.out_channels, 32)
+        self.assertEqual(module.scan_conv1d.groups, 32)
+        self.assertEqual(module.scan_conv1d.kernel_size, (3,))
+        self.assertEqual(module.scan_conv1d.padding, (1,))
         self.assertEqual(module.A_logs.shape, (32, 4))
         self.assertEqual(module.Ds.shape, (32,))
-        self.assertTrue(torch.all(-torch.exp(module.A_logs) < 0))
-        self.assertTrue(torch.allclose(module.Ds, torch.ones_like(module.Ds)))
+        self.assertIs(module.selective_scan, selective_scan_test_double)
+
+    def test_constructor_rejects_kernel_without_symmetric_same_padding(self):
+        for kernel_size in (0, 2, -1):
+            with self.subTest(kernel_size=kernel_size):
+                with self.assertRaisesRegex(
+                    ValueError, "positive odd integer"
+                ):
+                    SpikMamba2D(
+                        channels=4,
+                        conv_kernel_size=kernel_size,
+                        selective_scan=selective_scan_test_double,
+                    )
+
+    def test_selective_parameters_keep_stable_initialization(self):
+        module = SpikMamba2D(
+            channels=8,
+            d_state=4,
+            selective_scan=selective_scan_test_double,
+        )
+
         initialized_dt = F.softplus(module.dt_projs_bias)
         self.assertGreaterEqual(float(initialized_dt.min()), 0.001 - 1e-6)
         self.assertLessEqual(float(initialized_dt.max()), 0.1 + 1e-6)
-        self.assertFalse(hasattr(module, "in_proj"))
-        self.assertFalse(hasattr(module, "conv2d"))
-        self.assertFalse(hasattr(module, "out_norm"))
-        self.assertFalse(hasattr(module, "out_proj"))
+        self.assertTrue(torch.all(-torch.exp(module.A_logs) < 0))
+        self.assertTrue(torch.equal(module.Ds, torch.ones_like(module.Ds)))
 
-    def test_cross_scan_uses_vmunet_direction_order(self):
-        module = SS2D(channels=1, d_state=1,
-                      selective_scan=selective_scan_test_double)
-        x = torch.tensor([[[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]]])
-
-        scans = module._cross_scan(x)
-
-        expected = torch.tensor([[[[1, 2, 3, 4, 5, 6]],
-                                  [[1, 4, 2, 5, 3, 6]],
-                                  [[6, 5, 4, 3, 2, 1]],
-                                  [[6, 3, 5, 2, 4, 1]]]], dtype=torch.float32)
-        self.assertTrue(torch.equal(scans, expected))
-
-    def test_forward_core_calls_official_kernel_contract(self):
-        recorder = RecordingScan()
-        module = SS2D(channels=4, d_state=3,
-                      selective_scan=recorder)
-
-        output = module(torch.randn(2, 4, 2, 3))
-
-        self.assertEqual(output.shape, torch.Size((2, 4, 2, 3)))
-        self.assertEqual(recorder.call["u"], torch.Size((2, 16, 6)))
-        self.assertEqual(recorder.call["delta"], torch.Size((2, 16, 6)))
-        self.assertEqual(recorder.call["A"], torch.Size((16, 3)))
-        self.assertEqual(recorder.call["B"], torch.Size((2, 4, 3, 6)))
-        self.assertEqual(recorder.call["C"], torch.Size((2, 4, 3, 6)))
-        self.assertEqual(recorder.call["D"], torch.Size((16,)))
-        self.assertEqual(recorder.call["delta_bias"], torch.Size((16,)))
-        self.assertIsNone(recorder.call["z"])
-        self.assertTrue(recorder.call["delta_softplus"])
-        self.assertFalse(recorder.call["return_last_state"])
-
-    def test_ss2d_forward_preserves_bchw_shape_and_backpropagates(self):
-        torch.manual_seed(0)
-        module = SS2D(channels=8, d_state=2,
-                      selective_scan=selective_scan_test_double)
-        x = torch.randn(2, 8, 5, 6, requires_grad=True)
-
-        y = module(x)
-        y.square().mean().backward()
-
-        self.assertEqual(y.shape, x.shape)
-        self.assertIsNotNone(x.grad)
-        self.assertGreater(float(x.grad.abs().sum()), 0.0)
-
-
-class SS2DIntegrationTest(unittest.TestCase):
-    def test_ssm_block_honors_injected_module(self):
-        injected = nn.Identity()
-        block = SSMBlock2D(channels=8, ssm_module=injected,
-                           dropout=0.0, normalization=True)
-
-        self.assertIs(block.ssm_module, injected)
-
-    def test_ssm_block_applies_residual_around_injected_ss2d(self):
-        class Double(nn.Module):
-            def forward(self, x):
-                return 2 * x
-
-        block = SSMBlock2D(channels=8, ssm_module=Double(),
-                           dropout=0.0, normalization=True)
-        x = torch.randn(2, 8, 5, 6)
-
-        self.assertTrue(torch.equal(block._apply_ssm(x), 3 * x))
-
-    def test_snn_brats_activates_direct_ss2d(self):
-        torch.manual_seed(0)
-        model = SNNBraTS(
-            out_channels=4,
+class SpikMamba2DScanTest(unittest.TestCase):
+    def test_prepare_scans_preserves_direction_order_and_filters_independently(self):
+        module = SpikMamba2D(
+            channels=1,
+            d_state=1,
             selective_scan=selective_scan_test_double,
-            ssm_d_state=2,
         )
-        x = torch.randn(1, 1, 4, 16, 16)
+        module.linear_m = nn.Identity()
+        module.lif_1 = PassthroughPLIF()
+        module.lif_2 = PassthroughPLIF()
+        with torch.no_grad():
+            module.scan_conv1d.weight.zero_()
+            module.scan_conv1d.bias.zero_()
+            module.scan_conv1d.weight[:, 0, 1] = torch.tensor(
+                [1.0, 2.0, 3.0, 4.0]
+            )
+        F_in = torch.tensor([[[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]]])
 
-        y = model(x, t0=0)
+        scans = module._prepare_scans(F_in, time_step=7)
 
-        self.assertEqual(y.shape, (1, 4, 1, 16, 16))
-        self.assertIsInstance(model.ssm_block3, SSMBlock2D)
-        self.assertIsInstance(model.ssm_block3.ssm_module, SS2D)
-        self.assertIs(
-            model.ssm_block3.ssm_module.selective_scan,
-            selective_scan_test_double,
+        expected = torch.tensor(
+            [[[[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]],
+              [[2.0, 8.0, 4.0, 10.0, 6.0, 12.0]],
+              [[18.0, 15.0, 12.0, 9.0, 6.0, 3.0]],
+              [[24.0, 12.0, 20.0, 8.0, 16.0, 4.0]]]]
         )
-
+        self.assertTrue(torch.equal(scans, expected))
+        self.assertEqual(module.lif_1.time_steps, [7])
+        self.assertEqual(module.lif_2.time_steps, [7])
 
 if __name__ == "__main__":
     unittest.main()

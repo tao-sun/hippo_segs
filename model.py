@@ -64,14 +64,25 @@ class ConvBlock(nn.Module):
                               kernel_size=kernel_size,
                               stride=stride, padding=padding, bias=False)
         
-        if self.ss2d:
-            self.ssm_module = SS2D(
-                    channels=out_channels,
-                    d_state=16,
-                    dt_rank="auto")
+        # if self.ss2d:
+            # self.ssm_module = SS2D(
+            #         channels=out_channels,
+            #         d_state=16,
+            #         dt_rank="auto")
+            # self.pre_ssm_spike_neurons = PLIFNode(
+            #     init_tau=init_tau,
+            #     surrogate_function=surrogate.ATan(),
+            #     detach_reset=True,
+            #     no_spiking=(not spiking)
+            # )
+
+            # self.pre_norm = nn.GroupNorm(1, out_channels)
 
         # self.norm = nn.BatchNorm2d(out_channels)
         self.norm = nn.GroupNorm(1, out_channels)
+
+
+
         self.spike_neurons = PLIFNode(
             init_tau=init_tau,
             surrogate_function=surrogate.ATan(),
@@ -81,10 +92,12 @@ class ConvBlock(nn.Module):
 
     def forward(self, x, time_step: int):
         out = self.conv(x)
-        if self.ss2d:
-            out = self.ssm_module(out)
+        # if self.ss2d:
+        #     out = self.ssm_module(out)
+
         if self.normalization:
             out = self.norm(out)
+
         if self.spiking:
             out, _ = self.spike_neurons(out, time_step)
         else:
@@ -120,22 +133,33 @@ class DeconvBlock(nn.Module):
         return out
 
 
-class SS2D(nn.Module):
-    """Four-direction S6 selective scan for BCHW feature maps."""
+class SpikMamba2D(nn.Module):
+    """Stateful spiking four-direction selective scan for BCHW features."""
 
     def __init__(self,
                  channels: int,
                  d_state: int = 16,
                  dt_rank="auto",
+                 conv_kernel_size: int = 3,
+                 init_tau: float = 2.0,
+                 selective_scan=None,
+                 device=None,
+                 dtype=None,
                  dt_min: float = 0.001,
                  dt_max: float = 0.1,
                  dt_init: str = "random",
                  dt_scale: float = 1.0,
-                 dt_init_floor: float = 1e-4,
-                 device=None,
-                 dtype=None,
-                 **kwargs):
+                 dt_init_floor: float = 1e-4):
         super().__init__()
+        if (
+            not isinstance(conv_kernel_size, int)
+            or conv_kernel_size <= 0
+            or conv_kernel_size % 2 == 0
+        ):
+            raise ValueError(
+                "conv_kernel_size must be a positive odd integer"
+            )
+
         factory_kwargs = {"device": device, "dtype": dtype}
         self.channels = int(channels)
         self.d_state = int(d_state)
@@ -143,7 +167,36 @@ class SS2D(nn.Module):
             math.ceil(self.channels / 16) if dt_rank == "auto" else int(dt_rank)
         )
 
-        self.selective_scan = selective_scan_fn
+        self.linear_m = nn.Linear(
+            self.channels, self.channels, **factory_kwargs
+        )
+        self.lif_1 = PLIFNode(
+            init_tau=init_tau,
+            surrogate_function=surrogate.ATan(),
+            detach_reset=True,
+        )
+        self.scan_conv1d = nn.Conv1d(
+            4 * self.channels,
+            4 * self.channels,
+            kernel_size=conv_kernel_size,
+            padding=conv_kernel_size // 2,
+            groups=4 * self.channels,
+            device=device,
+            dtype=dtype,
+        )
+        self.lif_2 = PLIFNode(
+            init_tau=init_tau,
+            surrogate_function=surrogate.ATan(),
+            detach_reset=True,
+        )
+        self.lif_ssm = PLIFNode(
+            init_tau=init_tau,
+            surrogate_function=surrogate.ATan(),
+            detach_reset=True,
+        )
+        self.selective_scan = (
+            selective_scan if selective_scan is not None else selective_scan_fn
+        )
 
         x_projs = tuple(
             nn.Linear(

@@ -1,11 +1,11 @@
-name: brats23_sagittal_fold1_mamba
+name: brats23_sagittal_fold1_spikemamba
 data_root: /gpfs/scratch1/shared/apiaghiardelli/BRATS2023_preprocessed/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData
 val_fold: 1
 view: sagittal
 model: orig
 batch_size_subjects: 8
 lr: 0.001
-epochs: 200
+epochs: 120
 weight_decay: 0.00001
 grad_clip: 0.3
 tbptt_k: 1

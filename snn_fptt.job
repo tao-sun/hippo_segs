@@ -1,53 +1,88 @@
 #!/bin/bash
 #SBATCH --job-name=TrainSagittal
-#SBATCH --output=slurm_output_sagittal_mamba_fptt%j.out
-#SBATCH --error=slurm_output_sagittal_mamba_fptt%j.err
+#SBATCH --output=slurm_output_sagittal_spikemamba_fptt%j.out
+#SBATCH --error=slurm_output_sagittal_spikemamba_fptt%j.err
 #SBATCH --time=3-00:00:00
-#SBATCH --partition=gpu_a100
+#SBATCH --partition=gpu_h100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=18
 #SBATCH --gpus=4
 #SBATCH --mem=64G
 
-# === 1. Load environment ===
+set -euo pipefail
+
 echo "Loading modules..."
 module purge
 module load python/3.9
-module load cuda/11.8
-module load cudnn/8.2.4
 echo "Modules loaded."
 
-# === 1.1 Activate virtual environment ===
-source "$SLURM_SUBMIT_DIR/.venv/bin/activate"
-echo "Virtual environment activated: $VIRTUAL_ENV"
+cd "$SLURM_SUBMIT_DIR"
 
+VENV_DIR="$SLURM_SUBMIT_DIR/.venv"
+PYTHON_BIN="$VENV_DIR/bin/python"
+ACCELERATE_BIN="$VENV_DIR/bin/accelerate"
 
-# === 2. Define and Create Output Directory ===
-# I percorsi sono relativi a $SLURM_SUBMIT_DIR (la directory da cui sottometti il job)
-RUN_ID="brats23_sagittal_fold1_orig_${SLURM_JOB_ID}"
-OUTPUT_DIR_PERSISTENT="experiments/$RUN_ID"
-mkdir -p "$OUTPUT_DIR_PERSISTENT"
-export SNN_FPTT_RUN_ID="$RUN_ID"
-export SNN_FPTT_RUN_DIR="$SLURM_SUBMIT_DIR/$OUTPUT_DIR_PERSISTENT"
-echo "Output will be saved to: $SNN_FPTT_RUN_DIR"
+if [[ ! -x "$PYTHON_BIN" ]]; then
+    echo "ERROR: uv virtual environment not found at $VENV_DIR" >&2
+    echo "Run 'uv sync --frozen --python 3.9' before submitting the job." >&2
+    exit 1
+fi
 
-# === 3. Define Data Directory ===
-# Assicurati che questo percorso sia corretto rispetto a $SLURM_SUBMIT_DIR
-# e a come train_h100_np.py si aspetta di trovare i dati.
-# Se train_h100_np.py costruisce 'slices_output_png/sagittal' da args.data_dir,
-# allora args.data_dir dovrebbe essere la directory genitore di 'slices_output_png'.
-# Esempio: se i tuoi dati sono in $SLURM_SUBMIT_DIR/data_root/slices_output_png/...
-# DATA_INPUT_DIR="data_root"
-# Se i tuoi dati sono in $SLURM_SUBMIT_DIR/data/BraTS-GLI-2024/slices_output_png/...
-DATA_INPUT_DIR="data/" # Come nel tuo script originale
-echo "Data input directory assumed to be: $SLURM_SUBMIT_DIR/$DATA_INPUT_DIR"
+if [[ ! -x "$ACCELERATE_BIN" ]]; then
+    echo "ERROR: accelerate is not installed in $VENV_DIR" >&2
+    exit 1
+fi
 
-
-# === 4. Run your script ===
-echo "Starting Python training script..."
+export VIRTUAL_ENV="$VENV_DIR"
+export PATH="$VENV_DIR/bin:$PATH"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONUNBUFFERED=1
+
+echo "Using virtual environment: $VIRTUAL_ENV"
+"$PYTHON_BIN" --version
+
+RUN_ID="brats23_sagittal_fold1_orig_${SLURM_JOB_ID}"
+OUTPUT_DIR_PERSISTENT="$SLURM_SUBMIT_DIR/experiments/$RUN_ID"
+mkdir -p "$OUTPUT_DIR_PERSISTENT"
+export SNN_FPTT_RUN_ID="$RUN_ID"
+export SNN_FPTT_RUN_DIR="$OUTPUT_DIR_PERSISTENT"
+echo "Output will be saved to: $SNN_FPTT_RUN_DIR"
+
+DATA_INPUT_DIR="$SLURM_SUBMIT_DIR/data"
+echo "Data input directory assumed to be: $DATA_INPUT_DIR"
+
+echo "Checking Python, CUDA, and Mamba runtime..."
+"$PYTHON_BIN" -c '
+import sys
+
+import accelerate
+import nibabel
+import PIL
+import torch
+import tqdm
+import yaml
+from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+
+print(f"Python: {sys.version.split()[0]}")
+print(f"Accelerate: {accelerate.__version__}")
+print(f"Torch: {torch.__version__}")
+print(f"Torch CUDA: {torch.version.cuda}")
+print(f"CUDA available: {torch.cuda.is_available()}")
+print(f"GPU count: {torch.cuda.device_count()}")
+print(f"CXX11 ABI: {torch._C._GLIBCXX_USE_CXX11_ABI}")
+
+if sys.version_info[:2] != (3, 9):
+    raise RuntimeError("The Mamba wheel requires Python 3.9")
+if not torch.__version__.startswith("2.5."):
+    raise RuntimeError("The Mamba wheel requires PyTorch 2.5.x")
+if torch.version.cuda is None or not torch.version.cuda.startswith("12."):
+    raise RuntimeError("The Mamba wheel requires a CUDA 12 PyTorch build")
+if torch._C._GLIBCXX_USE_CXX11_ABI:
+    raise RuntimeError("The Mamba wheel requires CXX11 ABI=False")
+if not torch.cuda.is_available():
+    raise RuntimeError("CUDA is not available on the allocated node")
+'
 
 NUM_PROCESSES="${SLURM_GPUS_ON_NODE:-1}"
 case "$NUM_PROCESSES" in
@@ -62,12 +97,12 @@ ACCELERATE_ARGS=(
     --num_processes "$NUM_PROCESSES"
     --mixed_precision no
 )
+
 if (( NUM_PROCESSES > 1 )); then
     ACCELERATE_ARGS+=(--multi_gpu)
 fi
 
 echo "Launching Accelerate with $NUM_PROCESSES process(es)."
-accelerate launch "${ACCELERATE_ARGS[@]}" \
-    snn_fptt.py \
+"$ACCELERATE_BIN" launch "${ACCELERATE_ARGS[@]}" \
+    "$SLURM_SUBMIT_DIR/snn_fptt.py" \
     --config "$SLURM_SUBMIT_DIR/experiments_snn_fptt.yaml"
-
