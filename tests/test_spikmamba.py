@@ -319,25 +319,49 @@ def test_scan_length_is_patch_count_with_no_direction_axis():
     assert module.sl_ssm.time_steps == [7]
 
 
-def test_mamba_plifs_continue_then_restart_at_time_zero():
+def test_full_mamba_path_plifs_continue_then_restart_at_time_zero():
     module = SpikeMambaLayer(
         2,
         d_state=2,
+        d_conv=1,
         expand=1,
-        selective_scan=RecordingScan(),
+        bias=True,
+        selective_scan=continuous_selective_scan_reference,
     )
-    stimulus = torch.full((1, 2, 3), 0.5)
+    with torch.no_grad():
+        module.linear_m.weight.zero_()
+        module.linear_m.bias.fill_(1.0)
+        module.conv1d_m.weight.zero_()
+        module.conv1d_m.bias.fill_(1.5)
+        module.x_proj.weight.fill_(0.1)
+        module.out_proj.weight.fill_(0.01)
+        module.out_proj.bias.zero_()
+    patches = torch.zeros(1, 2, 1, 3)
+    stages = {
+        "sl_m1": module.sl_m1,
+        "sl_m2": module.sl_m2,
+        "sl_ssm": module.sl_ssm,
+    }
 
-    for stage in (module.sl_m1, module.sl_m2, module.sl_ssm):
-        stage(stimulus, 0)
-        first = stage.v.detach().clone()
-        stage(stimulus, 1)
-        continued = stage.v.detach().clone()
-        stage(stimulus, 0)
-        restarted = stage.v.detach().clone()
+    module(patches, time_step=0)
+    first = {
+        name: stage.v.detach().clone()
+        for name, stage in stages.items()
+    }
+    module(patches, time_step=1)
+    continued = {
+        name: stage.v.detach().clone()
+        for name, stage in stages.items()
+    }
+    module(patches, time_step=0)
+    restarted = {
+        name: stage.v.detach().clone()
+        for name, stage in stages.items()
+    }
 
-        assert not torch.allclose(first, continued)
-        torch.testing.assert_close(first, restarted)
+    for name in stages:
+        assert not torch.allclose(first[name], continued[name])
+        torch.testing.assert_close(first[name], restarted[name])
 
 
 def test_conv1d_is_causal_and_preserves_length():
@@ -383,6 +407,38 @@ def test_mamba_rejects_bad_configuration(kwargs):
     with pytest.raises((ValueError, NotImplementedError)):
         SpikeMambaLayer(
             selective_scan=RecordingScan(), **kwargs
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"dt_min": float("nan")},
+        {"dt_min": float("inf")},
+        {"dt_max": float("nan")},
+        {"dt_max": float("inf")},
+        {"dt_init_floor": float("nan")},
+        {"dt_init_floor": float("inf")},
+        {"dt_scale": float("nan")},
+        {"dt_scale": float("inf")},
+    ],
+)
+def test_mamba_rejects_nonfinite_delta_configuration(kwargs):
+    with pytest.raises(ValueError, match="finite"):
+        SpikeMambaLayer(
+            dim=4,
+            selective_scan=RecordingScan(),
+            **kwargs,
+        )
+
+
+def test_mamba_rejects_delta_floor_above_maximum():
+    with pytest.raises(ValueError, match="dt_init_floor"):
+        SpikeMambaLayer(
+            dim=4,
+            dt_max=0.1,
+            dt_init_floor=0.2,
+            selective_scan=RecordingScan(),
         )
 
 
@@ -434,6 +490,29 @@ def test_block_ffn_uses_four_times_channel_width_and_gelu():
     assert isinstance(block.ffn[3], nn.Linear)
     assert block.ffn[3].in_features == 24
     assert block.ffn[3].out_features == 6
+
+
+def test_block_propagates_device_and_dtype_to_private_ffn():
+    block = SpikMambaBlock(
+        dim=4,
+        d_state=2,
+        expand=1,
+        device=torch.device("meta"),
+        dtype=torch.float64,
+    )
+
+    assert {parameter.device.type for parameter in block.parameters()} == {
+        "meta"
+    }
+    for parameter in (
+        block.ffn_norm.weight,
+        block.ffn_norm.bias,
+        block.ffn[0].weight,
+        block.ffn[0].bias,
+        block.ffn[3].weight,
+        block.ffn[3].bias,
+    ):
+        assert parameter.dtype == torch.float64
 
 
 def test_public_api_and_module_tree_contain_no_attention_or_cross_scan():
@@ -505,6 +584,12 @@ def test_embedding_and_block_forward_backward_on_cpu():
         expand=2,
         selective_scan=continuous_selective_scan_reference,
     )
+    with torch.no_grad():
+        block.mamba_layer.conv1d_m.weight.zero_()
+        block.mamba_layer.conv1d_m.bias.fill_(3.0)
+        block.mamba_layer.x_proj.weight.fill_(0.1)
+        block.mamba_layer.dt_proj.weight.fill_(0.1)
+        block.mamba_layer.out_proj.weight.fill_(0.1)
 
     image = torch.randn(2, 4, 8, 12, requires_grad=True)
     patches = embedding(image, time_step=0)
@@ -517,14 +602,55 @@ def test_embedding_and_block_forward_backward_on_cpu():
     assert image.grad is not None
     assert torch.isfinite(image.grad).all()
     assert torch.count_nonzero(image.grad).item() > 0
-    parameter_grads = [
-        parameter.grad
-        for parameter in list(embedding.parameters()) + list(block.parameters())
-        if parameter.grad is not None
-    ]
-    assert parameter_grads
-    assert all(torch.isfinite(grad).all() for grad in parameter_grads)
-    assert any(torch.count_nonzero(grad).item() > 0 for grad in parameter_grads)
+    core_parameters = {
+        "A_log": block.mamba_layer.A_log,
+        "D": block.mamba_layer.D,
+        "x_proj.weight": block.mamba_layer.x_proj.weight,
+        "dt_proj.weight": block.mamba_layer.dt_proj.weight,
+        "dt_proj.bias": block.mamba_layer.dt_proj.bias,
+        "out_proj.weight": block.mamba_layer.out_proj.weight,
+    }
+    for name, parameter in core_parameters.items():
+        assert parameter.grad is not None, f"{name} did not receive a gradient"
+        assert torch.isfinite(parameter.grad).all(), (
+            f"{name} received a non-finite gradient"
+        )
+        assert torch.count_nonzero(parameter.grad).item() > 0, (
+            f"{name} received only zero gradients"
+        )
+
+
+def test_default_selective_scan_forward_backward_on_cuda():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    if spikmamba.selective_scan_fn is None:
+        pytest.skip("mamba_ssm selective scan backend is unavailable")
+
+    torch.manual_seed(7)
+    layer = SpikeMambaLayer(
+        dim=4,
+        d_state=2,
+        d_conv=2,
+        expand=1,
+        device=torch.device("cuda"),
+    )
+    assert layer.selective_scan is spikmamba.selective_scan_fn
+    patches = torch.randn(
+        2,
+        4,
+        2,
+        3,
+        device="cuda",
+        requires_grad=True,
+    )
+
+    output = layer(patches, time_step=0)
+    output.square().mean().backward()
+
+    assert output.shape == patches.shape
+    assert torch.isfinite(output).all()
+    assert patches.grad is not None
+    assert torch.isfinite(patches.grad).all()
 
 
 def test_block_preserves_a_non_square_patch_grid():

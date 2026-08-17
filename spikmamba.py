@@ -165,10 +165,15 @@ class SpikeMambaLayer(nn.Module):
             if dt_rank == "auto"
             else _positive_int("dt_rank", dt_rank)
         )
+        if not all(
+            math.isfinite(value)
+            for value in (dt_min, dt_max, dt_scale, dt_init_floor)
+        ):
+            raise ValueError("Delta configuration values must be finite")
         if dt_min <= 0 or dt_max <= 0 or dt_min > dt_max:
             raise ValueError("require 0 < dt_min <= dt_max")
-        if dt_init_floor <= 0:
-            raise ValueError("dt_init_floor must be positive")
+        if dt_init_floor <= 0 or dt_init_floor > dt_max:
+            raise ValueError("require 0 < dt_init_floor <= dt_max")
         if dt_init not in {"constant", "random"}:
             raise NotImplementedError(f"unsupported dt_init={dt_init!r}")
 
@@ -328,13 +333,18 @@ class SpikMambaBlock(nn.Module):
         if hidden_dim < 1:
             raise ValueError("mlp_ratio produces an empty hidden dimension")
 
+        factory_kwargs = {
+            name: mamba_kwargs[name]
+            for name in ("device", "dtype")
+            if name in mamba_kwargs
+        }
         self.mamba_layer = SpikeMambaLayer(dim=self.dim, **mamba_kwargs)
-        self.ffn_norm = nn.LayerNorm(self.dim)
+        self.ffn_norm = nn.LayerNorm(self.dim, **factory_kwargs)
         self.ffn = nn.Sequential(
-            nn.Linear(self.dim, hidden_dim),
+            nn.Linear(self.dim, hidden_dim, **factory_kwargs),
             nn.GELU(),
             nn.Dropout(float(dropout)),
-            nn.Linear(hidden_dim, self.dim),
+            nn.Linear(hidden_dim, self.dim, **factory_kwargs),
             nn.Dropout(float(dropout)),
         )
 
