@@ -1,6 +1,8 @@
 """Patch-based spiking Mamba components for per-frame BCHW features."""
 
-from typing import Tuple
+import math
+
+from typing import Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -9,7 +11,14 @@ import torch.nn.functional as F
 import surrogate
 from spike_neurons import PLIFNode
 
-__all__ = ["Spiking2DPatchEmbedding"]
+try:
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+    _MAMBA_IMPORT_ERROR = None
+except ImportError as exc:
+    selective_scan_fn = None
+    _MAMBA_IMPORT_ERROR = exc
+
+__all__ = ["SpikeMambaLayer", "Spiking2DPatchEmbedding"]
 
 
 def _positive_int(name: str, value: int) -> int:
@@ -117,3 +126,178 @@ class Spiking2DPatchEmbedding(nn.Module):
             1, self.embed_dim, 1, 1
         )
         return patches + spatial + temporal
+
+
+class SpikeMambaLayer(nn.Module):
+    """Continuous causal SSM over row-major patch tokens."""
+
+    def __init__(
+        self,
+        dim: int,
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
+        dt_rank: Union[int, str] = "auto",
+        init_tau: float = 2.0,
+        selective_scan=None,
+        conv_bias: bool = True,
+        bias: bool = False,
+        dt_min: float = 0.001,
+        dt_max: float = 0.1,
+        dt_init: str = "random",
+        dt_scale: float = 1.0,
+        dt_init_floor: float = 1e-4,
+        device=None,
+        dtype=None,
+    ) -> None:
+        super().__init__()
+        self.dim = _positive_int("dim", dim)
+        self.d_state = _positive_int("d_state", d_state)
+        self.d_conv = _positive_int("d_conv", d_conv)
+        self.expand = _positive_int("expand", expand)
+        self.d_inner = self.expand * self.dim
+        self.dt_rank = (
+            math.ceil(self.dim / 16)
+            if dt_rank == "auto"
+            else _positive_int("dt_rank", dt_rank)
+        )
+        if dt_min <= 0 or dt_max <= 0 or dt_min > dt_max:
+            raise ValueError("require 0 < dt_min <= dt_max")
+        if dt_init_floor <= 0:
+            raise ValueError("dt_init_floor must be positive")
+        if dt_init not in {"constant", "random"}:
+            raise NotImplementedError(f"unsupported dt_init={dt_init!r}")
+
+        kwargs = {"device": device, "dtype": dtype}
+        self.linear_m = nn.Linear(
+            self.dim, self.d_inner, bias=bias, **kwargs
+        )
+        self.sl_m1 = _make_plif(
+            init_tau, device=device, dtype=dtype
+        )
+        self.conv1d_m = nn.Conv1d(
+            self.d_inner,
+            self.d_inner,
+            self.d_conv,
+            groups=self.d_inner,
+            padding=self.d_conv - 1,
+            bias=conv_bias,
+            **kwargs,
+        )
+        self.sl_m2 = _make_plif(
+            init_tau, device=device, dtype=dtype
+        )
+        self.x_proj = nn.Linear(
+            self.d_inner,
+            self.dt_rank + 2 * self.d_state,
+            bias=False,
+            **kwargs,
+        )
+        self.dt_proj = nn.Linear(
+            self.dt_rank, self.d_inner, bias=True, **kwargs
+        )
+
+        std = self.dt_rank ** -0.5 * dt_scale
+        if dt_init == "constant":
+            nn.init.constant_(self.dt_proj.weight, std)
+        else:
+            nn.init.uniform_(self.dt_proj.weight, -std, std)
+        dt = torch.exp(
+            torch.rand(self.d_inner, **kwargs)
+            * (math.log(dt_max) - math.log(dt_min))
+            + math.log(dt_min)
+        ).clamp(min=dt_init_floor)
+        inverse_softplus = dt + torch.log(-torch.expm1(-dt))
+        with torch.no_grad():
+            self.dt_proj.bias.copy_(inverse_softplus)
+        self.dt_proj.bias._no_reinit = True
+
+        base = torch.arange(
+            1, self.d_state + 1,
+            dtype=torch.float32, device=device,
+        )
+        self.A_log = nn.Parameter(
+            torch.log(base.unsqueeze(0).repeat(self.d_inner, 1))
+        )
+        self.A_log._no_weight_decay = True
+        self.D = nn.Parameter(
+            torch.ones(self.d_inner, dtype=torch.float32, device=device)
+        )
+        self.D._no_weight_decay = True
+        self.out_proj = nn.Linear(
+            self.d_inner, self.dim, bias=bias, **kwargs
+        )
+        self.sl_ssm = _make_plif(
+            init_tau, device=device, dtype=dtype
+        )
+        self.selective_scan = (
+            selective_scan
+            if selective_scan is not None
+            else selective_scan_fn
+        )
+
+    @staticmethod
+    def _to_tokens(patches: torch.Tensor) -> torch.Tensor:
+        # B D H W -> B (H W) D, row-major.
+        return patches.flatten(2).transpose(1, 2).contiguous()
+
+    def _causal_conv(self, sequence: torch.Tensor) -> torch.Tensor:
+        return self.conv1d_m(sequence)[..., :sequence.shape[-1]]
+
+    def forward(self, patches: torch.Tensor, time_step: int) -> torch.Tensor:
+        if patches.ndim != 4:
+            raise ValueError(
+                f"expected BDHW patches, got {tuple(patches.shape)}"
+            )
+        if patches.shape[1] != self.dim:
+            raise ValueError(
+                f"expected {self.dim} channels, got {patches.shape[1]}"
+            )
+        if self.selective_scan is None:
+            raise ImportError(
+                "mamba_ssm or an injected selective_scan is required"
+            ) from _MAMBA_IMPORT_ERROR
+
+        batch, _, height, width = patches.shape
+        original = self._to_tokens(patches)
+        x = self.linear_m(original)
+        x, _ = self.sl_m1(x, time_step)
+        x = self._causal_conv(x.transpose(1, 2).contiguous())
+        x, _ = self.sl_m2(x, time_step)
+
+        projected = self.x_proj(x.transpose(1, 2))
+        delta_low, B, C = torch.split(
+            projected,
+            [self.dt_rank, self.d_state, self.d_state],
+            dim=-1,
+        )
+        delta = F.linear(
+            delta_low, self.dt_proj.weight, bias=None
+        ).transpose(1, 2).contiguous()
+        B = B.transpose(1, 2).contiguous()
+        C = C.transpose(1, 2).contiguous()
+        A = -torch.exp(self.A_log.float())
+
+        # Continuous recurrence: no spike operation occurs in this call.
+        y = self.selective_scan(
+            x,
+            delta,
+            A,
+            B,
+            C,
+            self.D.float(),
+            z=None,
+            delta_bias=self.dt_proj.bias.float(),
+            delta_softplus=True,
+            return_last_state=False,
+        )
+        y = self.out_proj(
+            y.transpose(1, 2).to(self.out_proj.weight.dtype)
+        )
+        ssm_spikes, _ = self.sl_ssm(y, time_step)
+        gated = ssm_spikes * original
+        return (
+            gated.transpose(1, 2)
+            .contiguous()
+            .view(batch, self.dim, height, width)
+        )
