@@ -18,7 +18,11 @@ except ImportError as exc:
     selective_scan_fn = None
     _MAMBA_IMPORT_ERROR = exc
 
-__all__ = ["SpikeMambaLayer", "Spiking2DPatchEmbedding"]
+__all__ = [
+    "Spiking2DPatchEmbedding",
+    "SpikeMambaLayer",
+    "SpikMambaBlock",
+]
 
 
 def _positive_int(name: str, value: int) -> int:
@@ -301,3 +305,55 @@ class SpikeMambaLayer(nn.Module):
             .contiguous()
             .view(batch, self.dim, height, width)
         )
+
+
+class SpikMambaBlock(nn.Module):
+    """Mamba patch mixer followed by a token-wise FFN, both residual."""
+
+    def __init__(
+        self,
+        dim: int,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        **mamba_kwargs,
+    ) -> None:
+        super().__init__()
+        self.dim = _positive_int("dim", dim)
+        if not isinstance(mlp_ratio, (int, float)) or mlp_ratio <= 0:
+            raise ValueError("mlp_ratio must be positive")
+        if not isinstance(dropout, (int, float)) or not 0.0 <= dropout < 1.0:
+            raise ValueError("dropout must satisfy 0 <= dropout < 1")
+
+        hidden_dim = int(self.dim * float(mlp_ratio))
+        if hidden_dim < 1:
+            raise ValueError("mlp_ratio produces an empty hidden dimension")
+
+        self.mamba_layer = SpikeMambaLayer(dim=self.dim, **mamba_kwargs)
+        self.ffn_norm = nn.LayerNorm(self.dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(self.dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(hidden_dim, self.dim),
+            nn.Dropout(float(dropout)),
+        )
+
+    def forward(self, patches: torch.Tensor, time_step: int) -> torch.Tensor:
+        if patches.ndim != 4:
+            raise ValueError("patches must have shape [B, D, Hp, Wp]")
+        if patches.shape[1] != self.dim:
+            raise ValueError(
+                f"expected {self.dim} patch channels, got {patches.shape[1]}"
+            )
+
+        global_features = patches + self.mamba_layer(patches, time_step)
+        batch, channels, height, width = global_features.shape
+        tokens = global_features.flatten(2).transpose(1, 2)
+        ffn_tokens = self.ffn(self.ffn_norm(tokens))
+        ffn_features = ffn_tokens.transpose(1, 2).reshape(
+            batch,
+            channels,
+            height,
+            width,
+        )
+        return global_features + ffn_features

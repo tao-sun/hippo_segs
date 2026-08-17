@@ -1,10 +1,16 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import pytest
 
+import spikmamba
 import surrogate
 from spike_neurons import PLIFNode
-from spikmamba import SpikeMambaLayer, Spiking2DPatchEmbedding
+from spikmamba import (
+    SpikeMambaLayer,
+    Spiking2DPatchEmbedding,
+    SpikMambaBlock,
+)
 
 
 class RecordingPLIF(nn.Module):
@@ -120,6 +126,77 @@ class IdentityPLIF(nn.Module):
 class OnesPLIF(nn.Module):
     def forward(self, x, time_step):
         return torch.ones_like(x), x
+
+
+class ZeroMamba(nn.Module):
+    def forward(self, patches: torch.Tensor, time_step: int) -> torch.Tensor:
+        return torch.zeros_like(patches)
+
+
+class DoubleMamba(nn.Module):
+    def forward(self, patches: torch.Tensor, time_step: int) -> torch.Tensor:
+        return 2.0 * patches
+
+
+class ZeroFFN(nn.Module):
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        return torch.zeros_like(tokens)
+
+
+class DoubleFFN(nn.Module):
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        return 2.0 * tokens
+
+
+def continuous_selective_scan_reference(
+    u: torch.Tensor,
+    delta: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: torch.Tensor = None,
+    z: torch.Tensor = None,
+    delta_bias: torch.Tensor = None,
+    delta_softplus: bool = False,
+    return_last_state: bool = False,
+):
+    if delta_bias is not None:
+        delta = delta + delta_bias.view(1, -1, 1)
+    if delta_softplus:
+        delta = F.softplus(delta)
+
+    batch, channels, length = u.shape
+    state_size = A.shape[-1]
+    state = torch.zeros(
+        batch,
+        channels,
+        state_size,
+        device=u.device,
+        dtype=u.dtype,
+    )
+    outputs = []
+
+    for index in range(length):
+        delta_i = delta[:, :, index]
+        input_i = u[:, :, index]
+        transition = torch.exp(delta_i.unsqueeze(-1) * A.unsqueeze(0))
+        input_term = (
+            delta_i.unsqueeze(-1)
+            * B[:, :, index].unsqueeze(1)
+            * input_i.unsqueeze(-1)
+        )
+        state = transition * state + input_term
+        output_i = torch.einsum("bdn,bn->bd", state, C[:, :, index])
+        if D is not None:
+            output_i = output_i + D.unsqueeze(0) * input_i
+        if z is not None:
+            output_i = output_i * F.silu(z[:, :, index])
+        outputs.append(output_i)
+
+    output = torch.stack(outputs, dim=-1)
+    if return_last_state:
+        return output, state
+    return output
 
 
 class RecordingScan:
@@ -320,3 +397,146 @@ def test_mamba_rejects_bad_grid_and_missing_scan():
     module.selective_scan = None
     with pytest.raises(ImportError, match="mamba_ssm"):
         module(torch.randn(1, 4, 2, 2), 0)
+
+
+def test_block_adds_the_mamba_residual_exactly():
+    block = SpikMambaBlock(dim=4, d_state=2, expand=1)
+    block.mamba_layer = DoubleMamba()
+    block.ffn = ZeroFFN()
+
+    patches = torch.randn(2, 4, 2, 3)
+    output = block(patches, time_step=0)
+
+    torch.testing.assert_close(output, 3.0 * patches)
+
+
+def test_block_adds_the_ffn_residual_exactly():
+    block = SpikMambaBlock(dim=4, d_state=2, expand=1)
+    block.mamba_layer = ZeroMamba()
+    block.ffn_norm = nn.Identity()
+    block.ffn = DoubleFFN()
+
+    patches = torch.randn(2, 4, 2, 3)
+    output = block(patches, time_step=0)
+
+    torch.testing.assert_close(output, 3.0 * patches)
+
+
+def test_block_ffn_uses_four_times_channel_width_and_gelu():
+    block = SpikMambaBlock(dim=6, mlp_ratio=4.0, d_state=2, expand=1)
+
+    assert isinstance(block.ffn_norm, nn.LayerNorm)
+    assert block.ffn_norm.normalized_shape == (6,)
+    assert isinstance(block.ffn[0], nn.Linear)
+    assert block.ffn[0].in_features == 6
+    assert block.ffn[0].out_features == 24
+    assert isinstance(block.ffn[1], nn.GELU)
+    assert isinstance(block.ffn[3], nn.Linear)
+    assert block.ffn[3].in_features == 24
+    assert block.ffn[3].out_features == 6
+
+
+def test_public_api_and_module_tree_contain_no_attention_or_cross_scan():
+    assert spikmamba.__all__ == [
+        "Spiking2DPatchEmbedding",
+        "SpikeMambaLayer",
+        "SpikMambaBlock",
+    ]
+
+    block = SpikMambaBlock(dim=4, d_state=2, expand=1)
+    module_names = [type(module).__name__.lower() for module in block.modules()]
+
+    assert not any(isinstance(module, nn.MultiheadAttention) for module in block.modules())
+    forbidden_name_fragments = (
+        "attention",
+        "spikesla",
+        "ss2d",
+        "vmamba",
+        "crossscan",
+        "cross_scan",
+        "reverse",
+        "directionmerge",
+        "direction_merge",
+    )
+    assert not any(
+        fragment in name
+        for name in module_names
+        for fragment in forbidden_name_fragments
+    )
+    for attribute in (
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "cross_scan",
+        "reverse_scan",
+        "directions",
+        "direction_merge",
+    ):
+        assert not hasattr(block.mamba_layer, attribute)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"dim": 0}, "dim"),
+        ({"dim": 4, "mlp_ratio": 0.0}, "mlp_ratio"),
+        ({"dim": 4, "dropout": -0.1}, "dropout"),
+        ({"dim": 4, "dropout": 1.0}, "dropout"),
+    ],
+)
+def test_block_rejects_invalid_configuration(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        SpikMambaBlock(**kwargs)
+
+
+def test_embedding_and_block_forward_backward_on_cpu():
+    torch.manual_seed(4)
+    embedding = Spiking2DPatchEmbedding(
+        in_channels=4,
+        embed_dim=8,
+        image_size=(8, 12),
+        patch_size=4,
+        max_time_steps=3,
+    )
+    block = SpikMambaBlock(
+        dim=8,
+        d_state=4,
+        d_conv=4,
+        expand=2,
+        selective_scan=continuous_selective_scan_reference,
+    )
+
+    image = torch.randn(2, 4, 8, 12, requires_grad=True)
+    patches = embedding(image, time_step=0)
+    output = block(patches, time_step=0)
+    loss = output.square().mean()
+    loss.backward()
+
+    assert patches.shape == (2, 8, 2, 3)
+    assert output.shape == patches.shape
+    assert image.grad is not None
+    assert torch.isfinite(image.grad).all()
+    assert torch.count_nonzero(image.grad).item() > 0
+    parameter_grads = [
+        parameter.grad
+        for parameter in list(embedding.parameters()) + list(block.parameters())
+        if parameter.grad is not None
+    ]
+    assert parameter_grads
+    assert all(torch.isfinite(grad).all() for grad in parameter_grads)
+    assert any(torch.count_nonzero(grad).item() > 0 for grad in parameter_grads)
+
+
+def test_block_preserves_a_non_square_patch_grid():
+    block = SpikMambaBlock(
+        dim=4,
+        d_state=2,
+        d_conv=3,
+        expand=1,
+        selective_scan=continuous_selective_scan_reference,
+    )
+    patches = torch.randn(1, 4, 2, 5)
+
+    output = block(patches, time_step=0)
+
+    assert output.shape == (1, 4, 2, 5)
