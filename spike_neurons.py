@@ -400,7 +400,13 @@ class PLIFNode(BaseNode):
         self.neuro_states_init = False
 
     def detach(self):
-        self.v = self.v.detach()
+        # TBPTT may call detach_states() on fresh modules before the first forward
+        # pass initializes membrane state. In that case, there is no voltage tensor
+        # yet to detach, so we should do nothing instead of crashing.
+        if hasattr(self, 'v'):
+            self.v = self.v.detach()
+        if hasattr(self, 's'):
+            self.s = self.s.detach()
     
     def forward(self, dv: torch.Tensor, time_step):
         if time_step == 0:

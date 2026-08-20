@@ -1,5 +1,7 @@
 #!/bin/bash
 
+export CUBLAS_WORKSPACE_CONFIG=:16:8
+
 # Define folds and views
 folds=(2 3 4 5)
 views=("sagittal" "coronal" "axial")

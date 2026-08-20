@@ -43,7 +43,7 @@ def _make_plif(init_tau: float, device=None, dtype=None) -> PLIFNode:
 
 
 class Spiking2DPatchEmbedding(nn.Module):
-    """Project one BCHW frame into a spiking patch grid."""
+    """Project one BCHW frame into a spiking patch grid without temporal embedding."""
 
     def __init__(
         self,
@@ -79,23 +79,7 @@ class Spiking2DPatchEmbedding(nn.Module):
             bias=True,
             **kwargs,
         )
-        self.norm = nn.BatchNorm2d(self.embed_dim, **kwargs)
-        self.sl_patch = _make_plif(
-            init_tau, device=device, dtype=dtype
-        )
-        self.spatial_pos_embed = nn.Parameter(
-            torch.empty(
-                1,
-                self.embed_dim,
-                height // self.patch_size,
-                width // self.patch_size,
-                **kwargs,
-            )
-        )
-        self.temporal_pos_embed = nn.Parameter(
-            torch.zeros(self.max_time_steps, self.embed_dim, **kwargs)
-        )
-        nn.init.trunc_normal_(self.spatial_pos_embed, std=0.02)
+        self.norm = nn.GroupNorm(1, self.embed_dim, **kwargs)
 
     def forward(self, x: torch.Tensor, time_step: int) -> torch.Tensor:
         if x.ndim != 4:
@@ -116,20 +100,7 @@ class Spiking2DPatchEmbedding(nn.Module):
         ):
             raise ValueError("time_step is outside the configured range")
 
-        patches = self.norm(self.proj(x))
-        patches, _ = self.sl_patch(patches, time_step)
-        spatial = self.spatial_pos_embed
-        if spatial.shape[-2:] != patches.shape[-2:]:
-            spatial = F.interpolate(
-                spatial,
-                size=patches.shape[-2:],
-                mode="bilinear",
-                align_corners=False,
-            )
-        temporal = self.temporal_pos_embed[time_step].view(
-            1, self.embed_dim, 1, 1
-        )
-        return patches + spatial + temporal
+        return self.norm(self.proj(x))
 
 
 class SpikeMambaLayer(nn.Module):
@@ -153,12 +124,14 @@ class SpikeMambaLayer(nn.Module):
         dt_init_floor: float = 1e-4,
         device=None,
         dtype=None,
+        max_time_steps: int = 256,
     ) -> None:
         super().__init__()
         self.dim = _positive_int("dim", dim)
         self.d_state = _positive_int("d_state", d_state)
         self.d_conv = _positive_int("d_conv", d_conv)
         self.expand = _positive_int("expand", expand)
+        self.max_time_steps = _positive_int("max_time_steps", max_time_steps)
         self.d_inner = self.expand * self.dim
         self.dt_rank = (
             math.ceil(self.dim / 16)
@@ -181,9 +154,7 @@ class SpikeMambaLayer(nn.Module):
         self.linear_m = nn.Linear(
             self.dim, self.d_inner, bias=bias, **kwargs
         )
-        self.sl_m1 = _make_plif(
-            init_tau, device=device, dtype=dtype
-        )
+        self.sl_m1 = _make_plif(init_tau, device=device, dtype=dtype)
         self.conv1d_m = nn.Conv1d(
             self.d_inner,
             self.d_inner,
@@ -193,9 +164,7 @@ class SpikeMambaLayer(nn.Module):
             bias=conv_bias,
             **kwargs,
         )
-        self.sl_m2 = _make_plif(
-            init_tau, device=device, dtype=dtype
-        )
+        self.sl_m2 = _make_plif(init_tau, device=device, dtype=dtype)
         self.x_proj = nn.Linear(
             self.d_inner,
             self.dt_rank + 2 * self.d_state,
@@ -236,9 +205,7 @@ class SpikeMambaLayer(nn.Module):
         self.out_proj = nn.Linear(
             self.d_inner, self.dim, bias=bias, **kwargs
         )
-        self.sl_ssm = _make_plif(
-            init_tau, device=device, dtype=dtype
-        )
+        self.sl_ssm = _make_plif(init_tau, device=device, dtype=dtype)
         self.selective_scan = (
             selective_scan
             if selective_scan is not None
@@ -252,6 +219,21 @@ class SpikeMambaLayer(nn.Module):
 
     def _causal_conv(self, sequence: torch.Tensor) -> torch.Tensor:
         return self.conv1d_m(sequence)[..., :sequence.shape[-1]]
+
+    def _cross_scan_routes(self, x: torch.Tensor, height: int, width: int):
+        """Build four patch routes from a grid tensor of shape (B, H, W, D)."""
+        batch = x.shape[0]
+        x_grid = x.reshape(batch, height, width, self.d_inner)
+
+        row_major = x_grid.reshape(batch, height * width, self.d_inner)
+        row_major_rev = torch.flip(row_major, dims=[1])
+
+        col_major = x_grid.permute(0, 2, 1, 3).reshape(
+            batch, height * width, self.d_inner
+        )
+        col_major_rev = torch.flip(col_major, dims=[1])
+
+        return [row_major, row_major_rev, col_major, col_major_rev]
 
     def forward(self, patches: torch.Tensor, time_step: int) -> torch.Tensor:
         if patches.ndim != 4:
@@ -268,43 +250,49 @@ class SpikeMambaLayer(nn.Module):
             ) from _MAMBA_IMPORT_ERROR
 
         batch, _, height, width = patches.shape
-        original = self._to_tokens(patches)
-        x = self.linear_m(original)
-        x, _ = self.sl_m1(x, time_step)
-        x = self._causal_conv(x.transpose(1, 2).contiguous())
-        x, _ = self.sl_m2(x, time_step)
+        p_local = self._to_tokens(patches)
 
-        projected = self.x_proj(x.transpose(1, 2))
-        delta_low, B, C = torch.split(
-            projected,
-            [self.dt_rank, self.d_state, self.d_state],
-            dim=-1,
-        )
-        delta = F.linear(
-            delta_low, self.dt_proj.weight, bias=None
-        ).transpose(1, 2).contiguous()
-        B = B.transpose(1, 2).contiguous()
-        C = C.transpose(1, 2).contiguous()
-        A = -torch.exp(self.A_log.float())
+        p_global = self.linear_m(p_local)
+        p_global, _ = self.sl_m1(p_global, time_step)
 
-        # Continuous recurrence: no spike operation occurs in this call.
-        y = self.selective_scan(
-            x,
-            delta,
-            A,
-            B,
-            C,
-            self.D.float(),
-            z=None,
-            delta_bias=self.dt_proj.bias.float(),
-            delta_softplus=True,
-            return_last_state=False,
-        )
-        y = self.out_proj(
-            y.transpose(1, 2).to(self.out_proj.weight.dtype)
-        )
-        ssm_spikes, _ = self.sl_ssm(y, time_step)
-        gated = ssm_spikes * original
+        route_outputs = []
+        for route in self._cross_scan_routes(p_global, height, width):
+            route_conv = self._causal_conv(route.transpose(1, 2).contiguous())
+            route_conv, _ = self.sl_m2(route_conv, time_step)
+
+            projected = self.x_proj(route_conv.transpose(1, 2))
+            delta_low, B, C = torch.split(
+                projected,
+                [self.dt_rank, self.d_state, self.d_state],
+                dim=-1,
+            )
+            delta = F.linear(
+                delta_low, self.dt_proj.weight, bias=None
+            ).transpose(1, 2).contiguous()
+            B = B.transpose(1, 2).contiguous()
+            C = C.transpose(1, 2).contiguous()
+            A = -torch.exp(self.A_log.float())
+
+            y = self.selective_scan(
+                route_conv,
+                delta,
+                A,
+                B,
+                C,
+                self.D.float(),
+                z=None,
+                delta_bias=self.dt_proj.bias.float(),
+                delta_softplus=True,
+                return_last_state=False,
+            )
+            y = self.out_proj(
+                y.transpose(1, 2).to(self.out_proj.weight.dtype)
+            )
+            route_outputs.append(y)
+
+        y = torch.stack(route_outputs, dim=0).mean(dim=0)
+        y, _ = self.sl_ssm(y, time_step)
+        gated = y * p_local
         return (
             gated.transpose(1, 2)
             .contiguous()
@@ -313,40 +301,16 @@ class SpikeMambaLayer(nn.Module):
 
 
 class SpikMambaBlock(nn.Module):
-    """Mamba patch mixer followed by a token-wise FFN, both residual."""
+    """Minimal residual patch mixer: Mamba + residual only."""
 
     def __init__(
         self,
         dim: int,
-        mlp_ratio: float = 4.0,
-        dropout: float = 0.0,
         **mamba_kwargs,
     ) -> None:
         super().__init__()
         self.dim = _positive_int("dim", dim)
-        if not isinstance(mlp_ratio, (int, float)) or mlp_ratio <= 0:
-            raise ValueError("mlp_ratio must be positive")
-        if not isinstance(dropout, (int, float)) or not 0.0 <= dropout < 1.0:
-            raise ValueError("dropout must satisfy 0 <= dropout < 1")
-
-        hidden_dim = int(self.dim * float(mlp_ratio))
-        if hidden_dim < 1:
-            raise ValueError("mlp_ratio produces an empty hidden dimension")
-
-        factory_kwargs = {
-            name: mamba_kwargs[name]
-            for name in ("device", "dtype")
-            if name in mamba_kwargs
-        }
         self.mamba_layer = SpikeMambaLayer(dim=self.dim, **mamba_kwargs)
-        self.ffn_norm = nn.LayerNorm(self.dim, **factory_kwargs)
-        self.ffn = nn.Sequential(
-            nn.Linear(self.dim, hidden_dim, **factory_kwargs),
-            nn.GELU(),
-            nn.Dropout(float(dropout)),
-            nn.Linear(hidden_dim, self.dim, **factory_kwargs),
-            nn.Dropout(float(dropout)),
-        )
 
     def forward(self, patches: torch.Tensor, time_step: int) -> torch.Tensor:
         if patches.ndim != 4:
@@ -356,14 +320,4 @@ class SpikMambaBlock(nn.Module):
                 f"expected {self.dim} patch channels, got {patches.shape[1]}"
             )
 
-        global_features = patches + self.mamba_layer(patches, time_step)
-        batch, channels, height, width = global_features.shape
-        tokens = global_features.flatten(2).transpose(1, 2)
-        ffn_tokens = self.ffn(self.ffn_norm(tokens))
-        ffn_features = ffn_tokens.transpose(1, 2).reshape(
-            batch,
-            channels,
-            height,
-            width,
-        )
-        return global_features + ffn_features
+        return patches + self.mamba_layer(patches, time_step)

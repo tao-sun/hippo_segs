@@ -1,4 +1,5 @@
 import math
+from typing import Union
 
 import torch
 import torch.nn as nn
@@ -6,6 +7,7 @@ import torch.nn.functional as F
 
 import surrogate
 from spike_neurons import PLIFNode
+from spikmamba import Spiking2DPatchEmbedding, SpikMambaBlock
 
 try:
     from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
@@ -49,40 +51,129 @@ def print_model_info(model: nn.Module):
     print("=" * 60)
 
 
+class _SpikMambaEncoderAdapter(nn.Module):
+    """Patch-based spiking Mamba encoder block with size-preserving upsampling."""
+
+    def __init__(
+        self,
+        channels: int,
+        patch_size: int = 4,
+        d_state: int = 16,
+        dt_rank: Union[int, str] = "auto",
+        init_tau: float = 2.0,
+        selective_scan=None,
+        max_time_steps: int = 256,
+    ) -> None:
+        super().__init__()
+        self.channels = int(channels)
+        self.patch_size = int(patch_size)
+        self.pre_norm = nn.GroupNorm(1, self.channels)
+        self.pre_plif = PLIFNode(
+            init_tau=init_tau,
+            surrogate_function=surrogate.ATan(),
+            detach_reset=True,
+        )
+        self.patch_embed = Spiking2DPatchEmbedding(
+            in_channels=self.channels,
+            embed_dim=self.channels,
+            image_size=(8, 8),
+            patch_size=self.patch_size,
+            max_time_steps=max_time_steps,
+            init_tau=init_tau,
+        )
+        self.spik_mamba = SpikMambaBlock(
+            dim=self.channels,
+            d_state=d_state,
+            dt_rank=dt_rank,
+            init_tau=init_tau,
+            selective_scan=selective_scan,
+            max_time_steps=max_time_steps,
+        )
+        self.up = nn.ConvTranspose2d(
+            self.channels,
+            self.channels,
+            kernel_size=self.patch_size,
+            stride=self.patch_size,
+            bias=False,
+        )
+        self.post_norm = nn.GroupNorm(1, self.channels)
+        self.post_plif = PLIFNode(
+            init_tau=init_tau,
+            surrogate_function=surrogate.ATan(),
+            detach_reset=True,
+        )
+
+    def forward(self, x: torch.Tensor, time_step: int) -> torch.Tensor:
+        if x.ndim != 4:
+            raise ValueError(f"expected BCHW input, got {tuple(x.shape)}")
+        if x.shape[1] != self.channels:
+            raise ValueError(
+                f"expected {self.channels} channels, got {x.shape[1]}"
+            )
+
+        batch, channels, height, width = x.shape
+        if channels != self.channels:
+            raise ValueError(
+                f"expected {self.channels} channels, got {channels}"
+            )
+
+        x = self.pre_norm(x)
+        x, _ = self.pre_plif(x, time_step)
+
+        pad_h = (-height) % self.patch_size
+        pad_w = (-width) % self.patch_size
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h))
+
+        padded_h, padded_w = x.shape[-2:]
+        if padded_h % self.patch_size or padded_w % self.patch_size:
+            raise ValueError(
+                "padded spatial size must remain divisible by patch_size"
+            )
+
+        x = self.patch_embed(x, time_step)
+        x = self.spik_mamba(x, time_step)
+        x = self.up(x)
+
+        if pad_h or pad_w:
+            x = x[..., :height, :width]
+
+        x = self.post_norm(x)
+        x, _ = self.post_plif(x, time_step)
+        return x
+
+
 class ConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels,
                  kernel_size=3, stride=1, padding=0,
                  dropout=0.3, init_tau=2.0,
-                 normalization=True, spiking=True, ss2d=True):
+                 normalization=True, spiking=True,
+                 spikMamba=False, selective_scan=None,
+                 ssm_d_state=16, ssm_dt_rank="auto"):
         super().__init__()
         self.dropout = float(dropout)
         self.normalization = normalization
         self.spiking = spiking
-        self.ss2d = ss2d
+        self.spikMamba = bool(spikMamba)
 
-        self.conv = nn.Conv2d(in_channels, out_channels,
-                              kernel_size=kernel_size,
-                              stride=stride, padding=padding, bias=False)
-        
-        # if self.ss2d:
-            # self.ssm_module = SS2D(
-            #         channels=out_channels,
-            #         d_state=16,
-            #         dt_rank="auto")
-            # self.pre_ssm_spike_neurons = PLIFNode(
-            #     init_tau=init_tau,
-            #     surrogate_function=surrogate.ATan(),
-            #     detach_reset=True,
-            #     no_spiking=(not spiking)
-            # )
+        self.conv = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            bias=False,
+        )
+        if self.spikMamba:
+            self.spik_mamba = _SpikMambaEncoderAdapter(
+                channels=out_channels,
+                d_state=ssm_d_state,
+                dt_rank=ssm_dt_rank,
+                init_tau=init_tau,
+                selective_scan=selective_scan,
+            )
 
-            # self.pre_norm = nn.GroupNorm(1, out_channels)
-
-        # self.norm = nn.BatchNorm2d(out_channels)
         self.norm = nn.GroupNorm(1, out_channels)
-
-
-
         self.spike_neurons = PLIFNode(
             init_tau=init_tau,
             surrogate_function=surrogate.ATan(),
@@ -92,8 +183,11 @@ class ConvBlock(nn.Module):
 
     def forward(self, x, time_step: int):
         out = self.conv(x)
-        # if self.ss2d:
-        #     out = self.ssm_module(out)
+        if self.spikMamba:
+            out = self.spik_mamba(out, time_step)
+            if self.dropout > 0:
+                out = F.dropout(out, p=self.dropout, training=self.training)
+            return out
 
         if self.normalization:
             out = self.norm(out)
@@ -103,7 +197,6 @@ class ConvBlock(nn.Module):
         else:
             out = self.spike_neurons(out, time_step)
         if self.dropout > 0:
-            # IMPORTANT: disable dropout in eval/reference
             out = F.dropout(out, p=self.dropout, training=self.training)
         return out
 
@@ -133,253 +226,6 @@ class DeconvBlock(nn.Module):
         return out
 
 
-class SpikMamba2D(nn.Module):
-    """Stateful spiking four-direction selective scan for BCHW features."""
-
-    def __init__(self,
-                 channels: int,
-                 d_state: int = 16,
-                 dt_rank="auto",
-                 conv_kernel_size: int = 3,
-                 init_tau: float = 2.0,
-                 selective_scan=None,
-                 device=None,
-                 dtype=None,
-                 dt_min: float = 0.001,
-                 dt_max: float = 0.1,
-                 dt_init: str = "random",
-                 dt_scale: float = 1.0,
-                 dt_init_floor: float = 1e-4):
-        super().__init__()
-        if (
-            not isinstance(conv_kernel_size, int)
-            or conv_kernel_size <= 0
-            or conv_kernel_size % 2 == 0
-        ):
-            raise ValueError(
-                "conv_kernel_size must be a positive odd integer"
-            )
-
-        factory_kwargs = {"device": device, "dtype": dtype}
-        self.channels = int(channels)
-        self.d_state = int(d_state)
-        self.dt_rank = (
-            math.ceil(self.channels / 16) if dt_rank == "auto" else int(dt_rank)
-        )
-
-        self.linear_m = nn.Linear(
-            self.channels, self.channels, **factory_kwargs
-        )
-        self.lif_1 = PLIFNode(
-            init_tau=init_tau,
-            surrogate_function=surrogate.ATan(),
-            detach_reset=True,
-        )
-        self.scan_conv1d = nn.Conv1d(
-            4 * self.channels,
-            4 * self.channels,
-            kernel_size=conv_kernel_size,
-            padding=conv_kernel_size // 2,
-            groups=4 * self.channels,
-            device=device,
-            dtype=dtype,
-        )
-        self.lif_2 = PLIFNode(
-            init_tau=init_tau,
-            surrogate_function=surrogate.ATan(),
-            detach_reset=True,
-        )
-        self.lif_ssm = PLIFNode(
-            init_tau=init_tau,
-            surrogate_function=surrogate.ATan(),
-            detach_reset=True,
-        )
-        self.selective_scan = (
-            selective_scan if selective_scan is not None else selective_scan_fn
-        )
-
-        x_projs = tuple(
-            nn.Linear(
-                self.channels,
-                self.dt_rank + 2 * self.d_state,
-                bias=False,
-                **factory_kwargs,
-            )
-            for _ in range(4)
-        )
-        self.x_proj_weight = nn.Parameter(
-            torch.stack([projection.weight for projection in x_projs], dim=0)
-        )
-
-        dt_projs = tuple(
-            self.dt_init(
-                self.dt_rank,
-                self.channels,
-                dt_scale,
-                dt_init,
-                dt_min,
-                dt_max,
-                dt_init_floor,
-                **factory_kwargs,
-            )
-            for _ in range(4)
-        )
-        self.dt_projs_weight = nn.Parameter(
-            torch.stack([projection.weight for projection in dt_projs], dim=0)
-        )
-        self.dt_projs_bias = nn.Parameter(
-            torch.stack([projection.bias for projection in dt_projs], dim=0)
-        )
-
-        self.A_logs = self.A_log_init(
-            self.d_state, self.channels, copies=4, merge=True, device=device
-        )
-        self.Ds = self.D_init(self.channels, copies=4, merge=True, device=device)
-
-    @staticmethod
-    def dt_init(dt_rank, d_inner, dt_scale=1.0, dt_init="random",
-                dt_min=0.001, dt_max=0.1, dt_init_floor=1e-4,
-                **factory_kwargs):
-        dt_proj = nn.Linear(dt_rank, d_inner, bias=True, **factory_kwargs)
-        dt_init_std = dt_rank ** -0.5 * dt_scale
-        if dt_init == "constant":
-            nn.init.constant_(dt_proj.weight, dt_init_std)
-        elif dt_init == "random":
-            nn.init.uniform_(dt_proj.weight, -dt_init_std, dt_init_std)
-        else:
-            raise NotImplementedError(f"unsupported dt_init={dt_init!r}")
-
-        dt = torch.exp(
-            torch.rand(d_inner, **factory_kwargs)
-            * (math.log(dt_max) - math.log(dt_min))
-            + math.log(dt_min)
-        ).clamp(min=dt_init_floor)
-        inv_dt = dt + torch.log(-torch.expm1(-dt))
-        with torch.no_grad():
-            dt_proj.bias.copy_(inv_dt)
-        dt_proj.bias._no_reinit = True
-        return dt_proj
-
-    @staticmethod
-    def A_log_init(d_state, d_inner, copies=1, device=None, merge=True):
-        base = torch.arange(1, d_state + 1, dtype=torch.float32, device=device)
-        A = base.unsqueeze(0).repeat(d_inner, 1)
-        A_log = torch.log(A)
-        if copies > 1:
-            A_log = A_log.unsqueeze(0).repeat(copies, 1, 1)
-            if merge:
-                A_log = A_log.flatten(0, 1)
-        parameter = nn.Parameter(A_log)
-        parameter._no_weight_decay = True
-        return parameter
-
-    @staticmethod
-    def D_init(d_inner, copies=1, device=None, merge=True):
-        D = torch.ones(d_inner, device=device)
-        if copies > 1:
-            D = D.unsqueeze(0).repeat(copies, 1)
-            if merge:
-                D = D.flatten(0, 1)
-        parameter = nn.Parameter(D)
-        parameter._no_weight_decay = True
-        return parameter
-
-    @staticmethod
-    def _cross_scan(x: torch.Tensor) -> torch.Tensor:
-        batch, channels, height, width = x.shape
-        length = height * width
-        horizontal_vertical = torch.stack(
-            [
-                x.view(batch, channels, length),
-                x.transpose(2, 3).contiguous().view(batch, channels, length),
-            ],
-            dim=1,
-        )
-        return torch.cat(
-            [horizontal_vertical, torch.flip(horizontal_vertical, dims=[-1])],
-            dim=1,
-        )
-
-    @staticmethod
-    def _align_scan_outputs(out_y: torch.Tensor, height: int, width: int):
-        batch, _, channels, length = out_y.shape
-        inverse = torch.flip(out_y[:, 2:4], dims=[-1])
-        width_height = (
-            out_y[:, 1]
-            .view(batch, channels, width, height)
-            .transpose(2, 3)
-            .contiguous()
-            .view(batch, channels, length)
-        )
-        inverse_width_height = (
-            inverse[:, 1]
-            .view(batch, channels, width, height)
-            .transpose(2, 3)
-            .contiguous()
-            .view(batch, channels, length)
-        )
-        return out_y[:, 0], inverse[:, 0], width_height, inverse_width_height
-
-    def forward_core(self, x: torch.Tensor):
-        batch, channels, height, width = x.shape
-        if channels != self.channels:
-            raise ValueError(
-                f"SS2D expects {self.channels} channels, got {channels}"
-            )
-        length = height * width
-        directions = 4
-        xs = self._cross_scan(x)
-        x_dbl = torch.einsum(
-            "b k d l, k c d -> b k c l", xs, self.x_proj_weight
-        )
-        dts, Bs, Cs = torch.split(
-            x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=2
-        )
-        dts = torch.einsum(
-            "b k r l, k d r -> b k d l", dts, self.dt_projs_weight
-        )
-
-        xs_packed = xs.float().view(batch, directions * channels, length)
-        dts_packed = dts.contiguous().float().view(
-            batch, directions * channels, length
-        )
-        Bs = Bs.float().view(batch, directions, self.d_state, length)
-        Cs = Cs.float().view(batch, directions, self.d_state, length)
-        Ds = self.Ds.float().view(-1)
-        As = -torch.exp(self.A_logs.float()).view(
-            directions * channels, self.d_state
-        )
-        dt_bias = self.dt_projs_bias.float().view(-1)
-
-        out_y = self.selective_scan(
-            xs_packed,
-            dts_packed,
-            As,
-            Bs,
-            Cs,
-            Ds,
-            z=None,
-            delta_bias=dt_bias,
-            delta_softplus=True,
-            return_last_state=False,
-        ).view(batch, directions, channels, length)
-        return self._align_scan_outputs(out_y, height, width)
-
-    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        if x.ndim != 4:
-            raise ValueError(
-                f"SS2D expects BCHW input, got shape={tuple(x.shape)}"
-            )
-        batch, channels, height, width = x.shape
-        if channels != self.channels:
-            raise ValueError(
-                f"SS2D expects {self.channels} channels, got {channels}"
-            )
-        scans = self.forward_core(x)
-        return sum(scans).view(batch, channels, height, width)
-
-
-
 class SNNBraTS(nn.Module):
     """
     Forward takes a window x_win: (B, k, 4, H, W) and an absolute starting time t0.
@@ -393,24 +239,65 @@ class SNNBraTS(nn.Module):
                  ssm_dt_rank="auto"):
         super().__init__()
         # Encoder
-        self.conv_block1 = ConvBlock(4, 32, padding=1, dropout=0.1, ss2d=True)
-        self.conv_block2 = ConvBlock(32, 64, padding=1, dropout=0.1)
-        self.conv_block3 = ConvBlock(64, 128, padding=1, dropout=0.1)
+        spik_mamba_kwargs = {
+            "spikMamba": True,
+            "selective_scan": selective_scan,
+            "ssm_d_state": ssm_d_state,
+            "ssm_dt_rank": ssm_dt_rank,
+        }
+        self.conv_block1 = ConvBlock(
+            4,
+            32,
+            padding=1,
+            dropout=0.1,
+            **spik_mamba_kwargs,
+        )
+        self.conv_block2 = ConvBlock(
+            32,
+            64,
+            padding=1,
+            dropout=0.1,
+            **spik_mamba_kwargs,
+        )
+        self.conv_block3 = ConvBlock(
+            64,
+            128,
+            padding=1,
+            dropout=0.1,
+            **spik_mamba_kwargs,
+        )
 
         # Decoder
         self.deconv_block1 = DeconvBlock(128, 128, dropout=0.1)
-        self.deconv1_conv  = ConvBlock(128, 128, padding=1, dropout=0.1, ss2d = False)
-        self.concat1_conv  = ConvBlock(128 + 64, 128, padding=1, dropout=0.1, ss2d = False)
+        self.deconv1_conv = ConvBlock(
+            128, 128, padding=1, dropout=0.1
+        )
+        self.concat1_conv = ConvBlock(
+            128 + 64, 128, padding=1, dropout=0.1
+        )
 
         self.deconv_block2 = DeconvBlock(128, 128, dropout=0.1)
-        self.deconv2_conv  = ConvBlock(128, 128, padding=1, dropout=0.1, ss2d = False)
-        self.concat2_conv  = ConvBlock(128 + 32, 128, padding=1, dropout=0.1, ss2d = False)
+        self.deconv2_conv = ConvBlock(
+            128, 128, padding=1, dropout=0.1
+        )
+        self.concat2_conv = ConvBlock(
+            128 + 32, 128, padding=1, dropout=0.1
+        )
 
         self.deconv_block3 = DeconvBlock(128, 128, dropout=0.1)
-        self.deconv3_conv  = ConvBlock(128, 128, padding=1, dropout=0.1, ss2d = False)
+        self.deconv3_conv = ConvBlock(
+            128, 128, padding=1, dropout=0.1
+        )
 
-        # Classifier head (non-spiking); out_channels = 4 classes {0,1,2,3} where 3 corresponds to BraTS label 4
-        self.class_conv = ConvBlock(128, out_channels, padding=1, dropout=0.0, normalization=False, spiking=False, ss2d = False)
+        # Classifier head (non-spiking); classes {0,1,2,3}, with 3 = BraTS 4
+        self.class_conv = ConvBlock(
+            128,
+            out_channels,
+            padding=1,
+            dropout=0.0,
+            normalization=False,
+            spiking=False,
+        )
 
         self.pool = nn.MaxPool2d(2, 2)
 
@@ -441,7 +328,7 @@ class SNNBraTS(nn.Module):
             x = self.deconv2_conv(x, time_step)
             x = torch.cat([pool1, x], dim=1)
             x = self.concat2_conv(x, time_step)
-
+            
             x = self.deconv_block3(x, time_step)
             x = self.deconv3_conv(x, time_step)
 

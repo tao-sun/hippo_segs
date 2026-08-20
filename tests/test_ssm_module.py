@@ -45,6 +45,10 @@ def selective_scan_test_double(u, delta, A, B, C, D=None, z=None,
     return (output, state) if return_last_state else output
 
 
+def ones_scan(u, delta, A, B, C, D=None, z=None, delta_bias=None,
+              delta_softplus=False, return_last_state=False):
+    return torch.ones_like(u)
+
 class RecordingScan:
     def __init__(self):
         self.call = None
@@ -76,6 +80,25 @@ class PassthroughPLIF(nn.Module):
         self.time_steps.append(time_step)
         return x, x
 
+
+class AddOneSpikMamba(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def forward(self, F, time_step):
+        self.calls.append((F.detach().clone(), time_step))
+        return F + 1
+
+
+class TimesTwo(nn.Module):
+    def forward(self, x):
+        return 2 * x
+
+
+class AddThreePLIF(nn.Module):
+    def forward(self, x, time_step):
+        return x + 3, x
 
 class SpikMamba2DConstructionTest(unittest.TestCase):
     def test_constructor_builds_independent_spiking_scan_stages(self):
@@ -158,6 +181,195 @@ class SpikMamba2DScanTest(unittest.TestCase):
         self.assertTrue(torch.equal(scans, expected))
         self.assertEqual(module.lif_1.time_steps, [7])
         self.assertEqual(module.lif_2.time_steps, [7])
+
+    def test_selective_scan_uses_packed_four_direction_contract(self):
+        recorder = RecordingScan()
+        module = SpikMamba2D(
+            channels=4,
+            d_state=3,
+            selective_scan=recorder,
+        )
+        scans = torch.randn(2, 4, 4, 6)
+
+        raw = module._run_selective_scan(scans)
+
+        self.assertEqual(raw.shape, (2, 4, 4, 6))
+        self.assertEqual(recorder.call["u"], torch.Size((2, 16, 6)))
+        self.assertEqual(recorder.call["delta"], torch.Size((2, 16, 6)))
+        self.assertEqual(recorder.call["A"], torch.Size((16, 3)))
+        self.assertEqual(recorder.call["B"], torch.Size((2, 4, 3, 6)))
+        self.assertEqual(recorder.call["C"], torch.Size((2, 4, 3, 6)))
+        self.assertEqual(recorder.call["D"], torch.Size((16,)))
+        self.assertEqual(
+            recorder.call["delta_bias"], torch.Size((16,))
+        )
+        self.assertIsNone(recorder.call["z"])
+        self.assertTrue(recorder.call["delta_softplus"])
+        self.assertFalse(recorder.call["return_last_state"])
+
+    def test_merge_restores_directions_and_sums_them(self):
+        module = SpikMamba2D(
+            channels=1,
+            d_state=1,
+            selective_scan=selective_scan_test_double,
+        )
+        raw = torch.tensor(
+            [[[[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]],
+              [[1.0, 4.0, 2.0, 5.0, 3.0, 6.0]],
+              [[6.0, 5.0, 4.0, 3.0, 2.0, 1.0]],
+              [[6.0, 3.0, 5.0, 2.0, 4.0, 1.0]]]]
+        )
+
+        merged = module._merge_scan_outputs(raw, height=2, width=3)
+
+        expected = torch.tensor(
+            [[[[4.0, 8.0, 12.0], [16.0, 20.0, 24.0]]]]
+        )
+        self.assertTrue(torch.equal(merged, expected))
+
+class ConvBlockSpikMambaIntegrationTest(unittest.TestCase):
+    def test_spikmamba_is_opt_in(self):
+        block = ConvBlock(1, 1, kernel_size=1, dropout=0.0)
+
+        self.assertFalse(block.spikMamba)
+        self.assertFalse(hasattr(block, "spik_mamba"))
+
+    def test_spikmamba_runs_after_conv_and_before_norm_and_output_plif(self):
+        block = ConvBlock(
+            1,
+            1,
+            kernel_size=1,
+            dropout=0.0,
+            spikMamba=True,
+            selective_scan=ones_scan,
+        )
+        with torch.no_grad():
+            block.conv.weight.fill_(1.0)
+        recorder = AddOneSpikMamba()
+        block.spik_mamba = recorder
+        block.norm = TimesTwo()
+        block.spike_neurons = AddThreePLIF()
+
+        output = block(torch.ones(1, 1, 1, 1), time_step=9)
+
+        self.assertTrue(
+            torch.equal(output, torch.tensor([[[[7.0]]]]))
+        )
+        self.assertTrue(
+            torch.equal(
+                recorder.calls[0][0],
+                torch.ones(1, 1, 1, 1),
+            )
+        )
+        self.assertEqual(recorder.calls[0][1], 9)
+
+class SNNBraTSSpikMambaIntegrationTest(unittest.TestCase):
+    def test_all_three_encoder_blocks_use_injected_spikmamba(self):
+        recorder = RecordingScan()
+        model = SNNBraTS(
+            out_channels=4,
+            selective_scan=recorder,
+            ssm_d_state=2,
+        )
+
+        for block in (
+            model.conv_block1,
+            model.conv_block2,
+            model.conv_block3,
+        ):
+            self.assertTrue(block.spikMamba)
+            self.assertIsInstance(block.spik_mamba, SpikMamba2D)
+            self.assertIs(block.spik_mamba.selective_scan, recorder)
+            self.assertEqual(block.spik_mamba.d_state, 2)
+
+        for block in (
+            model.deconv1_conv,
+            model.concat1_conv,
+            model.deconv2_conv,
+            model.concat2_conv,
+            model.deconv3_conv,
+            model.class_conv,
+        ):
+            self.assertFalse(block.spikMamba)
+            self.assertFalse(hasattr(block, "spik_mamba"))
+
+    def test_small_network_forward_preserves_segmentation_shape(self):
+        model = SNNBraTS(
+            out_channels=4,
+            selective_scan=ones_scan,
+            ssm_d_state=2,
+        ).eval()
+        x = torch.randn(1, 1, 4, 16, 16)
+
+        with torch.no_grad():
+            output = model(x, t0=0)
+
+        self.assertEqual(output.shape, (1, 4, 1, 16, 16))
+
+class SpikMamba2DForwardTest(unittest.TestCase):
+    def test_forward_uses_original_F_for_hadamard_and_residual(self):
+        module = SpikMamba2D(
+            channels=2,
+            d_state=1,
+            selective_scan=ones_scan,
+        )
+        module.lif_1 = PassthroughPLIF()
+        module.lif_2 = PassthroughPLIF()
+        module.lif_ssm = PassthroughPLIF()
+        F_in = torch.tensor([[[[1.0, 2.0]], [[3.0, 4.0]]]])
+
+        output = module(F_in, time_step=5)
+
+        self.assertTrue(torch.equal(output, 5 * F_in))
+        self.assertEqual(module.lif_ssm.time_steps, [5])
+
+    def test_forward_passes_same_time_step_to_all_three_plifs(self):
+        module = SpikMamba2D(
+            channels=2,
+            d_state=1,
+            selective_scan=ones_scan,
+        )
+        module.lif_1 = PassthroughPLIF()
+        module.lif_2 = PassthroughPLIF()
+        module.lif_ssm = PassthroughPLIF()
+
+        module(torch.randn(1, 2, 2, 3), time_step=11)
+
+        self.assertEqual(module.lif_1.time_steps, [11])
+        self.assertEqual(module.lif_2.time_steps, [11])
+        self.assertEqual(module.lif_ssm.time_steps, [11])
+
+    def test_forward_validates_layout_channels_and_scan_dependency(self):
+        module = SpikMamba2D(
+            channels=2,
+            d_state=1,
+            selective_scan=ones_scan,
+        )
+        with self.assertRaisesRegex(ValueError, "BCHW"):
+            module(torch.randn(1, 2, 4), time_step=0)
+        with self.assertRaisesRegex(ValueError, "expects 2 channels"):
+            module(torch.randn(1, 3, 2, 2), time_step=0)
+        module.selective_scan = None
+        with self.assertRaisesRegex(ImportError, "mamba_ssm"):
+            module(torch.randn(1, 2, 2, 2), time_step=0)
+
+    def test_forward_preserves_shape_and_backpropagates(self):
+        torch.manual_seed(0)
+        module = SpikMamba2D(
+            channels=4,
+            d_state=2,
+            selective_scan=selective_scan_test_double,
+        )
+        F_in = torch.randn(2, 4, 3, 4, requires_grad=True)
+
+        output = module(F_in, time_step=0)
+        output.square().mean().backward()
+
+        self.assertEqual(output.shape, F_in.shape)
+        self.assertIsNotNone(F_in.grad)
+        self.assertGreater(float(F_in.grad.abs().sum()), 0.0)
+        self.assertIsNotNone(module.linear_m.weight.grad)
+        self.assertIsNotNone(module.scan_conv1d.weight.grad)
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,6 +2,10 @@
 # dnn_3ch.py — SNN (TBPTT) 2D-train / 3D-eval for BraTS (ET/TC/WT multilabel)
 
 import os
+
+# Must be set before PyTorch initializes CUDA/CUBLAS.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+
 import re
 import random
 import argparse
@@ -52,6 +56,23 @@ torch.use_deterministic_algorithms(True, warn_only=True)
 
 # Ensure reproducible hashing (affects dataloader shuffling, etc.)
 os.environ["PYTHONHASHSEED"] = str(SEED)
+
+# ---- Mamba / selective_scan availability check ----
+MAMBA_SELECTIVE_SCAN_AVAILABLE = False
+MAMBA_SELECTIVE_SCAN_ERROR = None
+try:
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+    MAMBA_SELECTIVE_SCAN_AVAILABLE = selective_scan_fn is not None
+except Exception as exc:  # pragma: no cover - startup diagnostics only
+    MAMBA_SELECTIVE_SCAN_AVAILABLE = False
+    MAMBA_SELECTIVE_SCAN_ERROR = repr(exc)
+
+if MAMBA_SELECTIVE_SCAN_AVAILABLE:
+    print(f"[MAMBA] selective_scan_cuda is available: {selective_scan_fn}")
+else:
+    print("[MAMBA] selective_scan_cuda is NOT available.")
+    if MAMBA_SELECTIVE_SCAN_ERROR:
+        print(f"[MAMBA] Import error: {MAMBA_SELECTIVE_SCAN_ERROR}")
 
 # For dataloaders with multiple workers
 def seed_worker(worker_id):
