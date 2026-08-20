@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=TrainSagittal
-#SBATCH --output=slurm_output_sagittal_mamba_fptt%j.out
-#SBATCH --error=slurm_output_sagittal_mamba_fptt%j.err
+#SBATCH --output=sagittal_fold1_patchSS2D_fptt%j.out
+#SBATCH --error=sagittal_fold1_patchSS2D_fptt%j.err
 #SBATCH --time=3-00:00:00
-#SBATCH --partition=gpu_a100
+#SBATCH --partition=gpu_h100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=18
@@ -25,7 +25,7 @@ echo "Virtual environment activated: $VIRTUAL_ENV"
 
 # === 2. Define and Create Output Directory ===
 # I percorsi sono relativi a $SLURM_SUBMIT_DIR (la directory da cui sottometti il job)
-RUN_ID="brats23_sagittal_fold1_orig_${SLURM_JOB_ID}"
+RUN_ID="brats23_sagittal_fold1_patchSS2D${SLURM_JOB_ID}"
 OUTPUT_DIR_PERSISTENT="experiments/$RUN_ID"
 mkdir -p "$OUTPUT_DIR_PERSISTENT"
 export SNN_FPTT_RUN_ID="$RUN_ID"

@@ -499,6 +499,25 @@ def load_experiment_from_yaml(config_path: str) -> Dict:
     return raw
 
 
+def build_model(model_name: str, out_channels: int = 3, patch_size=None):
+    if model_name == "orig":
+        return SNNBraTS(
+            out_channels=out_channels,
+            patch_size=patch_size,
+        )
+    if patch_size is not None:
+        raise ValueError(
+            "patch_size is currently supported only when model='orig'"
+        )
+    if model_name == "shallow":
+        return SNNBraTSUNetShallow(out_channels=out_channels)
+    if model_name == "medium":
+        return SNNBraTSUNetMedium(out_channels=out_channels)
+    if model_name == "deep":
+        return SNNBraTSUNetDeep(out_channels=out_channels)
+    raise ValueError(f"Unknown model: {model_name}")
+
+
 def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
     accelerator = Accelerator()
     exp_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", exp_cfg["name"])
@@ -537,6 +556,16 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
     val_fold = int(exp_cfg["val_fold"])
     view = exp_cfg["view"]
     model_name = exp_cfg["model"]
+    patch_size = exp_cfg.get("patch_size")
+    if patch_size is not None:
+        if isinstance(patch_size, bool) or not isinstance(patch_size, int):
+            raise ValueError(
+                "patch_size must be a positive integer or null"
+            )
+        if patch_size <= 0:
+            raise ValueError(
+                "patch_size must be a positive integer or null"
+            )
     epochs = int(exp_cfg["epochs"])
     batch_size_subjects = int(exp_cfg["batch_size_subjects"])
     lr = float(exp_cfg["lr"])
@@ -570,6 +599,7 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
         "val_fold": val_fold,
         "view": view,
         "model": model_name,
+        "patch_size": patch_size,
         "epochs": epochs,
         "batch_size_subjects": batch_size_subjects,
         "lr": lr,
@@ -664,16 +694,11 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
 
     print(f"Loss weights -> lambda_bce={lambda_bce}, lambda_dice={lambda_dice}")
 
-    if model_name == "orig":
-        model = SNNBraTS(out_channels=3)
-    elif model_name == "shallow":
-        model = SNNBraTSUNetShallow(out_channels=3)
-    elif model_name == "medium":
-        model = SNNBraTSUNetMedium(out_channels=3)
-    elif model_name == "deep":
-        model = SNNBraTSUNetDeep(out_channels=3)
-    else:
-        raise ValueError(f"Unknown model: {model_name}")
+    model = build_model(
+        model_name,
+        out_channels=3,
+        patch_size=patch_size,
+    )
 
     if accelerator.is_main_process:
         print_model_info(model)

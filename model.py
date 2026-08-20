@@ -53,16 +53,48 @@ class ConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels,
                  kernel_size=3, stride=1, padding=0,
                  dropout=0.3, init_tau=2.0,
-                 normalization=True, spiking=True, ss2d=True):
+                 normalization=True, spiking=True, ss2d=True,
+                 patch_size=None):
         super().__init__()
         self.dropout = float(dropout)
         self.normalization = normalization
         self.spiking = spiking
         self.ss2d = ss2d
+        if patch_size is not None:
+            if (
+                isinstance(patch_size, bool)
+                or not isinstance(patch_size, int)
+                or patch_size <= 0
+            ):
+                raise ValueError(
+                    f"patch_size must be a positive integer or None, got {patch_size!r}"
+                )
+            if not self.ss2d:
+                raise ValueError("patch_size requires ss2d=True")
+        self.patch_size = patch_size
 
         self.conv = nn.Conv2d(in_channels, out_channels,
                               kernel_size=kernel_size,
                               stride=stride, padding=padding, bias=False)
+
+        if self.patch_size is not None:
+            self.patch_embed = nn.Sequential(
+                nn.Conv2d(
+                    out_channels,
+                    out_channels,
+                    kernel_size=self.patch_size,
+                    stride=self.patch_size,
+                    bias=False,
+                ),
+                nn.GroupNorm(1, out_channels),
+            )
+            self.patch_unembed = nn.ConvTranspose2d(
+                out_channels,
+                out_channels,
+                kernel_size=self.patch_size,
+                stride=self.patch_size,
+                bias=False,
+            )
         
         if self.ss2d:
             self.ssm_module = SS2D(
@@ -82,7 +114,37 @@ class ConvBlock(nn.Module):
     def forward(self, x, time_step: int):
         out = self.conv(x)
         if self.ss2d:
-            out = self.ssm_module(out)
+            if self.patch_size is not None:
+                height, width = out.shape[-2:]
+                pad_h = (
+                    self.patch_size - height % self.patch_size
+                ) % self.patch_size
+                pad_w = (
+                    self.patch_size - width % self.patch_size
+                ) % self.patch_size
+                if pad_h or pad_w:
+                    out = F.pad(out, (0, pad_w, 0, pad_h))
+
+                # [B,C,H,W] -> [B,C,H/patch_size,W/patch_size]
+                out = self.patch_embed(out)
+                if out.ndim != 4:
+                    raise ValueError(
+                        "patch embedding must return BCHW output, "
+                        f"got {tuple(out.shape)}"
+                    )
+                out = self.ssm_module(out.contiguous())
+
+                # [B,C,H_patch,W_patch] -> [B,C,H_padded,W_padded]
+                out = self.patch_unembed(out)
+                out = out[..., :height, :width]
+                if out.shape[-2:] != (height, width):
+                    raise ValueError(
+                        "patch unembedding failed to restore the convolution "
+                        f"output size {(height, width)}; "
+                        f"got {tuple(out.shape[-2:])}"
+                    )
+            else:
+                out = self.ssm_module(out)
         if self.normalization:
             out = self.norm(out)
         if self.spiking:
@@ -337,10 +399,18 @@ class SNNBraTS(nn.Module):
                  out_channels: int = 4,
                  selective_scan=None,
                  ssm_d_state: int = 16,
-                 ssm_dt_rank="auto"):
+                 ssm_dt_rank="auto",
+                 patch_size=None):
         super().__init__()
         # Encoder
-        self.conv_block1 = ConvBlock(4, 32, padding=1, dropout=0.1, ss2d=True)
+        self.conv_block1 = ConvBlock(
+            4,
+            32,
+            padding=1,
+            dropout=0.1,
+            ss2d=True,
+            patch_size=patch_size,
+        )
         self.conv_block2 = ConvBlock(32, 64, padding=1, dropout=0.1)
         self.conv_block3 = ConvBlock(64, 128, padding=1, dropout=0.1)
 

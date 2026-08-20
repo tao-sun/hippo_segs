@@ -1,8 +1,9 @@
-name: brats23_sagittal_fold1_mamba
+name: brats23_sagittal_fold1_patchSS2D
 data_root: /gpfs/scratch1/shared/apiaghiardelli/BRATS2023_preprocessed/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData
 val_fold: 1
 view: sagittal
 model: orig
+patch_size: 4  # null = pixel-level SS2D; positive integer = learned patch size
 batch_size_subjects: 8
 lr: 0.001
 epochs: 200
