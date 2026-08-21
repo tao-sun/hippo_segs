@@ -132,6 +132,7 @@ class SpikeMambaLayer(nn.Module):
         self.d_conv = _positive_int("d_conv", d_conv)
         self.expand = _positive_int("expand", expand)
         self.max_time_steps = _positive_int("max_time_steps", max_time_steps)
+        self.num_directions = 4
         self.d_inner = self.expand * self.dim
         self.dt_rank = (
             math.ceil(self.dim / 16)
@@ -164,42 +165,61 @@ class SpikeMambaLayer(nn.Module):
             bias=conv_bias,
             **kwargs,
         )
-        self.sl_m2 = _make_plif(init_tau, device=device, dtype=dtype)
-        self.x_proj = nn.Linear(
-            self.d_inner,
-            self.dt_rank + 2 * self.d_state,
-            bias=False,
-            **kwargs,
+        self.sl_m2 = nn.ModuleList(
+            [
+                _make_plif(init_tau, device=device, dtype=dtype)
+                for _ in range(self.num_directions)
+            ]
         )
-        self.dt_proj = nn.Linear(
-            self.dt_rank, self.d_inner, bias=True, **kwargs
+        x_proj_layers = [
+            nn.Linear(
+                self.d_inner,
+                self.dt_rank + 2 * self.d_state,
+                bias=False,
+                **kwargs,
+            )
+            for _ in range(self.num_directions)
+        ]
+        self.x_proj_weight = nn.Parameter(
+            torch.stack([layer.weight for layer in x_proj_layers], dim=0)
+        )
+        self.dt_proj_weight = nn.Parameter(
+            torch.empty(
+                self.num_directions, self.d_inner, self.dt_rank, **kwargs
+            )
         )
 
         std = self.dt_rank ** -0.5 * dt_scale
         if dt_init == "constant":
-            nn.init.constant_(self.dt_proj.weight, std)
+            nn.init.constant_(self.dt_proj_weight, std)
         else:
-            nn.init.uniform_(self.dt_proj.weight, -std, std)
+            nn.init.uniform_(self.dt_proj_weight, -std, std)
         dt = torch.exp(
-            torch.rand(self.d_inner, **kwargs)
+            torch.rand(
+                self.num_directions, self.d_inner, **kwargs
+            )
             * (math.log(dt_max) - math.log(dt_min))
             + math.log(dt_min)
         ).clamp(min=dt_init_floor)
         inverse_softplus = dt + torch.log(-torch.expm1(-dt))
-        with torch.no_grad():
-            self.dt_proj.bias.copy_(inverse_softplus)
-        self.dt_proj.bias._no_reinit = True
+        self.dt_proj_bias = nn.Parameter(inverse_softplus)
+        self.dt_proj_bias._no_reinit = True
 
         base = torch.arange(
             1, self.d_state + 1,
             dtype=torch.float32, device=device,
         )
         self.A_log = nn.Parameter(
-            torch.log(base.unsqueeze(0).repeat(self.d_inner, 1))
+            torch.log(base).view(1, 1, self.d_state).repeat(
+                self.num_directions, self.d_inner, 1
+            )
         )
         self.A_log._no_weight_decay = True
         self.D = nn.Parameter(
-            torch.ones(self.d_inner, dtype=torch.float32, device=device)
+            torch.ones(
+                self.num_directions, self.d_inner,
+                dtype=torch.float32, device=device,
+            )
         )
         self.D._no_weight_decay = True
         self.out_proj = nn.Linear(
@@ -255,42 +275,123 @@ class SpikeMambaLayer(nn.Module):
         p_global = self.linear_m(p_local)
         p_global, _ = self.sl_m1(p_global, time_step)
 
-        route_outputs = []
-        for route in self._cross_scan_routes(p_global, height, width):
-            route_conv = self._causal_conv(route.transpose(1, 2).contiguous())
-            route_conv, _ = self.sl_m2(route_conv, time_step)
-
-            projected = self.x_proj(route_conv.transpose(1, 2))
-            delta_low, B, C = torch.split(
-                projected,
-                [self.dt_rank, self.d_state, self.d_state],
-                dim=-1,
+        routes = torch.stack(
+            self._cross_scan_routes(p_global, height, width), dim=1
+        )
+        sequence_length = height * width
+        route_batch = routes.reshape(
+            batch * self.num_directions,
+            sequence_length,
+            self.d_inner,
+        )
+        route_conv = self._causal_conv(
+            route_batch.transpose(1, 2).contiguous()
+        )
+        route_convs = route_conv.reshape(
+            batch,
+            self.num_directions,
+            self.d_inner,
+            sequence_length,
+        )
+        spiking_routes = []
+        for route_index, route_features in enumerate(
+            route_convs.unbind(dim=1)
+        ):
+            route_spikes, _ = self.sl_m2[route_index](
+                route_features, time_step
             )
-            delta = F.linear(
-                delta_low, self.dt_proj.weight, bias=None
-            ).transpose(1, 2).contiguous()
-            B = B.transpose(1, 2).contiguous()
-            C = C.transpose(1, 2).contiguous()
-            A = -torch.exp(self.A_log.float())
+            spiking_routes.append(route_spikes)
+        route_convs = torch.stack(spiking_routes, dim=1)
 
-            y = self.selective_scan(
-                route_conv,
-                delta,
-                A,
-                B,
-                C,
-                self.D.float(),
-                z=None,
-                delta_bias=self.dt_proj.bias.float(),
-                delta_softplus=True,
-                return_last_state=False,
+        projection_size = self.dt_rank + 2 * self.d_state
+        projected = F.conv1d(
+            route_convs.reshape(
+                batch,
+                self.num_directions * self.d_inner,
+                sequence_length,
+            ),
+            self.x_proj_weight.reshape(
+                self.num_directions * projection_size,
+                self.d_inner,
+                1,
+            ),
+            groups=self.num_directions,
+        ).view(
+            batch,
+            self.num_directions,
+            projection_size,
+            sequence_length,
+        )
+        delta_low, state_B, state_C = torch.split(
+            projected,
+            [self.dt_rank, self.d_state, self.d_state],
+            dim=2,
+        )
+        delta = F.conv1d(
+            delta_low.reshape(
+                batch,
+                self.num_directions * self.dt_rank,
+                sequence_length,
+            ),
+            self.dt_proj_weight.reshape(
+                self.num_directions * self.d_inner,
+                self.dt_rank,
+                1,
+            ),
+            groups=self.num_directions,
+        )
+        scan_input = route_convs.reshape(
+            batch,
+            self.num_directions * self.d_inner,
+            sequence_length,
+        )
+        y = self.selective_scan(
+            scan_input,
+            delta,
+            -torch.exp(self.A_log.float()).reshape(
+                self.num_directions * self.d_inner,
+                self.d_state,
+            ),
+            state_B,
+            state_C,
+            self.D.float().reshape(self.num_directions * self.d_inner),
+            z=None,
+            delta_bias=self.dt_proj_bias.float().reshape(
+                self.num_directions * self.d_inner
+            ),
+            delta_softplus=True,
+            return_last_state=False,
+        )
+        route_outputs = (
+            y.reshape(
+                batch,
+                self.num_directions,
+                self.d_inner,
+                sequence_length,
             )
-            y = self.out_proj(
-                y.transpose(1, 2).to(self.out_proj.weight.dtype)
-            )
-            route_outputs.append(y)
-
-        y = torch.stack(route_outputs, dim=0).mean(dim=0)
+            .permute(0, 1, 3, 2)
+            .contiguous()
+        )
+        row_forward = route_outputs[:, 0]
+        row_backward = torch.flip(route_outputs[:, 1], dims=[1])
+        col_forward = (
+            route_outputs[:, 2]
+            .reshape(batch, width, height, self.d_inner)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+            .reshape(batch, sequence_length, self.d_inner)
+        )
+        col_backward = (
+            torch.flip(route_outputs[:, 3], dims=[1])
+            .reshape(batch, width, height, self.d_inner)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+            .reshape(batch, sequence_length, self.d_inner)
+        )
+        y = 0.25 * (
+            row_forward + row_backward + col_forward + col_backward
+        )
+        y = self.out_proj(y.to(self.out_proj.weight.dtype))
         y, _ = self.sl_ssm(y, time_step)
         gated = y * p_local
         return (
