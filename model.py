@@ -52,51 +52,49 @@ def print_model_info(model: nn.Module):
 
 
 class _SpikMambaEncoderAdapter(nn.Module):
-    """Patch-based spiking Mamba encoder block with size-preserving upsampling."""
+    """Downsample one feature map with patch embedding, then apply SS2D."""
 
     def __init__(
         self,
-        channels: int,
+        in_channels: int,
+        out_channels: int,
         patch_size: int = 4,
         d_state: int = 16,
         dt_rank: Union[int, str] = "auto",
         init_tau: float = 2.0,
         selective_scan=None,
         max_time_steps: int = 256,
+        linear_projection: bool = True,
+        residual_connections: bool = True,
+        conv1d_spiking: bool = True,
+        patch_embedding_spiking: bool = False,
     ) -> None:
         super().__init__()
-        self.channels = int(channels)
+        self.in_channels = int(in_channels)
+        self.out_channels = int(out_channels)
+        self.channels = self.out_channels
         self.patch_size = int(patch_size)
-        self.pre_norm = nn.GroupNorm(1, self.channels)
-        self.pre_plif = PLIFNode(
-            init_tau=init_tau,
-            surrogate_function=surrogate.ATan(),
-            detach_reset=True,
-        )
         self.patch_embed = Spiking2DPatchEmbedding(
-            in_channels=self.channels,
-            embed_dim=self.channels,
-            image_size=(8, 8),
+            in_channels=self.in_channels,
+            embed_dim=self.out_channels,
+            image_size=(self.patch_size, self.patch_size),
             patch_size=self.patch_size,
             max_time_steps=max_time_steps,
             init_tau=init_tau,
+            patch_embedding_spiking=patch_embedding_spiking,
         )
         self.spik_mamba = SpikMambaBlock(
-            dim=self.channels,
+            dim=self.out_channels,
             d_state=d_state,
             dt_rank=dt_rank,
             init_tau=init_tau,
             selective_scan=selective_scan,
             max_time_steps=max_time_steps,
+            linear_projection=linear_projection,
+            residual_connections=residual_connections,
+            conv1d_spiking=conv1d_spiking,
         )
-        self.up = nn.ConvTranspose2d(
-            self.channels,
-            self.channels,
-            kernel_size=self.patch_size,
-            stride=self.patch_size,
-            bias=False,
-        )
-        self.post_norm = nn.GroupNorm(1, self.channels)
+        self.post_norm = nn.GroupNorm(1, self.out_channels)
         self.post_plif = PLIFNode(
             init_tau=init_tau,
             surrogate_function=surrogate.ATan(),
@@ -106,37 +104,22 @@ class _SpikMambaEncoderAdapter(nn.Module):
     def forward(self, x: torch.Tensor, time_step: int) -> torch.Tensor:
         if x.ndim != 4:
             raise ValueError(f"expected BCHW input, got {tuple(x.shape)}")
-        if x.shape[1] != self.channels:
+        if x.shape[1] != self.in_channels:
             raise ValueError(
-                f"expected {self.channels} channels, got {x.shape[1]}"
-            )
-
-        batch, channels, height, width = x.shape
-        if channels != self.channels:
-            raise ValueError(
-                f"expected {self.channels} channels, got {channels}"
-            )
-
-        x = self.pre_norm(x)
-        x, _ = self.pre_plif(x, time_step)
-
-        pad_h = (-height) % self.patch_size
-        pad_w = (-width) % self.patch_size
-        if pad_h or pad_w:
-            x = F.pad(x, (0, pad_w, 0, pad_h))
-
-        padded_h, padded_w = x.shape[-2:]
-        if padded_h % self.patch_size or padded_w % self.patch_size:
-            raise ValueError(
-                "padded spatial size must remain divisible by patch_size"
+                f"expected {self.in_channels} channels, got {x.shape[1]}"
             )
 
         x = self.patch_embed(x, time_step)
-        x = self.spik_mamba(x, time_step)
-        x = self.up(x)
-
-        if pad_h or pad_w:
-            x = x[..., :height, :width]
+        batch, channels, height, width = x.shape
+        tokens = x.flatten(2).transpose(1, 2).contiguous()
+        tokens = self.spik_mamba(
+            tokens,
+            time_step,
+            spatial_shape=(height, width),
+        )
+        x = tokens.transpose(1, 2).contiguous().view(
+            batch, channels, height, width
+        )
 
         x = self.post_norm(x)
         x, _ = self.post_plif(x, time_step)
@@ -149,28 +132,39 @@ class ConvBlock(nn.Module):
                  dropout=0.3, init_tau=2.0,
                  normalization=True, spiking=True,
                  spikMamba=False, selective_scan=None,
-                 ssm_d_state=16, ssm_dt_rank="auto"):
+                 ssm_d_state=16, ssm_dt_rank="auto",
+                 patch_size=4, linear_projection=True,
+                 residual_connections=True,
+                 conv1d_spiking=True,
+                 patch_embedding_spiking=False):
         super().__init__()
         self.dropout = float(dropout)
         self.normalization = normalization
         self.spiking = spiking
         self.spikMamba = bool(spikMamba)
 
-        self.conv = nn.Conv2d(
-            in_channels,
-            out_channels,
-            kernel_size=kernel_size,
-            stride=stride,
-            padding=padding,
-            bias=False,
-        )
         if self.spikMamba:
             self.spik_mamba = _SpikMambaEncoderAdapter(
-                channels=out_channels,
+                in_channels=in_channels,
+                out_channels=out_channels,
+                patch_size=patch_size,
                 d_state=ssm_d_state,
                 dt_rank=ssm_dt_rank,
                 init_tau=init_tau,
                 selective_scan=selective_scan,
+                linear_projection=linear_projection,
+                residual_connections=residual_connections,
+                conv1d_spiking=conv1d_spiking,
+                patch_embedding_spiking=patch_embedding_spiking,
+            )
+        else:
+            self.conv = nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=padding,
+                bias=False,
             )
 
         self.norm = nn.GroupNorm(1, out_channels)
@@ -182,12 +176,13 @@ class ConvBlock(nn.Module):
         )
 
     def forward(self, x, time_step: int):
-        out = self.conv(x)
         if self.spikMamba:
-            out = self.spik_mamba(out, time_step)
+            out = self.spik_mamba(x, time_step)
             if self.dropout > 0:
                 out = F.dropout(out, p=self.dropout, training=self.training)
             return out
+
+        out = self.conv(x)
 
         if self.normalization:
             out = self.norm(out)
@@ -236,14 +231,40 @@ class SNNBraTS(nn.Module):
                  out_channels: int = 4,
                  selective_scan=None,
                  ssm_d_state: int = 16,
-                 ssm_dt_rank="auto"):
+                 ssm_dt_rank="auto",
+                 patch_size: int = 4,
+                 linear_projection: bool = True,
+                 residual_connections: bool = True,
+                 conv1d_spiking: bool = True,
+                 patch_embedding_spiking: bool = False):
         super().__init__()
+        if isinstance(patch_size, bool) or not isinstance(patch_size, int) or patch_size <= 0:
+            raise ValueError("patch_size must be a positive integer")
+        if not isinstance(linear_projection, bool):
+            raise TypeError("linear_projection must be a boolean")
+        if not isinstance(residual_connections, bool):
+            raise TypeError("residual_connections must be a boolean")
+        if not isinstance(conv1d_spiking, bool):
+            raise TypeError("conv1d_spiking must be a boolean")
+        if not isinstance(patch_embedding_spiking, bool):
+            raise TypeError("patch_embedding_spiking must be a boolean")
+        self.patch_size = patch_size
+        self.linear_projection = linear_projection
+        self.residual_connections = residual_connections
+        self.conv1d_spiking = conv1d_spiking
+        self.patch_embedding_spiking = patch_embedding_spiking
+        self.encoder_scale = self.patch_size ** 3
         # Encoder
         spik_mamba_kwargs = {
             "spikMamba": True,
             "selective_scan": selective_scan,
             "ssm_d_state": ssm_d_state,
             "ssm_dt_rank": ssm_dt_rank,
+            "patch_size": self.patch_size,
+            "linear_projection": self.linear_projection,
+            "residual_connections": self.residual_connections,
+            "conv1d_spiking": self.conv1d_spiking,
+            "patch_embedding_spiking": self.patch_embedding_spiking,
         }
         self.conv_block1 = ConvBlock(
             4,
@@ -268,7 +289,7 @@ class SNNBraTS(nn.Module):
         )
 
         # Decoder
-        self.deconv_block1 = DeconvBlock(128, 128, dropout=0.1)
+        self.deconv_block1 = DeconvBlock(128, 128, self.patch_size, self.patch_size, dropout=0.1)
         self.deconv1_conv = ConvBlock(
             128, 128, padding=1, dropout=0.1
         )
@@ -276,7 +297,7 @@ class SNNBraTS(nn.Module):
             128 + 64, 128, padding=1, dropout=0.1
         )
 
-        self.deconv_block2 = DeconvBlock(128, 128, dropout=0.1)
+        self.deconv_block2 = DeconvBlock(128, 128, self.patch_size, self.patch_size, dropout=0.1)
         self.deconv2_conv = ConvBlock(
             128, 128, padding=1, dropout=0.1
         )
@@ -284,7 +305,7 @@ class SNNBraTS(nn.Module):
             128 + 32, 128, padding=1, dropout=0.1
         )
 
-        self.deconv_block3 = DeconvBlock(128, 128, dropout=0.1)
+        self.deconv_block3 = DeconvBlock(128, 128, self.patch_size, self.patch_size, dropout=0.1)
         self.deconv3_conv = ConvBlock(
             128, 128, padding=1, dropout=0.1
         )
@@ -299,40 +320,38 @@ class SNNBraTS(nn.Module):
             spiking=False,
         )
 
-        self.pool = nn.MaxPool2d(2, 2)
 
     def forward(self, x_win: torch.Tensor, t0: int = 0) -> torch.Tensor:
         B, k, C, H, W = x_win.shape
+        pad_h = (-H) % self.encoder_scale
+        pad_w = (-W) % self.encoder_scale
         logits = []
 
         for i in range(k):
             time_step = t0 + i  # absolute time across the sequence 0..D-1
             x = x_win[:, i, :, :, :]  # (B,4,H,W)
+            if pad_h or pad_w:
+                x = F.pad(x, (0, pad_w, 0, pad_h))
 
-            x = self.conv_block1(x, time_step)
-            pool1 = self.pool(x)
-
-            x = self.conv_block2(pool1, time_step)
-
-            pool2 = self.pool(x)
-
-            x = self.conv_block3(pool2, time_step)
-            x = self.pool(x)
+            skip1 = self.conv_block1(x, time_step)
+            skip2 = self.conv_block2(skip1, time_step)
+            x = self.conv_block3(skip2, time_step)
 
             x = self.deconv_block1(x, time_step)
             x = self.deconv1_conv(x, time_step)
-            x = torch.cat([pool2, x], dim=1)
+            x = torch.cat([skip2, x], dim=1)
             x = self.concat1_conv(x, time_step)
 
             x = self.deconv_block2(x, time_step)
             x = self.deconv2_conv(x, time_step)
-            x = torch.cat([pool1, x], dim=1)
+            x = torch.cat([skip1, x], dim=1)
             x = self.concat2_conv(x, time_step)
             
             x = self.deconv_block3(x, time_step)
             x = self.deconv3_conv(x, time_step)
 
             x = self.class_conv(x, time_step)  # (B,out_channels,H,W)
+            x = x[..., :H, :W]
             logits.append(x)
 
         logits = torch.stack(logits, dim=2)  # (B,out_channels,k,H,W)

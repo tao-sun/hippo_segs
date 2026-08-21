@@ -53,6 +53,7 @@ class Spiking2DPatchEmbedding(nn.Module):
         patch_size: int = 4,
         max_time_steps: int = 256,
         init_tau: float = 2.0,
+        patch_embedding_spiking: bool = False,
         device=None,
         dtype=None,
     ) -> None:
@@ -63,6 +64,9 @@ class Spiking2DPatchEmbedding(nn.Module):
         self.max_time_steps = _positive_int(
             "max_time_steps", max_time_steps
         )
+        if not isinstance(patch_embedding_spiking, bool):
+            raise TypeError("patch_embedding_spiking must be a boolean")
+        self.patch_embedding_spiking = patch_embedding_spiking
         if not isinstance(image_size, tuple) or len(image_size) != 2:
             raise ValueError("image_size must be a (height, width) tuple")
         height = _positive_int("image_size[0]", image_size[0])
@@ -80,6 +84,11 @@ class Spiking2DPatchEmbedding(nn.Module):
             **kwargs,
         )
         self.norm = nn.GroupNorm(1, self.embed_dim, **kwargs)
+        self.patch_plif = (
+            _make_plif(init_tau, device=device, dtype=dtype)
+            if self.patch_embedding_spiking
+            else None
+        )
 
     def forward(self, x: torch.Tensor, time_step: int) -> torch.Tensor:
         if x.ndim != 4:
@@ -100,7 +109,10 @@ class Spiking2DPatchEmbedding(nn.Module):
         ):
             raise ValueError("time_step is outside the configured range")
 
-        return self.norm(self.proj(x))
+        x = self.norm(self.proj(x))
+        if self.patch_embedding_spiking:
+            x, _ = self.patch_plif(x, time_step)
+        return x
 
 
 class SpikeMambaLayer(nn.Module):
@@ -125,6 +137,8 @@ class SpikeMambaLayer(nn.Module):
         device=None,
         dtype=None,
         max_time_steps: int = 256,
+        linear_projection: bool = True,
+        conv1d_spiking: bool = True,
     ) -> None:
         super().__init__()
         self.dim = _positive_int("dim", dim)
@@ -132,7 +146,14 @@ class SpikeMambaLayer(nn.Module):
         self.d_conv = _positive_int("d_conv", d_conv)
         self.expand = _positive_int("expand", expand)
         self.max_time_steps = _positive_int("max_time_steps", max_time_steps)
-        self.d_inner = self.expand * self.dim
+        if not isinstance(linear_projection, bool):
+            raise TypeError("linear_projection must be a boolean")
+        if not isinstance(conv1d_spiking, bool):
+            raise TypeError("conv1d_spiking must be a boolean")
+        self.linear_projection = linear_projection
+        self.conv1d_spiking = conv1d_spiking
+        self.num_directions = 4
+        self.d_inner = self.expand * self.dim if linear_projection else self.dim
         self.dt_rank = (
             math.ceil(self.dim / 16)
             if dt_rank == "auto"
@@ -151,9 +172,12 @@ class SpikeMambaLayer(nn.Module):
             raise NotImplementedError(f"unsupported dt_init={dt_init!r}")
 
         kwargs = {"device": device, "dtype": dtype}
-        self.linear_m = nn.Linear(
-            self.dim, self.d_inner, bias=bias, **kwargs
-        )
+        if self.linear_projection:
+            self.linear_m = nn.Linear(
+                self.dim, self.d_inner, bias=bias, **kwargs
+            )
+        else:
+            self.linear_m = nn.Identity()
         self.sl_m1 = _make_plif(init_tau, device=device, dtype=dtype)
         self.conv1d_m = nn.Conv1d(
             self.d_inner,
@@ -164,58 +188,75 @@ class SpikeMambaLayer(nn.Module):
             bias=conv_bias,
             **kwargs,
         )
-        self.sl_m2 = _make_plif(init_tau, device=device, dtype=dtype)
-        self.x_proj = nn.Linear(
-            self.d_inner,
-            self.dt_rank + 2 * self.d_state,
-            bias=False,
-            **kwargs,
+        self.sl_m2 = nn.ModuleList(
+            [
+                _make_plif(init_tau, device=device, dtype=dtype)
+                for _ in range(self.num_directions)
+            ]
+            if self.conv1d_spiking
+            else []
         )
-        self.dt_proj = nn.Linear(
-            self.dt_rank, self.d_inner, bias=True, **kwargs
+        x_proj_layers = [
+            nn.Linear(
+                self.d_inner,
+                self.dt_rank + 2 * self.d_state,
+                bias=False,
+                **kwargs,
+            )
+            for _ in range(self.num_directions)
+        ]
+        self.x_proj_weight = nn.Parameter(
+            torch.stack([layer.weight for layer in x_proj_layers], dim=0)
         )
-
+        self.dt_proj_weight = nn.Parameter(
+            torch.empty(
+                self.num_directions, self.d_inner, self.dt_rank, **kwargs
+            )
+        )
         std = self.dt_rank ** -0.5 * dt_scale
         if dt_init == "constant":
-            nn.init.constant_(self.dt_proj.weight, std)
+            nn.init.constant_(self.dt_proj_weight, std)
         else:
-            nn.init.uniform_(self.dt_proj.weight, -std, std)
+            nn.init.uniform_(self.dt_proj_weight, -std, std)
         dt = torch.exp(
-            torch.rand(self.d_inner, **kwargs)
+            torch.rand(
+                self.num_directions, self.d_inner, **kwargs
+            )
             * (math.log(dt_max) - math.log(dt_min))
             + math.log(dt_min)
         ).clamp(min=dt_init_floor)
         inverse_softplus = dt + torch.log(-torch.expm1(-dt))
-        with torch.no_grad():
-            self.dt_proj.bias.copy_(inverse_softplus)
-        self.dt_proj.bias._no_reinit = True
+        self.dt_proj_bias = nn.Parameter(inverse_softplus)
+        self.dt_proj_bias._no_reinit = True
 
         base = torch.arange(
             1, self.d_state + 1,
             dtype=torch.float32, device=device,
         )
         self.A_log = nn.Parameter(
-            torch.log(base.unsqueeze(0).repeat(self.d_inner, 1))
+            torch.log(base).view(1, 1, self.d_state).repeat(
+                self.num_directions, self.d_inner, 1
+            )
         )
         self.A_log._no_weight_decay = True
         self.D = nn.Parameter(
-            torch.ones(self.d_inner, dtype=torch.float32, device=device)
+            torch.ones(
+                self.num_directions, self.d_inner,
+                dtype=torch.float32, device=device,
+            )
         )
         self.D._no_weight_decay = True
-        self.out_proj = nn.Linear(
-            self.d_inner, self.dim, bias=bias, **kwargs
-        )
-        self.sl_ssm = _make_plif(init_tau, device=device, dtype=dtype)
+        if self.linear_projection:
+            self.out_proj = nn.Linear(
+                self.d_inner, self.dim, bias=bias, **kwargs
+            )
+        else:
+            self.out_proj = nn.Identity()
         self.selective_scan = (
             selective_scan
             if selective_scan is not None
             else selective_scan_fn
         )
-
-    @staticmethod
-    def _to_tokens(patches: torch.Tensor) -> torch.Tensor:
-        # B D H W -> B (H W) D, row-major.
-        return patches.flatten(2).transpose(1, 2).contiguous()
 
     def _causal_conv(self, sequence: torch.Tensor) -> torch.Tensor:
         return self.conv1d_m(sequence)[..., :sequence.shape[-1]]
@@ -235,69 +276,161 @@ class SpikeMambaLayer(nn.Module):
 
         return [row_major, row_major_rev, col_major, col_major_rev]
 
-    def forward(self, patches: torch.Tensor, time_step: int) -> torch.Tensor:
-        if patches.ndim != 4:
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        time_step: int,
+        spatial_shape: Tuple[int, int],
+    ) -> torch.Tensor:
+        if tokens.ndim != 3:
             raise ValueError(
-                f"expected BDHW patches, got {tuple(patches.shape)}"
+                f"expected BLD patch tokens, got {tuple(tokens.shape)}"
             )
-        if patches.shape[1] != self.dim:
+        if tokens.shape[-1] != self.dim:
             raise ValueError(
-                f"expected {self.dim} channels, got {patches.shape[1]}"
+                f"expected token dimension {self.dim}, got {tokens.shape[-1]}"
+            )
+        if not isinstance(spatial_shape, tuple) or len(spatial_shape) != 2:
+            raise ValueError("spatial_shape must be a (height, width) tuple")
+        height = _positive_int("spatial_shape[0]", spatial_shape[0])
+        width = _positive_int("spatial_shape[1]", spatial_shape[1])
+        if tokens.shape[1] != height * width:
+            raise ValueError(
+                "token count must equal spatial_shape height * width"
             )
         if self.selective_scan is None:
             raise ImportError(
                 "mamba_ssm or an injected selective_scan is required"
             ) from _MAMBA_IMPORT_ERROR
 
-        batch, _, height, width = patches.shape
-        p_local = self._to_tokens(patches)
-
-        p_global = self.linear_m(p_local)
+        p_global = self.linear_m(tokens)
         p_global, _ = self.sl_m1(p_global, time_step)
 
-        route_outputs = []
-        for route in self._cross_scan_routes(p_global, height, width):
-            route_conv = self._causal_conv(route.transpose(1, 2).contiguous())
-            route_conv, _ = self.sl_m2(route_conv, time_step)
-
-            projected = self.x_proj(route_conv.transpose(1, 2))
-            delta_low, B, C = torch.split(
-                projected,
-                [self.dt_rank, self.d_state, self.d_state],
-                dim=-1,
-            )
-            delta = F.linear(
-                delta_low, self.dt_proj.weight, bias=None
-            ).transpose(1, 2).contiguous()
-            B = B.transpose(1, 2).contiguous()
-            C = C.transpose(1, 2).contiguous()
-            A = -torch.exp(self.A_log.float())
-
-            y = self.selective_scan(
-                route_conv,
-                delta,
-                A,
-                B,
-                C,
-                self.D.float(),
-                z=None,
-                delta_bias=self.dt_proj.bias.float(),
-                delta_softplus=True,
-                return_last_state=False,
-            )
-            y = self.out_proj(
-                y.transpose(1, 2).to(self.out_proj.weight.dtype)
-            )
-            route_outputs.append(y)
-
-        y = torch.stack(route_outputs, dim=0).mean(dim=0)
-        y, _ = self.sl_ssm(y, time_step)
-        gated = y * p_local
-        return (
-            gated.transpose(1, 2)
-            .contiguous()
-            .view(batch, self.dim, height, width)
+        routes = torch.stack(
+            self._cross_scan_routes(p_global, height, width),
+            dim=1,
         )
+        batch = tokens.shape[0]
+        route_batch = routes.reshape(
+            batch * self.num_directions,
+            height * width,
+            self.d_inner,
+        )
+        route_conv = self._causal_conv(
+            route_batch.transpose(1, 2).contiguous()
+        )
+        route_convs = route_conv.reshape(
+            batch,
+            self.num_directions,
+            self.d_inner,
+            height * width,
+        )
+        if self.conv1d_spiking:
+            spiking_routes = []
+            for route_index, route_features in enumerate(
+                route_convs.unbind(dim=1)
+            ):
+                route_spikes, _ = self.sl_m2[route_index](
+                    route_features, time_step
+                )
+                spiking_routes.append(route_spikes)
+            route_convs = torch.stack(spiking_routes, dim=1)
+
+        sequence_length = height * width
+        projection_size = self.dt_rank + 2 * self.d_state
+        projected = F.conv1d(
+            route_convs.reshape(
+                batch,
+                self.num_directions * self.d_inner,
+                sequence_length,
+            ),
+            self.x_proj_weight.reshape(
+                self.num_directions * projection_size,
+                self.d_inner,
+                1,
+            ),
+            groups=self.num_directions,
+        ).view(
+            batch,
+            self.num_directions,
+            projection_size,
+            sequence_length,
+        )
+        delta_low, state_B, state_C = torch.split(
+            projected,
+            [self.dt_rank, self.d_state, self.d_state],
+            dim=2,
+        )
+        delta = F.conv1d(
+            delta_low.reshape(
+                batch,
+                self.num_directions * self.dt_rank,
+                sequence_length,
+            ),
+            self.dt_proj_weight.reshape(
+                self.num_directions * self.d_inner,
+                self.dt_rank,
+                1,
+            ),
+            groups=self.num_directions,
+        )
+        scan_input = route_convs.reshape(
+            batch,
+            self.num_directions * self.d_inner,
+            sequence_length,
+        )
+        y = self.selective_scan(
+            scan_input,
+            delta,
+            -torch.exp(self.A_log.float()).reshape(
+                self.num_directions * self.d_inner,
+                self.d_state,
+            ),
+            state_B,
+            state_C,
+            self.D.float().reshape(self.num_directions * self.d_inner),
+            z=None,
+            delta_bias=self.dt_proj_bias.float().reshape(
+                self.num_directions * self.d_inner
+            ),
+            delta_softplus=True,
+            return_last_state=False,
+        )
+        route_outputs = (
+            y.reshape(
+                batch,
+                self.num_directions,
+                self.d_inner,
+                sequence_length,
+            )
+            .permute(0, 1, 3, 2)
+            .contiguous()
+        )
+
+        row_forward = route_outputs[:, 0]
+        row_backward = torch.flip(route_outputs[:, 1], dims=[1])
+        col_forward = (
+            route_outputs[:, 2]
+            .reshape(batch, width, height, self.d_inner)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+            .reshape(batch, sequence_length, self.d_inner)
+        )
+        col_backward = (
+            torch.flip(route_outputs[:, 3], dims=[1])
+            .reshape(batch, width, height, self.d_inner)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+            .reshape(batch, sequence_length, self.d_inner)
+        )
+        y = 0.25 * (
+            row_forward + row_backward + col_forward + col_backward
+        )
+        if self.linear_projection:
+            y = y.to(self.out_proj.weight.dtype)
+        else:
+            y = y.to(tokens.dtype)
+        return self.out_proj(y)
 
 
 class SpikMambaBlock(nn.Module):
@@ -306,18 +439,37 @@ class SpikMambaBlock(nn.Module):
     def __init__(
         self,
         dim: int,
+        residual_connections: bool = True,
         **mamba_kwargs,
     ) -> None:
         super().__init__()
         self.dim = _positive_int("dim", dim)
-        self.mamba_layer = SpikeMambaLayer(dim=self.dim, **mamba_kwargs)
+        if not isinstance(residual_connections, bool):
+            raise TypeError("residual_connections must be a boolean")
+        self.residual_connections = residual_connections
+        self.mamba_layer = SpikeMambaLayer(
+            dim=self.dim,
+            **mamba_kwargs,
+        )
 
-    def forward(self, patches: torch.Tensor, time_step: int) -> torch.Tensor:
-        if patches.ndim != 4:
-            raise ValueError("patches must have shape [B, D, Hp, Wp]")
-        if patches.shape[1] != self.dim:
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        time_step: int,
+        spatial_shape: Tuple[int, int],
+    ) -> torch.Tensor:
+        if tokens.ndim != 3:
+            raise ValueError("tokens must have shape [B, L, D]")
+        if tokens.shape[-1] != self.dim:
             raise ValueError(
-                f"expected {self.dim} patch channels, got {patches.shape[1]}"
+                f"expected token dimension {self.dim}, got {tokens.shape[-1]}"
             )
 
-        return patches + self.mamba_layer(patches, time_step)
+        mamba_features = self.mamba_layer(
+            tokens,
+            time_step,
+            spatial_shape=spatial_shape,
+        )
+        if self.residual_connections:
+            return tokens + mamba_features
+        return mamba_features
