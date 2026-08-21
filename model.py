@@ -80,8 +80,6 @@ class _SpikMambaEncoderAdapter(nn.Module):
             image_size=(self.patch_size, self.patch_size),
             patch_size=self.patch_size,
             max_time_steps=max_time_steps,
-            init_tau=init_tau,
-            patch_embedding_spiking=patch_embedding_spiking,
         )
         self.spik_mamba = SpikMambaBlock(
             dim=self.out_channels,
@@ -91,6 +89,7 @@ class _SpikMambaEncoderAdapter(nn.Module):
             selective_scan=selective_scan,
             max_time_steps=max_time_steps,
             linear_projection=linear_projection,
+            patch_embedding_spiking=patch_embedding_spiking,
             residual_connections=residual_connections,
             conv1d_spiking=conv1d_spiking,
         )

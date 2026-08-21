@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=TrainSagittal
-#SBATCH --output=slurm_output_sagittal_spikemamba_fptt%j.out
-#SBATCH --error=slurm_output_sagittal_spikemamba_fptt%j.err
+#SBATCH --job-name=SS2D_nopooling_fptt
+#SBATCH --output=slurm_output_sagittal_SS2D_nopooling_fptt%j.out
+#SBATCH --error=slurm_output_sagittal_SS2D_nopooling_fptt%j.err
 #SBATCH --time=3-00:00:00
 #SBATCH --partition=gpu_a100
 #SBATCH --nodes=1
@@ -47,7 +47,7 @@ export PYTHONUNBUFFERED=1
 echo "Using virtual environment: $VIRTUAL_ENV"
 "$PYTHON_BIN" --version
 
-RUN_ID="brats23_sagittal_fold1_orig_${SLURM_JOB_ID}"
+RUN_ID="brats23_sagittal_fold1_SS2D_nopooling_${SLURM_JOB_ID}"
 OUTPUT_DIR_PERSISTENT="$SLURM_SUBMIT_DIR/experiments/$RUN_ID"
 mkdir -p "$OUTPUT_DIR_PERSISTENT"
 export SNN_FPTT_RUN_ID="$RUN_ID"

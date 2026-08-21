@@ -1,12 +1,12 @@
-name: brats23_sagittal_fold1_spikemamba
+name: brats23_sagittal_fold1_SS2D_nopooling
 data_root: /gpfs/scratch1/shared/apiaghiardelli/BRATS2023_preprocessed/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData
 val_fold: 1
 view: sagittal
 model: orig
 # model architecture
-patch_size: 4
+patch_size: 2
 linear_projection: false
-residual_connections: false
+residual_connections: true
 conv1d_spiking: false
 patch_embedding_spiking: false
 # training

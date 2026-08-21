@@ -52,8 +52,6 @@ class Spiking2DPatchEmbedding(nn.Module):
         image_size: Tuple[int, int] = (160, 192),
         patch_size: int = 4,
         max_time_steps: int = 256,
-        init_tau: float = 2.0,
-        patch_embedding_spiking: bool = False,
         device=None,
         dtype=None,
     ) -> None:
@@ -64,9 +62,6 @@ class Spiking2DPatchEmbedding(nn.Module):
         self.max_time_steps = _positive_int(
             "max_time_steps", max_time_steps
         )
-        if not isinstance(patch_embedding_spiking, bool):
-            raise TypeError("patch_embedding_spiking must be a boolean")
-        self.patch_embedding_spiking = patch_embedding_spiking
         if not isinstance(image_size, tuple) or len(image_size) != 2:
             raise ValueError("image_size must be a (height, width) tuple")
         height = _positive_int("image_size[0]", image_size[0])
@@ -84,11 +79,6 @@ class Spiking2DPatchEmbedding(nn.Module):
             **kwargs,
         )
         self.norm = nn.GroupNorm(1, self.embed_dim, **kwargs)
-        self.patch_plif = (
-            _make_plif(init_tau, device=device, dtype=dtype)
-            if self.patch_embedding_spiking
-            else None
-        )
 
     def forward(self, x: torch.Tensor, time_step: int) -> torch.Tensor:
         if x.ndim != 4:
@@ -109,10 +99,7 @@ class Spiking2DPatchEmbedding(nn.Module):
         ):
             raise ValueError("time_step is outside the configured range")
 
-        x = self.norm(self.proj(x))
-        if self.patch_embedding_spiking:
-            x, _ = self.patch_plif(x, time_step)
-        return x
+        return self.norm(self.proj(x))
 
 
 class SpikeMambaLayer(nn.Module):
@@ -138,6 +125,7 @@ class SpikeMambaLayer(nn.Module):
         dtype=None,
         max_time_steps: int = 256,
         linear_projection: bool = True,
+        patch_embedding_spiking: bool = False,
         conv1d_spiking: bool = True,
     ) -> None:
         super().__init__()
@@ -148,9 +136,12 @@ class SpikeMambaLayer(nn.Module):
         self.max_time_steps = _positive_int("max_time_steps", max_time_steps)
         if not isinstance(linear_projection, bool):
             raise TypeError("linear_projection must be a boolean")
+        if not isinstance(patch_embedding_spiking, bool):
+            raise TypeError("patch_embedding_spiking must be a boolean")
         if not isinstance(conv1d_spiking, bool):
             raise TypeError("conv1d_spiking must be a boolean")
         self.linear_projection = linear_projection
+        self.patch_embedding_spiking = patch_embedding_spiking
         self.conv1d_spiking = conv1d_spiking
         self.num_directions = 4
         self.d_inner = self.expand * self.dim if linear_projection else self.dim
@@ -178,7 +169,11 @@ class SpikeMambaLayer(nn.Module):
             )
         else:
             self.linear_m = nn.Identity()
-        self.sl_m1 = _make_plif(init_tau, device=device, dtype=dtype)
+        self.patch_sl = (
+            _make_plif(init_tau, device=device, dtype=dtype)
+            if self.patch_embedding_spiking
+            else None
+        )
         self.conv1d_m = nn.Conv1d(
             self.d_inner,
             self.d_inner,
@@ -304,7 +299,8 @@ class SpikeMambaLayer(nn.Module):
             ) from _MAMBA_IMPORT_ERROR
 
         p_global = self.linear_m(tokens)
-        p_global, _ = self.sl_m1(p_global, time_step)
+        if self.patch_embedding_spiking:
+            p_global, _ = self.patch_sl(p_global, time_step)
 
         routes = torch.stack(
             self._cross_scan_routes(p_global, height, width),
