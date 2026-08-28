@@ -125,21 +125,108 @@ def reduce_dice_totals(accelerator: Accelerator,
     }
 
 
-def save_checkpoint_if_main(accelerator: Accelerator,
-                            model: nn.Module,
-                            checkpoint_path: Path,
-                            epoch: int,
-                            dice_mean: float,
-                            config: Dict) -> bool:
+def save_training_checkpoint_if_main(accelerator: Accelerator,
+                                     model: nn.Module,
+                                     optimizer,
+                                     scheduler,
+                                     checkpoint_path: Path,
+                                     epoch: int,
+                                     best_dice: float,
+                                     best_dice_epoch: int,
+                                     config: Dict,
+                                     train_generator: torch.Generator) -> bool:
     if not accelerator.is_main_process:
         return False
-    accelerator.save({
-        "model": accelerator.unwrap_model(model).state_dict(),
+
+    base_model = accelerator.unwrap_model(model)
+    checkpoint = {
+        "format_version": 1,
+        "model": base_model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
         "epoch": epoch,
-        "dice_mean": dice_mean,
+        "best_dice": best_dice,
+        "best_dice_epoch": best_dice_epoch,
         "config": config,
-    }, checkpoint_path)
+        "fptt_avg_weights": {
+            name: value.detach().cpu()
+            for name, value in base_model.avg_weights.items()
+        },
+        "fptt_lambdas": {
+            name: value.detach().cpu()
+            for name, value in base_model.lambdas.items()
+        },
+        "python_rng_state": random.getstate(),
+        "numpy_rng_state": np.random.get_state(),
+        "torch_rng_state": torch.get_rng_state(),
+        "cuda_rng_state": (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        ),
+        "train_generator_state": train_generator.get_state(),
+    }
+
+    temporary_path = checkpoint_path.with_name(f".{checkpoint_path.name}.tmp")
+    accelerator.save(checkpoint, temporary_path)
+    os.replace(temporary_path, checkpoint_path)
     return True
+
+
+def load_training_checkpoint(accelerator: Accelerator,
+                             model: nn.Module,
+                             optimizer,
+                             scheduler,
+                             checkpoint_path: Path,
+                             train_generator: torch.Generator) -> Dict:
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location="cpu",
+        weights_only=False,
+    )
+    required = {
+        "model", "optimizer", "scheduler", "epoch", "best_dice",
+        "best_dice_epoch", "fptt_avg_weights", "fptt_lambdas",
+    }
+    missing = sorted(required - set(checkpoint))
+    if missing:
+        raise ValueError(
+            f"Checkpoint {checkpoint_path} is not resumable; missing: "
+            f"{', '.join(missing)}"
+        )
+
+    base_model = accelerator.unwrap_model(model)
+    base_model.load_state_dict(checkpoint["model"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    scheduler.load_state_dict(checkpoint["scheduler"])
+
+    parameters = dict(base_model.named_parameters())
+    for state_name, checkpoint_key in (
+        ("avg_weights", "fptt_avg_weights"),
+        ("lambdas", "fptt_lambdas"),
+    ):
+        saved_state = checkpoint[checkpoint_key]
+        missing_parameters = sorted(set(parameters) - set(saved_state))
+        if missing_parameters:
+            raise ValueError(
+                f"Checkpoint {checkpoint_path} has incomplete {state_name}: "
+                f"missing {', '.join(missing_parameters)}"
+            )
+        setattr(base_model, state_name, {
+            name: saved_state[name].to(device=param.device, dtype=param.dtype)
+            for name, param in parameters.items()
+        })
+
+    if "python_rng_state" in checkpoint:
+        random.setstate(checkpoint["python_rng_state"])
+    if "numpy_rng_state" in checkpoint:
+        np.random.set_state(checkpoint["numpy_rng_state"])
+    if "torch_rng_state" in checkpoint:
+        torch.set_rng_state(checkpoint["torch_rng_state"])
+    if torch.cuda.is_available() and checkpoint.get("cuda_rng_state") is not None:
+        torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state"])
+    if "train_generator_state" in checkpoint:
+        train_generator.set_state(checkpoint["train_generator_state"])
+
+    return checkpoint
 
 
 class TeeWriter:
@@ -533,6 +620,13 @@ def load_experiment_from_yaml(config_path: str) -> Dict:
     if not isinstance(raw["patch_embedding_spiking"], bool):
         raise ValueError("patch_embedding_spiking must be a boolean")
 
+    resume_from = raw.get("resume_from")
+    if resume_from is not None:
+        if not isinstance(resume_from, str) or not resume_from.strip():
+            raise ValueError("resume_from must be null or a non-empty run directory")
+        raw["resume_from"] = resume_from.strip()
+    else:
+        raw["resume_from"] = None
 
     return raw
 
@@ -562,6 +656,7 @@ def build_model(model_name, out_channels=3, patch_size=4,
 def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
     accelerator = Accelerator()
     exp_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", exp_cfg["name"])
+    resume_from = exp_cfg.get("resume_from")
     run_metadata = [
         datetime.now().strftime("%Y%m%d_%H%M%S")
         if accelerator.is_main_process else None,
@@ -570,10 +665,18 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
     ]
     broadcast_object_list(run_metadata, from_process=0)
     start_time, configured_run_id = run_metadata
-    run_id = configured_run_id or f"{exp_name}_{start_time}"
-    run_dir = Path(os.environ.get("SNN_FPTT_RUN_DIR", RUNS_ROOT / run_id))
-    if accelerator.is_main_process:
-        run_dir.mkdir(parents=True, exist_ok=True)
+
+    if resume_from is not None:
+        run_dir = Path(resume_from).expanduser().resolve()
+        if not run_dir.is_dir():
+            raise FileNotFoundError(f"Resume run directory does not exist: {run_dir}")
+        run_id = run_dir.name
+    else:
+        run_id = configured_run_id or f"{exp_name}_{start_time}"
+        run_dir = Path(os.environ.get("SNN_FPTT_RUN_DIR", RUNS_ROOT / run_id))
+        if accelerator.is_main_process:
+            run_dir.mkdir(parents=True, exist_ok=True)
+
     accelerator.wait_for_everyone()
     metrics_path = run_dir / "epoch_metrics.csv"
     hyperparams_path = run_dir / "hyperparameters.yaml"
@@ -631,6 +734,7 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
     config = {
         "name": exp_name,
         "run_id": run_id,
+        "resume_from": str(run_dir) if resume_from is not None else None,
         "data_root": data_root,
         "val_fold": val_fold,
         "view": view,
@@ -680,8 +784,9 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
         for source_file in source_files:
             if source_file.exists():
                 destination = run_dir / source_file.name
-                shutil.copy2(source_file, destination)
-                copied_sources.append(destination.name)
+                if source_file.resolve() != destination.resolve():
+                    shutil.copy2(source_file, destination)
+                    copied_sources.append(destination.name)
     if copied_sources:
         print(f"Copied source files: {', '.join(copied_sources)}")
 
@@ -750,16 +855,54 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min')
 
-    spkmon = FiringRateMonitor(model)
+    # Firing-rate monitoring is intentionally disabled because its forward
+    # hooks call ``Tensor.item()`` repeatedly and synchronize CPU and GPU.
+    # Keep the implementation above available for targeted diagnostics:
+    # spkmon = FiringRateMonitor(model)
+    spkmon = None
     model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
         model, optimizer, train_loader, val_loader, scheduler
     )
 
+    base_model = accelerator.unwrap_model(model)
+    init_running_params(base_model)
+
     best_dice = -1.0
     best_dice_epoch = 0
+    start_epoch = 1
+    last_checkpoint_path = run_dir / "checkpoint_last.pt"
+    best_checkpoint_path = run_dir / "checkpoint_best.pt"
 
+    if resume_from is not None:
+        if not last_checkpoint_path.is_file():
+            raise FileNotFoundError(
+                f"Resume checkpoint not found: {last_checkpoint_path}"
+            )
+        checkpoint = load_training_checkpoint(
+            accelerator,
+            model,
+            optimizer,
+            scheduler,
+            last_checkpoint_path,
+            g,
+        )
+        start_epoch = int(checkpoint["epoch"]) + 1
+        best_dice = float(checkpoint["best_dice"])
+        best_dice_epoch = int(checkpoint["best_dice_epoch"])
+        print(
+            f"Resumed from {last_checkpoint_path} at epoch "
+            f"{checkpoint['epoch']}; next epoch: {start_epoch}"
+        )
+        accelerator.wait_for_everyone()
+
+    append_metrics = (
+        resume_from is not None
+        and metrics_path.is_file()
+        and metrics_path.stat().st_size > 0
+    )
+    metrics_mode = "a" if append_metrics else "w"
     metrics_target = metrics_path if accelerator.is_main_process else os.devnull
-    with open(metrics_target, "w", newline="", encoding="utf-8") as metrics_file:
+    with open(metrics_target, metrics_mode, newline="", encoding="utf-8") as metrics_file:
         metrics_writer = csv.DictWriter(metrics_file, fieldnames=[
             "epoch",
             "train_loss",
@@ -772,12 +915,15 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
             "best_dice_epoch",
             "checkpoint_path",
         ])
-        if accelerator.is_main_process:
+        if accelerator.is_main_process and not append_metrics:
             metrics_writer.writeheader()
 
-        init_running_params(accelerator.unwrap_model(model))
-
-        for epoch in range(1, epochs + 1):
+        epoch_bar = tqdm(
+            range(start_epoch, epochs + 1),
+            desc="epochs",
+            disable=not accelerator.is_local_main_process,
+        )
+        for epoch in epoch_bar:
             print(f"\nEpoch {epoch}/{epochs}")
             tr_loss = train_epoch_snn_tbptt(model, train_loader, optimizer, accelerator,
                                     k, lambda_bce, lambda_dice,
@@ -797,8 +943,9 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
                 "n_subjects": 0,
                 "best_dice_mean": float(best_dice),
                 "best_dice_epoch": int(best_dice_epoch),
-                "checkpoint_path": "",
+                "checkpoint_path": str(last_checkpoint_path),
             }
+            best_improved = False
 
             if epoch % eval_every == 0:
                 metrics = evaluate_3d_snn(model,
@@ -826,19 +973,49 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
                 if metrics["dice_mean"] > best_dice:
                     best_dice = metrics["dice_mean"]
                     best_dice_epoch = epoch
-                    ckpt_path = run_dir / f"checkpoint_{run_id}.pt"
-                    if save_checkpoint_if_main(
-                        accelerator, model, ckpt_path, epoch, best_dice, config
-                    ):
-                        epoch_metrics["checkpoint_path"] = str(ckpt_path)
-                        print(f"  Saved best model -> {ckpt_path}")
-                    accelerator.wait_for_everyone()
+                    best_improved = True
 
             epoch_metrics["best_dice_mean"] = float(best_dice)
             epoch_metrics["best_dice_epoch"] = int(best_dice_epoch)
+
+            if best_improved and save_training_checkpoint_if_main(
+                accelerator,
+                model,
+                optimizer,
+                scheduler,
+                best_checkpoint_path,
+                epoch,
+                best_dice,
+                best_dice_epoch,
+                config,
+                g,
+            ):
+                print(f"  Saved best checkpoint -> {best_checkpoint_path}")
+
+            if save_training_checkpoint_if_main(
+                accelerator,
+                model,
+                optimizer,
+                scheduler,
+                last_checkpoint_path,
+                epoch,
+                best_dice,
+                best_dice_epoch,
+                config,
+                g,
+            ):
+                print(f"  Saved last checkpoint -> {last_checkpoint_path}")
+            accelerator.wait_for_everyone()
+
             if accelerator.is_main_process:
                 metrics_writer.writerow(epoch_metrics)
                 metrics_file.flush()
+
+            if accelerator.is_local_main_process:
+                progress_metrics = {"train_loss": f"{tr_loss:.4f}"}
+                if epoch_metrics["dice_mean"] is not None:
+                    progress_metrics["dice_mean"] = f"{epoch_metrics['dice_mean']:.4f}"
+                epoch_bar.set_postfix(progress_metrics)
 
     print(f"\nBest dice: {best_dice}, epoch {best_dice_epoch}")
     accelerator.wait_for_everyone()
@@ -919,9 +1096,7 @@ def train_epoch_snn_tbptt(model,
 
     running_loss = torch.zeros((), device=accelerator.device)
     update_count = torch.zeros((), device=accelerator.device)
-    pbar = tqdm(loader, desc=f"train (TBPTT k={k})",
-                disable=not accelerator.is_local_main_process)
-    for xs, ys, meta in pbar:
+    for xs, ys, meta in loader:
         xs = xs.to(accelerator.device, non_blocking=True)  # (B,S,4,H,W)
         ys = ys.to(accelerator.device, non_blocking=True)  # (B,S,3,H,W)
         B, S, C, H, W = xs.shape
@@ -966,7 +1141,6 @@ def train_epoch_snn_tbptt(model,
             
 
             running_loss += loss.detach() * xs.size(0)
-            pbar.set_postfix({'loss': f"{loss.item():.4f}"})
 
     epoch_loss = reduce_loss_totals(accelerator, running_loss, update_count)
     
@@ -1011,8 +1185,7 @@ def evaluate_3d_snn(model,
         spkmon.reset()
 
     dices = []
-    for xs, ys, meta in tqdm(loader, desc="eval", leave=False,
-                             disable=not accelerator.is_local_main_process):
+    for xs, ys, meta in loader:
         xs = xs.to(accelerator.device)   # (1,S,4,H,W)
         ys = ys.to(accelerator.device)   # (1,S,3,H,W)
         S = xs.shape[1]

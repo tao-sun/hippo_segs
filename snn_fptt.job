@@ -2,7 +2,7 @@
 #SBATCH --job-name=SS2D_nopooling_fptt
 #SBATCH --output=slurm_output_sagittal_SS2D_nopooling_fptt%j.out
 #SBATCH --error=slurm_output_sagittal_SS2D_nopooling_fptt%j.err
-#SBATCH --time=3-00:00:00
+#SBATCH --time=5-00:00:00
 #SBATCH --partition=gpu_a100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
