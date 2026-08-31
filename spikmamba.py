@@ -103,13 +103,12 @@ class Spiking2DPatchEmbedding(nn.Module):
 
 
 class SpikeMambaLayer(nn.Module):
-    """Continuous causal SSM over row-major patch tokens."""
+    """Spatial depthwise mixing followed by four directional SSM scans."""
 
     def __init__(
         self,
         dim: int,
         d_state: int = 16,
-        d_conv: int = 4,
         expand: int = 2,
         dt_rank: Union[int, str] = "auto",
         init_tau: float = 2.0,
@@ -126,23 +125,22 @@ class SpikeMambaLayer(nn.Module):
         max_time_steps: int = 256,
         linear_projection: bool = True,
         patch_embedding_spiking: bool = False,
-        conv1d_spiking: bool = True,
+        dwconv2d_spiking: bool = True,
     ) -> None:
         super().__init__()
         self.dim = _positive_int("dim", dim)
         self.d_state = _positive_int("d_state", d_state)
-        self.d_conv = _positive_int("d_conv", d_conv)
         self.expand = _positive_int("expand", expand)
         self.max_time_steps = _positive_int("max_time_steps", max_time_steps)
         if not isinstance(linear_projection, bool):
             raise TypeError("linear_projection must be a boolean")
         if not isinstance(patch_embedding_spiking, bool):
             raise TypeError("patch_embedding_spiking must be a boolean")
-        if not isinstance(conv1d_spiking, bool):
-            raise TypeError("conv1d_spiking must be a boolean")
+        if not isinstance(dwconv2d_spiking, bool):
+            raise TypeError("dwconv2d_spiking must be a boolean")
         self.linear_projection = linear_projection
         self.patch_embedding_spiking = patch_embedding_spiking
-        self.conv1d_spiking = conv1d_spiking
+        self.dwconv2d_spiking = dwconv2d_spiking
         self.num_directions = 4
         self.d_inner = self.expand * self.dim if linear_projection else self.dim
         self.dt_rank = (
@@ -174,22 +172,19 @@ class SpikeMambaLayer(nn.Module):
             if self.patch_embedding_spiking
             else None
         )
-        self.conv1d_m = nn.Conv1d(
+        self.dwconv2d = nn.Conv2d(
             self.d_inner,
             self.d_inner,
-            self.d_conv,
+            kernel_size=3,
             groups=self.d_inner,
-            padding=self.d_conv - 1,
+            padding=1,
             bias=conv_bias,
             **kwargs,
         )
-        self.sl_m2 = nn.ModuleList(
-            [
-                _make_plif(init_tau, device=device, dtype=dtype)
-                for _ in range(self.num_directions)
-            ]
-            if self.conv1d_spiking
-            else []
+        self.dwconv2d_sl = (
+            _make_plif(init_tau, device=device, dtype=dtype)
+            if self.dwconv2d_spiking
+            else None
         )
         x_proj_layers = [
             nn.Linear(
@@ -253,9 +248,6 @@ class SpikeMambaLayer(nn.Module):
             else selective_scan_fn
         )
 
-    def _causal_conv(self, sequence: torch.Tensor) -> torch.Tensor:
-        return self.conv1d_m(sequence)[..., :sequence.shape[-1]]
-
     def _cross_scan_routes(self, x: torch.Tensor, height: int, width: int):
         """Build four patch routes from a grid tensor of shape (B, H, W, D)."""
         batch = x.shape[0]
@@ -302,35 +294,29 @@ class SpikeMambaLayer(nn.Module):
         if self.patch_embedding_spiking:
             p_global, _ = self.patch_sl(p_global, time_step)
 
+
+        batch = tokens.shape[0]
+        spatial_features = (
+            p_global.transpose(1, 2)
+            .contiguous()
+            .reshape(batch, self.d_inner, height, width)
+        )
+        spatial_features = self.dwconv2d(spatial_features)
+        if self.dwconv2d_spiking:
+            spatial_features, _ = self.dwconv2d_sl(
+                spatial_features, time_step
+            )
+        p_global = (
+            spatial_features.flatten(2)
+            .transpose(1, 2)
+            .contiguous()
+        )
+
         routes = torch.stack(
             self._cross_scan_routes(p_global, height, width),
             dim=1,
         )
-        batch = tokens.shape[0]
-        route_batch = routes.reshape(
-            batch * self.num_directions,
-            height * width,
-            self.d_inner,
-        )
-        route_conv = self._causal_conv(
-            route_batch.transpose(1, 2).contiguous()
-        )
-        route_convs = route_conv.reshape(
-            batch,
-            self.num_directions,
-            self.d_inner,
-            height * width,
-        )
-        if self.conv1d_spiking:
-            spiking_routes = []
-            for route_index, route_features in enumerate(
-                route_convs.unbind(dim=1)
-            ):
-                route_spikes, _ = self.sl_m2[route_index](
-                    route_features, time_step
-                )
-                spiking_routes.append(route_spikes)
-            route_convs = torch.stack(spiking_routes, dim=1)
+        route_convs = routes.permute(0, 1, 3, 2).contiguous()
 
         sequence_length = height * width
         projection_size = self.dt_rank + 2 * self.d_state

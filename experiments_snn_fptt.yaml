@@ -5,10 +5,10 @@ view: sagittal
 model: orig
 # model architecture
 patch_size: 2
-linear_projection: false
+linear_projection: true
 residual_connections: true
-conv1d_spiking: false
-patch_embedding_spiking: true
+dwconv2d_spiking: false
+patch_embedding_spiking: false
 # training
 # Set this to an existing run directory to resume from checkpoint_last.pt.
 resume_from: null

@@ -66,7 +66,7 @@ class _SpikMambaEncoderAdapter(nn.Module):
         max_time_steps: int = 256,
         linear_projection: bool = True,
         residual_connections: bool = True,
-        conv1d_spiking: bool = True,
+        dwconv2d_spiking: bool = True,
         patch_embedding_spiking: bool = False,
     ) -> None:
         super().__init__()
@@ -91,7 +91,7 @@ class _SpikMambaEncoderAdapter(nn.Module):
             linear_projection=linear_projection,
             patch_embedding_spiking=patch_embedding_spiking,
             residual_connections=residual_connections,
-            conv1d_spiking=conv1d_spiking,
+            dwconv2d_spiking=dwconv2d_spiking,
         )
         self.post_norm = nn.GroupNorm(1, self.out_channels)
         self.post_plif = PLIFNode(
@@ -134,7 +134,7 @@ class ConvBlock(nn.Module):
                  ssm_d_state=16, ssm_dt_rank="auto",
                  patch_size=4, linear_projection=True,
                  residual_connections=True,
-                 conv1d_spiking=True,
+                 dwconv2d_spiking=True,
                  patch_embedding_spiking=False):
         super().__init__()
         self.dropout = float(dropout)
@@ -153,7 +153,7 @@ class ConvBlock(nn.Module):
                 selective_scan=selective_scan,
                 linear_projection=linear_projection,
                 residual_connections=residual_connections,
-                conv1d_spiking=conv1d_spiking,
+                dwconv2d_spiking=dwconv2d_spiking,
                 patch_embedding_spiking=patch_embedding_spiking,
             )
         else:
@@ -234,7 +234,7 @@ class SNNBraTS(nn.Module):
                  patch_size: int = 4,
                  linear_projection: bool = True,
                  residual_connections: bool = True,
-                 conv1d_spiking: bool = True,
+                 dwconv2d_spiking: bool = True,
                  patch_embedding_spiking: bool = False):
         super().__init__()
         if isinstance(patch_size, bool) or not isinstance(patch_size, int) or patch_size <= 0:
@@ -243,14 +243,14 @@ class SNNBraTS(nn.Module):
             raise TypeError("linear_projection must be a boolean")
         if not isinstance(residual_connections, bool):
             raise TypeError("residual_connections must be a boolean")
-        if not isinstance(conv1d_spiking, bool):
-            raise TypeError("conv1d_spiking must be a boolean")
+        if not isinstance(dwconv2d_spiking, bool):
+            raise TypeError("dwconv2d_spiking must be a boolean")
         if not isinstance(patch_embedding_spiking, bool):
             raise TypeError("patch_embedding_spiking must be a boolean")
         self.patch_size = patch_size
         self.linear_projection = linear_projection
         self.residual_connections = residual_connections
-        self.conv1d_spiking = conv1d_spiking
+        self.dwconv2d_spiking = dwconv2d_spiking
         self.patch_embedding_spiking = patch_embedding_spiking
         self.encoder_scale = self.patch_size ** 3
         # Encoder
@@ -262,7 +262,7 @@ class SNNBraTS(nn.Module):
             "patch_size": self.patch_size,
             "linear_projection": self.linear_projection,
             "residual_connections": self.residual_connections,
-            "conv1d_spiking": self.conv1d_spiking,
+            "dwconv2d_spiking": self.dwconv2d_spiking,
             "patch_embedding_spiking": self.patch_embedding_spiking,
         }
         self.conv_block1 = ConvBlock(

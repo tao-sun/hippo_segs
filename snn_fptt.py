@@ -586,7 +586,7 @@ def load_experiment_from_yaml(config_path: str) -> Dict:
         "patch_size",
         "linear_projection",
         "residual_connections",
-        "conv1d_spiking",
+        "dwconv2d_spiking",
         "patch_embedding_spiking",
         "batch_size_subjects",
         "lr",
@@ -615,8 +615,8 @@ def load_experiment_from_yaml(config_path: str) -> Dict:
         raise ValueError("linear_projection must be a boolean")
     if not isinstance(raw["residual_connections"], bool):
         raise ValueError("residual_connections must be a boolean")
-    if not isinstance(raw["conv1d_spiking"], bool):
-        raise ValueError("conv1d_spiking must be a boolean")
+    if not isinstance(raw["dwconv2d_spiking"], bool):
+        raise ValueError("dwconv2d_spiking must be a boolean")
     if not isinstance(raw["patch_embedding_spiking"], bool):
         raise ValueError("patch_embedding_spiking must be a boolean")
 
@@ -633,7 +633,7 @@ def load_experiment_from_yaml(config_path: str) -> Dict:
 def build_model(model_name, out_channels=3, patch_size=4,
                 linear_projection=True,
                 residual_connections=True,
-                conv1d_spiking=True,
+                dwconv2d_spiking=True,
                 patch_embedding_spiking=False):
     if model_name == "orig":
         return SNNBraTS(
@@ -641,7 +641,7 @@ def build_model(model_name, out_channels=3, patch_size=4,
             patch_size=patch_size,
             linear_projection=linear_projection,
             residual_connections=residual_connections,
-            conv1d_spiking=conv1d_spiking,
+            dwconv2d_spiking=dwconv2d_spiking,
             patch_embedding_spiking=patch_embedding_spiking,
         )
     if model_name == "shallow":
@@ -703,7 +703,7 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
     patch_size = exp_cfg["patch_size"]
     linear_projection = exp_cfg["linear_projection"]
     residual_connections = exp_cfg["residual_connections"]
-    conv1d_spiking = exp_cfg["conv1d_spiking"]
+    dwconv2d_spiking = exp_cfg["dwconv2d_spiking"]
     patch_embedding_spiking = exp_cfg["patch_embedding_spiking"]
     epochs = int(exp_cfg["epochs"])
     batch_size_subjects = int(exp_cfg["batch_size_subjects"])
@@ -742,7 +742,7 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
         "patch_size": patch_size,
         "linear_projection": linear_projection,
         "residual_connections": residual_connections,
-        "conv1d_spiking": conv1d_spiking,
+        "dwconv2d_spiking": dwconv2d_spiking,
         "patch_embedding_spiking": patch_embedding_spiking,
         "epochs": epochs,
         "batch_size_subjects": batch_size_subjects,
@@ -845,7 +845,7 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
         patch_size=patch_size,
         linear_projection=linear_projection,
         residual_connections=residual_connections,
-        conv1d_spiking=conv1d_spiking,
+        dwconv2d_spiking=dwconv2d_spiking,
         patch_embedding_spiking=patch_embedding_spiking,
     )
 
