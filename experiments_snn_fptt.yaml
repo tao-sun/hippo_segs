@@ -7,8 +7,8 @@ model: orig
 patch_size: 2
 linear_projection: true
 residual_connections: true
-dwconv2d_spiking: false
-patch_embedding_spiking: false
+dwconv2d_spiking: true
+patch_embedding_spiking: true
 # training
 # Set this to an existing run directory to resume from checkpoint_last.pt.
 resume_from: null

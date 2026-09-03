@@ -252,7 +252,8 @@ class SNNBraTS(nn.Module):
         self.residual_connections = residual_connections
         self.dwconv2d_spiking = dwconv2d_spiking
         self.patch_embedding_spiking = patch_embedding_spiking
-        self.encoder_scale = self.patch_size ** 3
+        self.num_encoder_stages = 4
+        self.encoder_scale = self.patch_size ** self.num_encoder_stages
         # Encoder
         spik_mamba_kwargs = {
             "spikMamba": True,
@@ -287,7 +288,39 @@ class SNNBraTS(nn.Module):
             **spik_mamba_kwargs,
         )
 
+        self.conv_block4 = ConvBlock(
+            128,
+            256,
+            padding=1,
+            dropout=0.1,
+            **spik_mamba_kwargs,
+        )
+
         # Decoder
+        # NEW decoder stage only to compensate for the additional encoder level
+        self.deconv_block0 = DeconvBlock(
+            256,
+            128,
+            self.patch_size,
+            self.patch_size,
+            dropout=0.1,
+        )
+
+        self.deconv0_conv = ConvBlock(
+            128,
+            128,
+            padding=1,
+            dropout=0.1,
+        )
+
+        # merge with conv_block3 skip: 128 + 128
+        self.concat0_conv = ConvBlock(
+            128 + 128,
+            128,
+            padding=1,
+            dropout=0.1,
+        )
+
         self.deconv_block1 = DeconvBlock(128, 128, self.patch_size, self.patch_size, dropout=0.1)
         self.deconv1_conv = ConvBlock(
             128, 128, padding=1, dropout=0.1
@@ -334,7 +367,13 @@ class SNNBraTS(nn.Module):
 
             skip1 = self.conv_block1(x, time_step)
             skip2 = self.conv_block2(skip1, time_step)
-            x = self.conv_block3(skip2, time_step)
+            skip3 = self.conv_block3(skip2, time_step)
+            x = self.conv_block4(skip3, time_step)
+
+            x = self.deconv_block0(x, time_step)
+            x = self.deconv0_conv(x, time_step)
+            x = torch.cat([skip3, x], dim=1)
+            x = self.concat0_conv(x, time_step)
 
             x = self.deconv_block1(x, time_step)
             x = self.deconv1_conv(x, time_step)
