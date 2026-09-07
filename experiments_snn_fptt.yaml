@@ -1,4 +1,4 @@
-name: brats23_sagittal_fold1_SS2D_nopooling
+name: brats23_sagittal_fold1_VSS
 data_root: /gpfs/scratch1/shared/apiaghiardelli/BRATS2023_preprocessed/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData
 val_fold: 1
 view: sagittal
