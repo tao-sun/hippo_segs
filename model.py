@@ -34,13 +34,18 @@ def print_model_info(model: nn.Module):
     print("=" * 60)
     total_params = 0
     trainable_params = 0
+    seen_params = set()
 
     for name, module in model.named_modules():
-        # Skip container modules
-        if len(list(module.children())) > 0 and not isinstance(module, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)):
-            continue
-
-        params = sum(p.numel() for p in module.parameters() if p.requires_grad)
+        # Count only parameters owned by this module. This includes parameters
+        # registered directly on composite modules (such as selective scan)
+        # without counting their child modules twice.
+        params = 0
+        for parameter in module.parameters(recurse=False):
+            parameter_id = id(parameter)
+            if parameter.requires_grad and parameter_id not in seen_params:
+                params += parameter.numel()
+                seen_params.add(parameter_id)
         if params > 0:
             print(f"{name:35s} {human_readable(params):>12s}")
             total_params += params

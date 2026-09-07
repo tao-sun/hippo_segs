@@ -1,0 +1,16 @@
+# Paths relative to this YAML file are supported. Absolute paths also work.
+checkpoint: experiments/brats23_sagittal_fold1_SS2D_nopooling_26148971/checkpoint_best.pt
+data_root: /gpfs/scratch1/shared/apiaghiardelli/BRATS2023_preprocessed/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData
+
+# Dataset split to evaluate.
+view: sagittal  # sagittal | coronal | axial
+fold: 1         # 1..5
+
+# Runtime. null uses the value saved in the checkpoint.
+device: auto    # auto | cuda | cpu | mps
+tbptt_k: null
+threshold: null
+num_workers: 2
+
+# null evaluates the entire fold; use a positive integer for a quick test.
+max_subjects: null
