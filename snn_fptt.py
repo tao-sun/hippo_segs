@@ -15,6 +15,8 @@ from typing import List, Tuple, Dict, Optional
 import json
 import csv
 import shutil
+import warnings
+import uuid
 
 import numpy as np
 import nibabel as nib
@@ -100,6 +102,7 @@ FOLD_NAMES = {"1", "2", "3", "4", "5"}
 
 DEFAULT_EXPERIMENTS_YAML = "experiments_snn_fptt.yaml"
 RUNS_ROOT = Path("experiments")
+CACHE_FORMAT_VERSION = 1
 
 
 def reduce_loss_totals(accelerator: Accelerator,
@@ -353,6 +356,152 @@ def load_subject_nii_and_pngs(subj_dir: Path, view: str) -> Tuple[Dict[str, List
     return img_paths_by_mod, seg_path
 
 
+def load_subject_source_uint8(
+    subj_dir: Path,
+    view: str,
+) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int, int]]:
+    """Load one source subject without expanding uint8 data to float32."""
+    img_paths_by_mod, seg_path = load_subject_nii_and_pngs(subj_dir, view)
+
+    seg_img = nib.load(str(seg_path))
+    seg = seg_img.get_fdata(dtype=np.float32)
+    seg = np.rint(seg).astype(np.int16)
+    if seg.shape != TARGET_SHAPE:
+        x, y, z = seg.shape
+        tx, ty, tz = TARGET_SHAPE
+        xs, ys, zs = ((x - tx) // 2, (y - ty) // 2, (z - tz) // 2)
+        seg = seg[xs:xs + tx, ys:ys + ty, zs:zs + tz]
+    if seg.size and (seg.min() < 0 or seg.max() > np.iinfo(np.uint8).max):
+        raise ValueError(f"Segmentation labels do not fit uint8: {seg_path}")
+
+    frames = []
+    slice_count = len(next(iter(img_paths_by_mod.values())))
+    for slice_index in range(slice_count):
+        channels = []
+        for modality in MOD_ORDER:
+            path = img_paths_by_mod[modality][slice_index]
+            with Image.open(path) as image:
+                channels.append(np.array(image.convert("L"), dtype=np.uint8))
+        frames.append(np.stack(channels, axis=0))
+
+    images = np.stack(frames, axis=0)
+    segmentation = seg.astype(np.uint8, copy=False)
+    xyz = tuple(int(size) for size in segmentation.shape)
+    return images, segmentation, xyz
+
+
+def subject_cache_path(
+    cache_root: Path,
+    view: str,
+    fold: int,
+    subject_id: str,
+) -> Path:
+    return Path(cache_root) / view / str(int(fold)) / f"{subject_id}.pt"
+
+
+def build_subject_cache_file(
+    subject_dir: Path,
+    fold: int,
+    view: str,
+    cache_root: Path,
+    overwrite: bool = False,
+) -> Path:
+    """Materialize one subject as an atomic, lossless uint8 cache file."""
+    subject_dir = Path(subject_dir)
+    cache_path = subject_cache_path(cache_root, view, fold, subject_dir.name)
+    if cache_path.is_file() and not overwrite:
+        return cache_path
+
+    images, segmentation, xyz = load_subject_source_uint8(subject_dir, view)
+    payload = {
+        "format_version": CACHE_FORMAT_VERSION,
+        "subject_id": subject_dir.name,
+        "view": view,
+        "images": torch.from_numpy(np.ascontiguousarray(images)),
+        "segmentation": torch.from_numpy(np.ascontiguousarray(segmentation)),
+        "xyz": xyz,
+    }
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = cache_path.with_name(
+        f".{cache_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        torch.save(payload, temporary_path)
+        os.replace(temporary_path, cache_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return cache_path
+
+
+def load_subject_cache_file(
+    cache_path: Path,
+    expected_subject_id: Optional[str] = None,
+    expected_view: Optional[str] = None,
+) -> Dict:
+    """Load and validate one materialized subject cache."""
+    cache_path = Path(cache_path)
+    payload = torch.load(cache_path, map_location="cpu", weights_only=True)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Invalid cache payload in {cache_path}: expected mapping")
+
+    required_keys = {
+        "format_version", "subject_id", "view", "images",
+        "segmentation", "xyz",
+    }
+    missing_keys = sorted(required_keys - set(payload))
+    if missing_keys:
+        raise ValueError(
+            f"Invalid cache file {cache_path}; missing: {', '.join(missing_keys)}"
+        )
+    if payload["format_version"] != CACHE_FORMAT_VERSION:
+        raise ValueError(
+            f"Unsupported cache format in {cache_path}: "
+            f"{payload['format_version']}"
+        )
+    if expected_subject_id is not None and payload["subject_id"] != expected_subject_id:
+        raise ValueError(f"Subject mismatch in cache file: {cache_path}")
+    if expected_view is not None and payload["view"] != expected_view:
+        raise ValueError(f"View mismatch in cache file: {cache_path}")
+    if payload["view"] not in VALID_VIEWS:
+        raise ValueError(f"Invalid view in cache file: {cache_path}")
+    if not isinstance(payload["images"], torch.Tensor):
+        raise ValueError(f"Cached images must be a tensor: {cache_path}")
+    if not isinstance(payload["segmentation"], torch.Tensor):
+        raise ValueError(f"Cached segmentation must be a tensor: {cache_path}")
+    if payload["images"].dtype != torch.uint8:
+        raise ValueError(f"Cached images must be uint8: {cache_path}")
+    if payload["segmentation"].dtype != torch.uint8:
+        raise ValueError(f"Cached segmentation must be uint8: {cache_path}")
+
+    xyz = tuple(int(size) for size in payload["xyz"])
+    if tuple(payload["segmentation"].shape) != xyz:
+        raise ValueError(
+            f"Cached segmentation shape does not match xyz: {cache_path}"
+        )
+    if xyz != tuple(TARGET_SHAPE):
+        raise ValueError(
+            f"Cached segmentation shape {xyz} does not match "
+            f"TARGET_SHAPE {TARGET_SHAPE}: {cache_path}"
+        )
+    expected_slices, expected_height, expected_width = expected_DHW_for_view(
+        payload["view"]
+    )
+    expected_images_shape = (
+        expected_slices,
+        len(MOD_ORDER),
+        expected_height,
+        expected_width,
+    )
+    if tuple(payload["images"].shape) != expected_images_shape:
+        raise ValueError(
+            f"Cached images have shape {tuple(payload['images'].shape)}, "
+            f"expected {expected_images_shape}: {cache_path}"
+        )
+    payload["xyz"] = xyz
+    return payload
+
+
 def expected_DHW_for_view(view: str) -> Tuple[int, int, int]:
     if view == "sagittal":
         return (TARGET_SHAPE[0], TARGET_SHAPE[1], TARGET_SHAPE[2])  # (160,192,152)
@@ -403,48 +552,95 @@ class BratsVolumeDataset(Dataset):
       y_vol: (S, 3, H, W) float32
       meta:  dict with 'sid' and 'xyz'
     """
-    def __init__(self, root: str, val_fold: int, view: str, subjects_per_fold: Optional[int] = None):
+    def __init__(
+        self,
+        root: str,
+        val_fold: int,
+        view: str,
+        subjects_per_fold: Optional[int] = None,
+        cache_root: Optional[str] = None,
+        cache_required: bool = False,
+    ):
         rootp = ensure_train_root(Path(root))
         self.view = view
+        self.fold = int(val_fold)
+        self.cache_root = (
+            Path(cache_root).expanduser().resolve()
+            if cache_root is not None
+            else None
+        )
+        self.cache_required = bool(cache_required)
         if view not in VALID_VIEWS:
             raise ValueError(f"view must be one of {VALID_VIEWS}")
         subjects = find_subject_dirs(rootp, [val_fold])
         self.subjects = limit_subject_dirs(subjects, subjects_per_fold, f"fold {val_fold}")
+        if self.cache_required:
+            if self.cache_root is None:
+                raise ValueError("cache_required=True requires cache_root")
+            missing_cache_paths = []
+            for subject_dir in self.subjects:
+                cache_path = subject_cache_path(
+                    self.cache_root,
+                    self.view,
+                    self.fold,
+                    subject_dir.name,
+                )
+                if not cache_path.is_file():
+                    missing_cache_paths.append(cache_path)
+            if missing_cache_paths:
+                raise FileNotFoundError(
+                    f"Required subject cache is incomplete: "
+                    f"{len(missing_cache_paths)} file(s) missing; first: "
+                    f"{missing_cache_paths[0]}"
+                )
 
     def __len__(self):
         return len(self.subjects)
 
     def __getitem__(self, idx: int):
         subj_dir = self.subjects[idx]
-        img_paths_by_mod, seg_path = load_subject_nii_and_pngs(subj_dir, self.view)
+        images = None
+        seg = None
+        xyz = None
+        if self.cache_root is not None:
+            cache_path = subject_cache_path(
+                self.cache_root,
+                self.view,
+                self.fold,
+                subj_dir.name,
+            )
+            if cache_path.is_file():
+                try:
+                    payload = load_subject_cache_file(
+                        cache_path,
+                        expected_subject_id=subj_dir.name,
+                        expected_view=self.view,
+                    )
+                except Exception as exc:
+                    if self.cache_required:
+                        raise
+                    warnings.warn(
+                        f"Invalid cache {cache_path}: {exc}. "
+                        "Falling back to source files.",
+                        RuntimeWarning,
+                    )
+                else:
+                    images = payload["images"].numpy()
+                    seg = payload["segmentation"].numpy()
+                    xyz = payload["xyz"]
+            elif self.cache_required:
+                raise FileNotFoundError(
+                    f"Required subject cache not found: {cache_path}"
+                )
 
-        # load seg → multilabel → (S,3,H,W)
-        seg_img = nib.load(str(seg_path))
-        seg = seg_img.get_fdata(dtype=np.float32)
-        seg = np.rint(seg).astype(np.int16)
-        if seg.shape != TARGET_SHAPE:
-            x, y, z = seg.shape
-            tx, ty, tz = TARGET_SHAPE
-            xs, ys, zs = ((x - tx)//2, (y - ty)//2, (z - tz)//2)
-            seg = seg[xs:xs+tx, ys:ys+ty, zs:zs+tz]
+        if images is None:
+            images, seg, xyz = load_subject_source_uint8(subj_dir, self.view)
+
+        # segmentation → multilabel → (S,3,H,W)
         ml = brats_to_multilabel(seg)    # (3,X,Y,Z)
-        xyz = ml.shape[1:]
         ys = take_view(ml, self.view)    # (S,3,H,W)
 
-        # images
-        D = len(next(iter(img_paths_by_mod.values())))
-        frames = []
-        for i in range(D):
-            chans = []
-            for m in MOD_ORDER:
-                path = img_paths_by_mod[m][i]
-                # ensure file is closed after loading
-                with Image.open(path) as im:
-                    im = im.convert("L")
-                    t = np.array(im, dtype=np.float32) / 255.0
-                chans.append(t)
-            frames.append(np.stack(chans, axis=0))
-        xs = np.stack(frames, axis=0)                   # (S,4,H,W)
+        xs = images.astype(np.float32) / 255.0          # (S,4,H,W)
 
         return torch.from_numpy(xs).float(), torch.from_numpy(ys).float(), {"sid": subj_dir.name, "xyz": xyz}
 
@@ -628,6 +824,30 @@ def load_experiment_from_yaml(config_path: str) -> Dict:
     else:
         raw["resume_from"] = None
 
+    cache_root = raw.get("cache_root")
+    if cache_root is not None:
+        if not isinstance(cache_root, str) or not cache_root.strip():
+            raise ValueError("cache_root must be null or a non-empty directory")
+        raw["cache_root"] = cache_root.strip()
+    else:
+        raw["cache_root"] = None
+
+    cache_required = raw.get("cache_required", False)
+    if not isinstance(cache_required, bool):
+        raise ValueError("cache_required must be a boolean")
+    if cache_required and raw["cache_root"] is None:
+        raise ValueError("cache_required=true requires cache_root")
+    raw["cache_required"] = cache_required
+
+    for key, default in (
+        ("loader_workers", 2),
+        ("loader_prefetch_factor", 1),
+    ):
+        value = raw.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{key} must be a positive integer")
+        raw[key] = value
+
     return raw
 
 def build_model(model_name, out_channels=3, patch_size=4,
@@ -720,6 +940,10 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
     eval_every = int(exp_cfg["eval_every"])
     eval_batch_slices = int(exp_cfg["eval_batch_slices"])
     prob_threshold = float(exp_cfg["prob_threshold"])
+    cache_root = exp_cfg.get("cache_root")
+    cache_required = bool(exp_cfg.get("cache_required", False))
+    loader_workers = int(exp_cfg.get("loader_workers", 2))
+    loader_prefetch_factor = int(exp_cfg.get("loader_prefetch_factor", 1))
     subjects_per_fold = exp_cfg.get("subjects_per_fold")
     if subjects_per_fold is not None:
         subjects_per_fold = int(subjects_per_fold)
@@ -759,6 +983,10 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
         "eval_every": eval_every,
         "eval_batch_slices": eval_batch_slices,
         "prob_threshold": prob_threshold,
+        "cache_root": cache_root,
+        "cache_required": cache_required,
+        "loader_workers": loader_workers,
+        "loader_prefetch_factor": loader_prefetch_factor,
         "subjects_per_fold": subjects_per_fold,
         "overfit_subjects": overfit_subjects,
     }
@@ -810,14 +1038,28 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
 
     train_subjects = []
     for f in train_folds:
-        dset = BratsVolumeDataset(root=data_root, val_fold=f, view=view, subjects_per_fold=subjects_per_fold)
+        dset = BratsVolumeDataset(
+            root=data_root,
+            val_fold=f,
+            view=view,
+            subjects_per_fold=subjects_per_fold,
+            cache_root=cache_root,
+            cache_required=cache_required,
+        )
         train_subjects.append(dset)
     if not train_subjects:
         raise RuntimeError("No training subjects found.")
     from torch.utils.data import ConcatDataset
     train_ds = ConcatDataset(train_subjects)
 
-    val_ds = BratsVolumeDataset(root=data_root, val_fold=val_fold, view=view, subjects_per_fold=subjects_per_fold)
+    val_ds = BratsVolumeDataset(
+        root=data_root,
+        val_fold=val_fold,
+        view=view,
+        subjects_per_fold=subjects_per_fold,
+        cache_root=cache_root,
+        cache_required=cache_required,
+    )
     print(f"Train subjects: {len(train_ds)} | Val subjects: {len(val_ds)}")
     if overfit_subjects is not None:
         train_ds, val_ds = make_overfit_datasets(train_ds, view, overfit_subjects)
@@ -831,11 +1073,27 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
     g = torch.Generator()
     g.manual_seed(SEED)
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size_subjects, shuffle=True,
-                              num_workers=2, pin_memory=False, drop_last=False,
-                              worker_init_fn=seed_worker, generator=g)
-    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False,
-                            num_workers=2, pin_memory=True)
+    loader_options = {
+        "num_workers": loader_workers,
+        "pin_memory": True,
+        "persistent_workers": True,
+        "prefetch_factor": loader_prefetch_factor,
+    }
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size_subjects,
+        shuffle=True,
+        drop_last=False,
+        worker_init_fn=seed_worker,
+        generator=g,
+        **loader_options,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=1,
+        shuffle=False,
+        **loader_options,
+    )
 
     print(f"Loss weights -> lambda_bce={lambda_bce}, lambda_dice={lambda_dice}")
 
@@ -853,7 +1111,7 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
         print_model_info(model)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min')
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=12, verbose=True, threshold = 5e-4, min_lr=1e-5, threshold_mode = 'abs', cooldown=3)
 
     # Firing-rate monitoring is intentionally disabled because its forward
     # hooks call ``Tensor.item()`` repeatedly and synchronize CPU and GPU.
