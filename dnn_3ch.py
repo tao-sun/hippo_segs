@@ -69,7 +69,7 @@ def find_subject_dirs(train_root: Path, folds: List[int], verbose: bool = True) 
 
 def brats_to_multilabel(mask3d: np.ndarray) -> np.ndarray:
     """
-    BraTS integer labels {0,1,2,4} -> multilabel [ET,TC,WT]
+    BraTS23/24 GLI labels {0,1,2,3,4} -> multilabel [ET,TC,WT].
     Returns (3, X, Y, Z) float32 in {0,1}.
     """
     m = mask3d.astype(np.int32)

@@ -294,7 +294,7 @@ def limit_subject_dirs(subjects: List[Path], limit: Optional[int], label: str) -
 def brats_to_multilabel(mask3d: np.ndarray) -> np.ndarray:
     """
     Convert BraTS integer labels to multilabel [ET, TC, WT].
-    Automatically detects BraTS17 ({0,1,2,4}) or BraTS23 ({0,1,2,3,4}) format.
+    Automatically detects BraTS17 ({0,1,2,4}) or BraTS23/24 ({0,1,2,3,4}) format.
     Returns (3, X, Y, Z) float32 in {0,1}.
     """
     m = mask3d.astype(np.int32)
@@ -302,9 +302,9 @@ def brats_to_multilabel(mask3d: np.ndarray) -> np.ndarray:
 
     # --- detect version ---
     if 3 in unique_labels:
-        # BraTS23
+        # BraTS23/24 GLI: 1=NETC, 2=SNFH, 3=ET, 4=RC.
         et = (m == 3)
-        tc = (m == 1) | (m == 3)    
+        tc = (m == 1) | (m == 3)
         wt = (m == 1) | (m == 2) | (m == 3)
     else:
         # BraTS17

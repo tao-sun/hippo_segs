@@ -49,17 +49,21 @@ VALID_VIEWS = {"sagittal", "coronal", "axial"}
 TARGET_SHAPE = (160, 192, 152)                     # (x,y,z)
 
 def brats_intmask_to_multilabel(mask3d: np.ndarray) -> np.ndarray:
-    """BraTS labels {0,1,2,4} or {0,1,2,3} -> multilabel channels [ET, TC, WT]; returns (3,x,y,z) float32."""
+    """Convert BraTS17/23/24 integer labels to channels ``[ET, TC, WT]``."""
     m = mask3d.astype(np.int32)
-    
-    # Detect which label set is used
-    unique_vals = np.unique(m)
-    et_label = 4 if 4 in unique_vals else 3
 
-    et = (m == et_label)
-    tc = (m == 1) | (m == et_label)
-    wt = (m == 1) | (m == 2) | (m == et_label)
-    
+    unique_vals = np.unique(m)
+    if 3 in unique_vals:
+        # BraTS24 GLI: 1=NETC, 2=SNFH, 3=ET, 4=RC.
+        et = m == 3
+        tc = (m == 1) | (m == 3)
+        wt = (m == 1) | (m == 2) | (m == 3)
+    else:
+        # BraTS17: 1=NCR, 2=ED, 4=ET.
+        et = m == 4
+        tc = (m == 1) | (m == 4)
+        wt = (m == 1) | (m == 2) | (m == 4)
+
     return np.stack([et, tc, wt], axis=0).astype(np.float32)
 
 class BratsDataset(Dataset):
