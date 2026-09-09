@@ -31,7 +31,7 @@ from tqdm import tqdm
 import torch
 from torch.utils.data import DataLoader
 
-from model import SNNBraTS
+from model import SNNBraTSVSS
 # Use the exact per-subject dataset & stacking used by evaluate_3d_snn(). :contentReference[oaicite:2]{index=2}
 from snn_fptt import BratsVolumeDataset, stack_back   # :contentReference[oaicite:3]{index=3}
 
@@ -50,8 +50,8 @@ def get_device(arg: str) -> torch.device:
     return torch.device("cpu")
 
 
-def load_model(ckpt: Path, device: torch.device) -> SNNBraTS:
-    m = SNNBraTS(out_channels=3).to(device)
+def load_model(ckpt: Path, device: torch.device) -> SNNBraTSVSS:
+    m = SNNBraTSVSS(out_channels=3).to(device)
     sd = torch.load(str(ckpt), map_location=device)
     # Your checkpoints from snn_fptt.py save {"model": state_dict, ...}. :contentReference[oaicite:4]{index=4}
     if isinstance(sd, dict) and "model" in sd and isinstance(sd["model"], dict):
@@ -89,7 +89,7 @@ def nll_from_probs(prob: np.ndarray, gt: np.ndarray) -> float:
 
 @torch.no_grad()
 def infer_view_volumes_and_metrics(
-    model: SNNBraTS,
+    model: SNNBraTSVSS,
     dset: BratsVolumeDataset,
     device: torch.device,
     k: int,

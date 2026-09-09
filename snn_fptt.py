@@ -35,7 +35,7 @@ from accelerate.utils import broadcast_object_list
 
 # ==== use your spiking UNet-like model ====
 # SNNBraTS: forward(x_win[B,k,4,H,W], t0) -> (B, out_channels, k, H, W)
-from model import SNNBraTS, SNNBraTSUNetShallow, SNNBraTSUNetMedium, SNNBraTSUNetDeep, print_model_info  # mirrors your SNN implementation with PLIF nodes
+from model import SNNBraTSVSS, SNNBraTSVSSDeep, print_model_info
 
 # ------------------ SEEDING ------------------
 SEED = 2025
@@ -816,6 +816,17 @@ def load_experiment_from_yaml(config_path: str) -> Dict:
     if not isinstance(raw["patch_embedding_spiking"], bool):
         raise ValueError("patch_embedding_spiking must be a boolean")
 
+    stage_depths = raw.get("stage_depths", [1, 1, 1])
+    if (not isinstance(stage_depths, list) or not stage_depths or
+            any(isinstance(depth, bool) or not isinstance(depth, int) or depth < 1
+                for depth in stage_depths)):
+        raise ValueError("stage_depths must be a non-empty list of positive integers")
+    if raw["model"] == "VSS" and len(stage_depths) != 3:
+        raise ValueError("VSS requires 3 stage depths")
+    if raw["model"] == "VSS_deep" and len(stage_depths) != 4:
+        raise ValueError("VSS_deep requires 4 stage depths")
+    raw["stage_depths"] = stage_depths
+
     resume_from = raw.get("resume_from")
     if resume_from is not None:
         if not isinstance(resume_from, str) or not resume_from.strip():
@@ -854,22 +865,28 @@ def build_model(model_name, out_channels=3, patch_size=4,
                 linear_projection=True,
                 residual_connections=True,
                 dwconv2d_spiking=True,
-                patch_embedding_spiking=False):
-    if model_name == "orig":
-        return SNNBraTS(
+                patch_embedding_spiking=False,
+                stage_depths=(1, 1, 1)):
+    if model_name == "VSS":
+        return SNNBraTSVSS(
             out_channels=out_channels,
             patch_size=patch_size,
             linear_projection=linear_projection,
             residual_connections=residual_connections,
             dwconv2d_spiking=dwconv2d_spiking,
             patch_embedding_spiking=patch_embedding_spiking,
+            stage_depths=stage_depths,
         )
-    if model_name == "shallow":
-        return SNNBraTSUNetShallow(out_channels=out_channels)
-    if model_name == "medium":
-        return SNNBraTSUNetMedium(out_channels=out_channels)
-    if model_name == "deep":
-        return SNNBraTSUNetDeep(out_channels=out_channels)
+    if model_name == "VSS_deep":
+        return SNNBraTSVSSDeep(
+            out_channels=out_channels,
+            patch_size=patch_size,
+            linear_projection=linear_projection,
+            residual_connections=residual_connections,
+            dwconv2d_spiking=dwconv2d_spiking,
+            patch_embedding_spiking=patch_embedding_spiking,
+            stage_depths=stage_depths,
+        )
     raise ValueError(f"Unknown model: {model_name}")
 
 
@@ -925,6 +942,7 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
     residual_connections = exp_cfg["residual_connections"]
     dwconv2d_spiking = exp_cfg["dwconv2d_spiking"]
     patch_embedding_spiking = exp_cfg["patch_embedding_spiking"]
+    stage_depths = exp_cfg["stage_depths"]
     epochs = int(exp_cfg["epochs"])
     batch_size_subjects = int(exp_cfg["batch_size_subjects"])
     lr = float(exp_cfg["lr"])
@@ -968,6 +986,7 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
         "residual_connections": residual_connections,
         "dwconv2d_spiking": dwconv2d_spiking,
         "patch_embedding_spiking": patch_embedding_spiking,
+        "stage_depths": stage_depths,
         "epochs": epochs,
         "batch_size_subjects": batch_size_subjects,
         "lr": lr,
@@ -1105,6 +1124,7 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
         residual_connections=residual_connections,
         dwconv2d_spiking=dwconv2d_spiking,
         patch_embedding_spiking=patch_embedding_spiking,
+        stage_depths=stage_depths,
     )
 
     if accelerator.is_main_process:

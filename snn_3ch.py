@@ -16,8 +16,8 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
 
 # ==== use your spiking UNet-like model ====
-# SNNBraTS: forward(x_win[B,k,4,H,W], t0) -> (B, out_channels, k, H, W)
-from model import SNNBraTS  # mirrors your SNN implementation with PLIF nodes
+# SNNBraTSVSS: forward(x_win[B,k,4,H,W], t0) -> (B, out_channels, k, H, W)
+from model import SNNBraTSVSS  # mirrors the SNN implementation with PLIF nodes
 
 # -----------------------------
 # Constants & helpers
@@ -546,7 +546,7 @@ if __name__ == "__main__":
     print(f"Loss weights -> lambda_bce={lambda_bce}, lambda_dice={lambda_dice}")
 
     # ---- Model/Optim ----
-    model = SNNBraTS(out_channels=3).to(device)  # ET/TC/WT
+    model = SNNBraTSVSS(out_channels=3).to(device)  # ET/TC/WT
     # optimizer = torch.optim.Adadelta(model.parameters(), lr=lr, rho=rho, eps=eps, weight_decay=weight_decay)
     
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)

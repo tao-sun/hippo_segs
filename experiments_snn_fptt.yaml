@@ -2,9 +2,10 @@ name: brats23_sagittal_fold1_VSS
 data_root: /gpfs/scratch1/shared/apiaghiardelli/BRATS2023_preprocessed/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData
 val_fold: 1
 view: sagittal
-model: orig
 # model architecture
+model: VSS  # VSS: 3 stages; VSS_deep: 4 stages
 patch_size: 2
+stage_depths: [2, 2, 2]  # VSS: 3 stages; VSS_deep: 4 stages
 linear_projection: true
 residual_connections: true
 dwconv2d_spiking: true
@@ -15,7 +16,7 @@ resume_from: null
 # Optional lossless uint8 cache built with build_brats_cache.py.
 cache_root: /gpfs/scratch1/shared/apiaghiardelli/BRATS2023_subject_cache
 cache_required: true
-loader_workers: 2          # per Accelerate process; 2 x 4 GPUs = 8 workers
+loader_workers: 4          # per Accelerate process; 4 x 2 GPUs = 8 workers
 loader_prefetch_factor: 1  # subjects are large, so keep RAM usage bounded
 batch_size_subjects: 8
 lr: 0.001
