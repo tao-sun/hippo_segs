@@ -3,9 +3,10 @@ data_root: /home/aurora/data/BRATS2024_preprocessed/BraTS2024TrainingData
 label_format: brats24
 val_fold: 1
 view: sagittal
-model: orig
 # model architecture
+model: VSS  # VSS: 3 stages; VSS_deep: 4 stages
 patch_size: 2
+stage_depths: [2, 2, 2]  # VSS: 3 stages; VSS_deep: 4 stages
 linear_projection: true
 residual_connections: true
 dwconv2d_spiking: false

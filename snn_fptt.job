@@ -6,7 +6,7 @@
 #SBATCH --partition=gpu_h100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=72
+#SBATCH --cpus-per-task=64
 #SBATCH --gpus=2
 #SBATCH --mem=64G
 

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from model import SNNBraTS
+from model import SNNBraTSVSS
 from spike_neurons import PLIFNode
 from spikmamba import SpikeMambaLayer
 
@@ -114,7 +114,7 @@ def test_dwconv2d_spiking_can_be_disabled_independently():
 
 
 def test_model_propagates_dwconv_flag_and_optional_linear_projection():
-    model = SNNBraTS(
+    model = SNNBraTSVSS(
         out_channels=3,
         selective_scan=SelectiveScanIdentity(),
         patch_size=2,

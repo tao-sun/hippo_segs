@@ -36,7 +36,7 @@ from accelerate.utils import broadcast_object_list
 
 # ==== use your spiking UNet-like model ====
 # SNNBraTS: forward(x_win[B,k,4,H,W], t0) -> (B, out_channels, k, H, W)
-from model import SNNBraTS, SNNBraTSUNetShallow, SNNBraTSUNetMedium, SNNBraTSUNetDeep, print_model_info  # mirrors your SNN implementation with PLIF nodes
+from model import SNNBraTSVSS, SNNBraTSVSSDeep, print_model_info
 
 # ------------------ SEEDING ------------------
 SEED = 2025
@@ -1137,12 +1137,16 @@ def build_model(model_name, out_channels=3, patch_size=4,
             patch_embedding_spiking=patch_embedding_spiking,
             input_skip=input_skip,
         )
-    if model_name == "shallow":
-        return SNNBraTSUNetShallow(out_channels=out_channels)
-    if model_name == "medium":
-        return SNNBraTSUNetMedium(out_channels=out_channels)
-    if model_name == "deep":
-        return SNNBraTSUNetDeep(out_channels=out_channels)
+    if model_name == "VSS_deep":
+        return SNNBraTSVSSDeep(
+            out_channels=out_channels,
+            patch_size=patch_size,
+            linear_projection=linear_projection,
+            residual_connections=residual_connections,
+            dwconv2d_spiking=dwconv2d_spiking,
+            patch_embedding_spiking=patch_embedding_spiking,
+            stage_depths=stage_depths,
+        )
     raise ValueError(f"Unknown model: {model_name}")
 
 
@@ -1224,6 +1228,7 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
     residual_connections = exp_cfg["residual_connections"]
     dwconv2d_spiking = exp_cfg["dwconv2d_spiking"]
     patch_embedding_spiking = exp_cfg["patch_embedding_spiking"]
+    stage_depths = exp_cfg["stage_depths"]
     epochs = int(exp_cfg["epochs"])
     batch_size_subjects = int(exp_cfg["batch_size_subjects"])
     lr = float(exp_cfg["lr"])

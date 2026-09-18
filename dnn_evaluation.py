@@ -31,7 +31,7 @@ from tqdm import tqdm
 import torch
 from torch.utils.data import DataLoader
 
-from model import SNNBraTS
+from model import SNNBraTSVSS
 from dnn_3ch import UNetLike2D
 
 # Use the exact per-subject dataset & stacking used by evaluate_3d_snn(). :contentReference[oaicite:2]{index=2}
