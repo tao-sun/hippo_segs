@@ -10,6 +10,7 @@ import re
 import random
 import argparse
 import sys
+import subprocess
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 import json
@@ -128,6 +129,70 @@ def reduce_dice_totals(accelerator: Accelerator,
     }
 
 
+def get_tmux_session_name() -> Optional[str]:
+    tmux = os.environ.get("TMUX")
+    pane = os.environ.get("TMUX_PANE")
+    if not tmux or not pane:
+        return None
+    try:
+        result = subprocess.run(
+            ["tmux", "-S", tmux.rsplit(",", 2)[0], "display-message",
+             "-p", "-t", pane, "#{session_name}"],
+            capture_output=True, text=True, check=True, timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip() or None
+
+
+def validate_checkpoint_input_skip(checkpoint: Dict, input_skip: bool) -> None:
+    saved = checkpoint.get("config", {}).get("input_skip", False)
+    if saved != input_skip:
+        raise ValueError(
+            f"Checkpoint input_skip={saved} differs from requested input_skip={input_skip}; "
+            "start a new run with resume_from: null when changing architecture."
+        )
+
+
+def create_training_scheduler(optimizer, name: str):
+    if name == "cosine":
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=92, eta_min=1e-8,
+        )
+    if name == "reduce_plateau":
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min"
+        )
+    raise ValueError("scheduler must be 'cosine' or 'reduce_plateau'")
+
+
+def validate_checkpoint_scheduler(checkpoint: Dict, requested: str) -> None:
+    saved = checkpoint.get("config", {}).get("scheduler")
+    if saved is None:
+        # Older checkpoints did not record the scheduler name.
+        state = checkpoint.get("scheduler", {})
+        if "T_max" in state:
+            saved = "cosine"
+        elif "num_bad_epochs" in state:
+            saved = "reduce_plateau"
+    if saved != requested:
+        raise ValueError(
+            f"Checkpoint scheduler={saved!r} differs from requested {requested!r}; "
+            "set resume_scheduler: false to start the selected scheduler from the checkpoint LR."
+        )
+
+
+def step_training_scheduler(scheduler, train_loss: float) -> None:
+    base_scheduler = getattr(scheduler, "scheduler", scheduler)
+    if isinstance(
+        base_scheduler,
+        torch.optim.lr_scheduler.ReduceLROnPlateau,
+    ):
+        scheduler.step(train_loss)
+    else:
+        scheduler.step()
+
+
 def save_training_checkpoint_if_main(accelerator: Accelerator,
                                      model: nn.Module,
                                      optimizer,
@@ -174,21 +239,35 @@ def save_training_checkpoint_if_main(accelerator: Accelerator,
     return True
 
 
+def validate_checkpoint_training_mode(checkpoint: Dict, use_fptt: bool) -> None:
+    saved_mode = checkpoint.get("config", {}).get("use_fptt", True)
+    if saved_mode != use_fptt:
+        raise ValueError(
+            f"Checkpoint use_fptt={saved_mode} differs from requested use_fptt={use_fptt}; "
+            "start a new run with resume_from: null."
+        )
+
+
 def load_training_checkpoint(accelerator: Accelerator,
                              model: nn.Module,
                              optimizer,
                              scheduler,
                              checkpoint_path: Path,
-                             train_generator: torch.Generator) -> Dict:
+                             train_generator: torch.Generator,
+                             resume_scheduler: bool = True,
+                             use_fptt: bool = True) -> Dict:
     checkpoint = torch.load(
         checkpoint_path,
         map_location="cpu",
         weights_only=False,
     )
+    validate_checkpoint_training_mode(checkpoint, use_fptt)
     required = {
-        "model", "optimizer", "scheduler", "epoch", "best_dice",
+        "model", "optimizer", "epoch", "best_dice",
         "best_dice_epoch", "fptt_avg_weights", "fptt_lambdas",
     }
+    if resume_scheduler:
+        required.add("scheduler")
     missing = sorted(required - set(checkpoint))
     if missing:
         raise ValueError(
@@ -196,10 +275,30 @@ def load_training_checkpoint(accelerator: Accelerator,
             f"{', '.join(missing)}"
         )
 
+    if resume_scheduler:
+        base_scheduler = getattr(scheduler, "scheduler", scheduler)
+        if isinstance(base_scheduler, torch.optim.lr_scheduler.CosineAnnealingLR):
+            validate_checkpoint_scheduler(checkpoint, "cosine")
+        elif isinstance(base_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            validate_checkpoint_scheduler(checkpoint, "reduce_plateau")
+
     base_model = accelerator.unwrap_model(model)
+    validate_checkpoint_input_skip(checkpoint, getattr(base_model, "input_skip", False))
     base_model.load_state_dict(checkpoint["model"])
     optimizer.load_state_dict(checkpoint["optimizer"])
-    scheduler.load_state_dict(checkpoint["scheduler"])
+    if resume_scheduler:
+        scheduler.load_state_dict(checkpoint["scheduler"])
+    else:
+        base_scheduler = getattr(scheduler, "scheduler", scheduler)
+        checkpoint_lrs = [
+            float(group["lr"]) for group in optimizer.param_groups
+        ]
+        if hasattr(base_scheduler, "base_lrs"):
+            base_scheduler.base_lrs = checkpoint_lrs
+        if hasattr(base_scheduler, "_last_lr"):
+            base_scheduler._last_lr = checkpoint_lrs
+        for group, checkpoint_lr in zip(optimizer.param_groups, checkpoint_lrs):
+            group["initial_lr"] = checkpoint_lr
 
     parameters = dict(base_model.named_parameters())
     for state_name, checkpoint_key in (
@@ -291,17 +390,30 @@ def limit_subject_dirs(subjects: List[Path], limit: Optional[int], label: str) -
     return subjects[:limit]
 
 
-def brats_to_multilabel(mask3d: np.ndarray) -> np.ndarray:
+def brats_to_multilabel(mask3d: np.ndarray, label_format: str = "auto") -> np.ndarray:
     """
     Convert BraTS integer labels to multilabel [ET, TC, WT].
-    Automatically detects BraTS17 ({0,1,2,4}) or BraTS23/24 ({0,1,2,3,4}) format.
+    ``label_format`` should be explicit when the dataset is known. ``auto`` is
+    retained for backwards compatibility with unambiguous masks.
     Returns (3, X, Y, Z) float32 in {0,1}.
     """
     m = mask3d.astype(np.int32)
-    unique_labels = np.unique(m)
+    if label_format not in {"auto", "brats17", "brats23", "brats24"}:
+        raise ValueError(f"Unknown label format: {label_format}")
 
-    # --- detect version ---
-    if 3 in unique_labels:
+    if label_format == "auto":
+        unique_labels = np.unique(m)
+        if 3 in unique_labels:
+            label_format = "brats24"
+        elif 4 in unique_labels:
+            label_format = "brats17"
+        else:
+            raise ValueError(
+                "Cannot infer BraTS label format from labels; "
+                "pass label_format explicitly"
+            )
+
+    if label_format in {"brats23", "brats24"}:
         # BraTS23/24 GLI: 1=NETC, 2=SNFH, 3=ET, 4=RC.
         et = (m == 3)
         tc = (m == 1) | (m == 3)
@@ -550,7 +662,7 @@ class BratsVolumeDataset(Dataset):
     Per-item = one subject:
       x_vol: (S, 4, H, W) float32
       y_vol: (S, 3, H, W) float32
-      meta:  dict with 'sid' and 'xyz'
+      meta:  dict with 'sid', 'xyz', and raw ground-truth labels
     """
     def __init__(
         self,
@@ -560,6 +672,7 @@ class BratsVolumeDataset(Dataset):
         subjects_per_fold: Optional[int] = None,
         cache_root: Optional[str] = None,
         cache_required: bool = False,
+        label_format: str = "auto",
     ):
         rootp = ensure_train_root(Path(root))
         self.view = view
@@ -570,6 +683,9 @@ class BratsVolumeDataset(Dataset):
             else None
         )
         self.cache_required = bool(cache_required)
+        if label_format not in {"auto", "brats17", "brats23", "brats24"}:
+            raise ValueError(f"Unknown label format: {label_format}")
+        self.label_format = label_format
         if view not in VALID_VIEWS:
             raise ValueError(f"view must be one of {VALID_VIEWS}")
         subjects = find_subject_dirs(rootp, [val_fold])
@@ -637,12 +753,22 @@ class BratsVolumeDataset(Dataset):
             images, seg, xyz = load_subject_source_uint8(subj_dir, self.view)
 
         # segmentation → multilabel → (S,3,H,W)
-        ml = brats_to_multilabel(seg)    # (3,X,Y,Z)
+        ml = brats_to_multilabel(seg, self.label_format)    # (3,X,Y,Z)
         ys = take_view(ml, self.view)    # (S,3,H,W)
 
         xs = images.astype(np.float32) / 255.0          # (S,4,H,W)
 
-        return torch.from_numpy(xs).float(), torch.from_numpy(ys).float(), {"sid": subj_dir.name, "xyz": xyz}
+        metadata = {
+            "sid": subj_dir.name,
+            "xyz": xyz,
+            "raw_labels": tuple(int(label) for label in np.unique(seg)),
+        }
+        return torch.from_numpy(xs).float(), torch.from_numpy(ys).float(), metadata
+
+
+def collate_training_subjects(batch):
+    images, labels, metadata = zip(*batch)
+    return torch.stack(images), torch.stack(labels), list(metadata)
 
 
 class ViewSubset(Dataset):
@@ -741,6 +867,91 @@ class SoftDiceLoss(nn.Module):
         return 1 - dice.mean()
 
 
+def size_aware_positive_weights(targets, reference_sizes, gamma=0.5,
+                                max_weight=5.0, eps=1.0):
+    """Return one positive-voxel weight per sample and class."""
+    n_pos = targets.sum(dim=tuple(range(2, targets.ndim)))
+    references = torch.as_tensor(
+        reference_sizes, device=targets.device, dtype=targets.dtype
+    ).reshape(1, -1)
+    weights = ((references + eps) / (n_pos + eps)).pow(gamma)
+    weights = weights.clamp(min=1.0, max=max_weight)
+    return torch.where(n_pos > 0, weights, torch.ones_like(weights))
+
+
+def size_aware_weighted_bce(logits, targets, reference_sizes, gamma=0.5,
+                            max_weight=5.0, eps=1.0):
+    class_weights = size_aware_positive_weights(
+        targets, reference_sizes, gamma, max_weight, eps
+    )
+    raw_bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    positive_weights = class_weights.reshape(
+        *class_weights.shape, *((1,) * (targets.ndim - 2))
+    )
+    voxel_weights = torch.where(
+        targets > 0, positive_weights, torch.ones_like(targets)
+    )
+    return (raw_bce * voxel_weights).mean(), class_weights
+
+
+def foreground_dice_loss(logits, targets, eps=1e-6):
+    probs = torch.sigmoid(logits)
+    reduce_dims = tuple(range(2, probs.ndim))
+    intersection = (probs * targets).sum(dim=reduce_dims)
+    pred_sum = probs.sum(dim=reduce_dims)
+    target_sum = targets.sum(dim=reduce_dims)
+    dice = (2 * intersection + eps) / (pred_sum + target_sum + eps)
+    present = target_sum > 0
+    if not present.any():
+        return logits.sum() * 0.0
+    return 1.0 - dice[present].mean()
+
+
+def compute_supervised_loss(logits, targets, loss_function, lambda_bce,
+                            lambda_dice, reference_sizes=None,
+                            size_aware_bce=None, foreground_dice=None):
+    if loss_function == "bce_dice":
+        bce = F.binary_cross_entropy_with_logits(logits, targets)
+        dice = SoftDiceLoss()(logits, targets)
+        return lambda_bce * bce + lambda_dice * dice, bce, dice, None
+    if loss_function != "wbce_fdice":
+        raise ValueError(f"Unknown loss_function: {loss_function}")
+    if reference_sizes is None:
+        raise ValueError("wbce_fdice requires reference lesion sizes")
+    bce, weights = size_aware_weighted_bce(
+        logits, targets, reference_sizes, **(size_aware_bce or {})
+    )
+    dice = foreground_dice_loss(logits, targets, **(foreground_dice or {}))
+    return lambda_bce * bce + lambda_dice * dice, bce, dice, weights
+
+
+@torch.no_grad()
+def compute_reference_lesion_sizes(dataset, k):
+    """Median positive ET/TC/WT voxel counts in training TBPTT windows."""
+    positive_counts = [[] for _ in OUT_TOKENS]
+    for index in range(len(dataset)):
+        _, targets, _ = dataset[index]
+        for t0 in range(0, targets.shape[0], k):
+            counts = targets[t0:t0 + k].sum(dim=(0, 2, 3))
+            for class_index, count in enumerate(counts.tolist()):
+                if count > 0:
+                    positive_counts[class_index].append(float(count))
+    missing = [
+        OUT_TOKENS[i].upper()
+        for i, values in enumerate(positive_counts) if not values
+    ]
+    if missing:
+        raise ValueError(
+            "Cannot compute reference lesion size; no positive training windows for: "
+            + ", ".join(missing)
+        )
+    return torch.tensor(
+        [float(np.median(values)) for values in positive_counts],
+        dtype=torch.float32,
+    )
+
+
+
 def combined_loss_window(logits: torch.Tensor, targets: torch.Tensor,
                          lambda_bce: float, lambda_dice: float) -> torch.Tensor:
     # logits/targets shape: (B,K,k,H,W) for a TBPTT window
@@ -804,6 +1015,14 @@ def load_experiment_from_yaml(config_path: str) -> Dict:
     missing = sorted(required_keys - set(raw))
     if missing:
         raise ValueError(f"YAML config is missing keys: {', '.join(missing)}")
+    use_fptt = raw.get("use_fptt", True)
+    if not isinstance(use_fptt, bool):
+        raise ValueError("use_fptt must be a boolean")
+    raw["use_fptt"] = use_fptt
+    if use_fptt and float(raw["alpha_fptt"]) <= 0:
+        raise ValueError("alpha_fptt must be positive when use_fptt=true")
+    if isinstance(raw["tbptt_k"], bool) or not isinstance(raw["tbptt_k"], int) or raw["tbptt_k"] <= 0:
+        raise ValueError("tbptt_k must be a positive integer")
     patch_size = raw["patch_size"]
     if isinstance(patch_size, bool) or not isinstance(patch_size, int) or patch_size <= 0:
         raise ValueError("patch_size must be a positive integer")
@@ -816,6 +1035,13 @@ def load_experiment_from_yaml(config_path: str) -> Dict:
     if not isinstance(raw["patch_embedding_spiking"], bool):
         raise ValueError("patch_embedding_spiking must be a boolean")
 
+    input_skip = raw.get("input_skip", False)
+    if not isinstance(input_skip, bool):
+        raise ValueError("input_skip must be a boolean")
+    if input_skip and raw["model"] != "orig":
+        raise ValueError("input_skip=true is supported only for model: orig")
+    raw["input_skip"] = input_skip
+
     resume_from = raw.get("resume_from")
     if resume_from is not None:
         if not isinstance(resume_from, str) or not resume_from.strip():
@@ -823,6 +1049,44 @@ def load_experiment_from_yaml(config_path: str) -> Dict:
         raw["resume_from"] = resume_from.strip()
     else:
         raw["resume_from"] = None
+
+    resume_scheduler = raw.get("resume_scheduler", True)
+    if not isinstance(resume_scheduler, bool):
+        raise ValueError("resume_scheduler must be a boolean")
+    raw["resume_scheduler"] = resume_scheduler
+    scheduler_name = raw.get("scheduler", "cosine")
+    if scheduler_name not in ("cosine", "reduce_plateau"):
+        raise ValueError("scheduler must be 'cosine' or 'reduce_plateau'")
+    raw["scheduler"] = scheduler_name
+
+    loss_function = raw.get("loss_function", "bce_dice")
+    if loss_function not in {"bce_dice", "wbce_fdice"}:
+        raise ValueError("loss_function must be one of: 'bce_dice', 'wbce_fdice'")
+    raw["loss_function"] = loss_function
+    size_aware_bce = raw.get(
+        "size_aware_bce", {"gamma": 0.5, "max_weight": 5.0, "eps": 1.0}
+    )
+    foreground_dice = raw.get("foreground_dice", {"eps": 1e-6})
+    if not isinstance(size_aware_bce, dict):
+        raise ValueError("size_aware_bce must be a mapping")
+    if not isinstance(foreground_dice, dict):
+        raise ValueError("foreground_dice must be a mapping")
+    bce_defaults = {"gamma": 0.5, "max_weight": 5.0, "eps": 1.0}
+    dice_defaults = {"eps": 1e-6}
+    if set(size_aware_bce) - set(bce_defaults) or set(foreground_dice) - set(dice_defaults):
+        raise ValueError("Unknown size_aware_bce or foreground_dice option")
+    bce_defaults.update(size_aware_bce)
+    dice_defaults.update(foreground_dice)
+    for key, value in bce_defaults.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+            raise ValueError(f"size_aware_bce.{key} must be non-negative")
+    if bce_defaults["max_weight"] < 1:
+        raise ValueError("size_aware_bce.max_weight must be at least 1")
+    dice_eps = dice_defaults["eps"]
+    if isinstance(dice_eps, bool) or not isinstance(dice_eps, (int, float)) or dice_eps <= 0:
+        raise ValueError("foreground_dice.eps must be positive")
+    raw["size_aware_bce"] = bce_defaults
+    raw["foreground_dice"] = dice_defaults
 
     cache_root = raw.get("cache_root")
     if cache_root is not None:
@@ -839,6 +1103,11 @@ def load_experiment_from_yaml(config_path: str) -> Dict:
         raise ValueError("cache_required=true requires cache_root")
     raw["cache_required"] = cache_required
 
+    label_format = raw.get("label_format", "auto")
+    if label_format not in {"auto", "brats17", "brats23", "brats24"}:
+        raise ValueError("label_format must be one of auto, brats17, brats23, brats24")
+    raw["label_format"] = label_format
+
     for key, default in (
         ("loader_workers", 2),
         ("loader_prefetch_factor", 1),
@@ -854,7 +1123,10 @@ def build_model(model_name, out_channels=3, patch_size=4,
                 linear_projection=True,
                 residual_connections=True,
                 dwconv2d_spiking=True,
-                patch_embedding_spiking=False):
+                patch_embedding_spiking=False,
+                input_skip=False):
+    if input_skip and model_name != "orig":
+        raise ValueError("input_skip=true is supported only for model: orig")
     if model_name == "orig":
         return SNNBraTS(
             out_channels=out_channels,
@@ -863,6 +1135,7 @@ def build_model(model_name, out_channels=3, patch_size=4,
             residual_connections=residual_connections,
             dwconv2d_spiking=dwconv2d_spiking,
             patch_embedding_spiking=patch_embedding_spiking,
+            input_skip=input_skip,
         )
     if model_name == "shallow":
         return SNNBraTSUNetShallow(out_channels=out_channels)
@@ -875,8 +1148,16 @@ def build_model(model_name, out_channels=3, patch_size=4,
 
 def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
     accelerator = Accelerator()
+    use_fptt = exp_cfg.get("use_fptt", True)
+    input_skip = exp_cfg.get("input_skip", False)
     exp_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", exp_cfg["name"])
     resume_from = exp_cfg.get("resume_from")
+    resume_scheduler = exp_cfg.get("resume_scheduler", True)
+    scheduler_name = exp_cfg.get("scheduler", "cosine")
+    loss_function = exp_cfg.get("loss_function", "bce_dice")
+    size_aware_bce_cfg = dict(exp_cfg.get("size_aware_bce", {}))
+    foreground_dice_cfg = dict(exp_cfg.get("foreground_dice", {}))
+    resume_checkpoint_config = {}
     run_metadata = [
         datetime.now().strftime("%Y%m%d_%H%M%S")
         if accelerator.is_main_process else None,
@@ -890,6 +1171,22 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
         run_dir = Path(resume_from).expanduser().resolve()
         if not run_dir.is_dir():
             raise FileNotFoundError(f"Resume run directory does not exist: {run_dir}")
+        # Reject mode changes before opening logs or overwriting run metadata.
+        resume_checkpoint = torch.load(
+            run_dir / "checkpoint_last.pt", map_location="cpu", weights_only=False
+        )
+        validate_checkpoint_training_mode(resume_checkpoint, use_fptt)
+        validate_checkpoint_input_skip(resume_checkpoint, input_skip)
+        if resume_scheduler:
+            validate_checkpoint_scheduler(resume_checkpoint, scheduler_name)
+        resume_checkpoint_config = dict(resume_checkpoint.get("config", {}))
+        saved_loss = resume_checkpoint_config.get("loss_function", "bce_dice")
+        if saved_loss != loss_function:
+            raise ValueError(
+                f"Checkpoint loss_function={saved_loss!r} differs from requested "
+                f"loss_function={loss_function!r}; start a new run."
+            )
+        del resume_checkpoint
         run_id = run_dir.name
     else:
         run_id = configured_run_id or f"{exp_name}_{start_time}"
@@ -913,6 +1210,8 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
 
     print(f"\n=== Experiment: {exp_name} ===")
     print(f"Start time: {start_time}")
+    tmux_session = get_tmux_session_name()
+    print(f"Tmux session: {tmux_session or 'non disponibile'}")
     print(f"Run directory: {run_dir.resolve()}")
     print(json.dumps(exp_cfg, indent=2, default=str))
 
@@ -958,7 +1257,10 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
     config = {
         "name": exp_name,
         "run_id": run_id,
+        "tmux_session": tmux_session,
         "resume_from": str(run_dir) if resume_from is not None else None,
+        "resume_scheduler": resume_scheduler,
+        "scheduler": scheduler_name,
         "data_root": data_root,
         "val_fold": val_fold,
         "view": view,
@@ -968,18 +1270,23 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
         "residual_connections": residual_connections,
         "dwconv2d_spiking": dwconv2d_spiking,
         "patch_embedding_spiking": patch_embedding_spiking,
+        "input_skip": input_skip,
         "epochs": epochs,
         "batch_size_subjects": batch_size_subjects,
         "lr": lr,
         "weight_decay": weight_decay,
         "grad_clip": grad_clip,
         "tbptt_k": k,
+        "use_fptt": use_fptt,
         "alpha_fptt": alpha_fptt,
         "beta_fptt": beta_fptt,
         "rho_fptt": rho_fptt,
         "lambda_fptt": lambda_fptt,
         "lambda_bce": lambda_bce,
         "lambda_dice": lambda_dice,
+        "loss_function": loss_function,
+        "size_aware_bce": size_aware_bce_cfg,
+        "foreground_dice": foreground_dice_cfg,
         "eval_every": eval_every,
         "eval_batch_slices": eval_batch_slices,
         "prob_threshold": prob_threshold,
@@ -993,10 +1300,6 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
 
     print("\n=== CONFIG (SNN) ===")
     print(json.dumps(config, indent=2))
-
-    if accelerator.is_main_process:
-        with open(hyperparams_path, "w", encoding="utf-8") as handle:
-            yaml.safe_dump(config, handle, sort_keys=False)
 
     source_files = []
     job_file = Path(__file__).with_suffix(".job")
@@ -1045,6 +1348,7 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
             subjects_per_fold=subjects_per_fold,
             cache_root=cache_root,
             cache_required=cache_required,
+            label_format=exp_cfg["label_format"],
         )
         train_subjects.append(dset)
     if not train_subjects:
@@ -1059,6 +1363,7 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
         subjects_per_fold=subjects_per_fold,
         cache_root=cache_root,
         cache_required=cache_required,
+        label_format=exp_cfg["label_format"],
     )
     print(f"Train subjects: {len(train_ds)} | Val subjects: {len(val_ds)}")
     if overfit_subjects is not None:
@@ -1069,6 +1374,39 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
             "Use this only to verify that the model can memorize a tiny dataset.\n"
         )
         print(f"Overfit train subjects: {len(train_ds)} | Overfit val subjects: {len(val_ds)}")
+
+    reference_sizes = None
+    if loss_function == "wbce_fdice":
+        saved_references = resume_checkpoint_config.get("reference_lesion_sizes")
+        reference_payload = [saved_references if accelerator.is_main_process else None]
+        if accelerator.is_main_process and saved_references is None:
+            computed = compute_reference_lesion_sizes(train_ds, k)
+            reference_payload[0] = {
+                name.upper(): float(computed[index])
+                for index, name in enumerate(OUT_TOKENS)
+            }
+        broadcast_object_list(reference_payload, from_process=0)
+        reference_map = reference_payload[0]
+        reference_sizes = torch.tensor(
+            [reference_map[name] for name in ("ET", "TC", "WT")],
+            dtype=torch.float32,
+        )
+        config["reference_lesion_sizes"] = reference_map
+        print(
+            "Loss configuration -> wbce_fdice | "
+            f"size_aware_bce={size_aware_bce_cfg} | "
+            f"foreground_dice={foreground_dice_cfg}"
+        )
+        print(
+            "Reference positive voxels -> "
+            + " ".join(f"M_{name}={reference_map[name]:.1f}" for name in ("ET", "TC", "WT"))
+        )
+    else:
+        print("Loss configuration -> bce_dice (exact baseline reduction)")
+
+    if accelerator.is_main_process:
+        with open(hyperparams_path, "w", encoding="utf-8") as handle:
+            yaml.safe_dump(config, handle, sort_keys=False)
 
     g = torch.Generator()
     g.manual_seed(SEED)
@@ -1086,7 +1424,12 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
         drop_last=False,
         worker_init_fn=seed_worker,
         generator=g,
+        collate_fn=collate_training_subjects,
         **loader_options,
+    )
+    train_eval_ds = ViewSubset(train_ds, list(range(len(train_ds))), view)
+    train_eval_loader = DataLoader(
+        train_eval_ds, batch_size=1, shuffle=False, **loader_options
     )
     val_loader = DataLoader(
         val_ds,
@@ -1105,21 +1448,21 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
         residual_connections=residual_connections,
         dwconv2d_spiking=dwconv2d_spiking,
         patch_embedding_spiking=patch_embedding_spiking,
+        input_skip=input_skip,
     )
 
     if accelerator.is_main_process:
         print_model_info(model)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=12, verbose=True, threshold = 5e-4, min_lr=1e-5, threshold_mode = 'abs', cooldown=3)
-
+    scheduler = create_training_scheduler(optimizer, scheduler_name)
     # Firing-rate monitoring is intentionally disabled because its forward
     # hooks call ``Tensor.item()`` repeatedly and synchronize CPU and GPU.
     # Keep the implementation above available for targeted diagnostics:
     # spkmon = FiringRateMonitor(model)
     spkmon = None
-    model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
-        model, optimizer, train_loader, val_loader, scheduler
+    model, optimizer, train_loader, train_eval_loader, val_loader, scheduler = accelerator.prepare(
+        model, optimizer, train_loader, train_eval_loader, val_loader, scheduler
     )
 
     base_model = accelerator.unwrap_model(model)
@@ -1143,6 +1486,8 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
             scheduler,
             last_checkpoint_path,
             g,
+            resume_scheduler=resume_scheduler,
+            use_fptt=use_fptt,
         )
         start_epoch = int(checkpoint["epoch"]) + 1
         best_dice = float(checkpoint["best_dice"])
@@ -1151,6 +1496,12 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
             f"Resumed from {last_checkpoint_path} at epoch "
             f"{checkpoint['epoch']}; next epoch: {start_epoch}"
         )
+        scheduler_status = (
+            "restored from checkpoint"
+            if resume_scheduler
+            else "reset from checkpoint optimizer LR"
+        )
+        print(f"  Scheduler state: {scheduler_status}")
         accelerator.wait_for_everyone()
 
     append_metrics = (
@@ -1160,7 +1511,37 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
     )
     metrics_mode = "a" if append_metrics else "w"
     metrics_target = metrics_path if accelerator.is_main_process else os.devnull
-    with open(metrics_target, metrics_mode, newline="", encoding="utf-8") as metrics_file:
+    # Separate CSV preserves the schema of epoch_metrics.csv in existing runs.
+    loss_path = run_dir / "loss_components.csv"
+    append_losses = resume_from is not None and loss_path.exists() and loss_path.stat().st_size > 0
+    loss_target = loss_path if accelerator.is_main_process else os.devnull
+    train_dice_path = run_dir / "training_dice.csv"
+    append_train_dice = resume_from is not None and train_dice_path.exists() and train_dice_path.stat().st_size > 0
+    train_dice_target = train_dice_path if accelerator.is_main_process else os.devnull
+    diagnostics_path = run_dir / "loss_diagnostics.csv"
+    append_diagnostics = resume_from is not None and diagnostics_path.exists() and diagnostics_path.stat().st_size > 0
+    diagnostics_target = diagnostics_path if accelerator.is_main_process else os.devnull
+    with open(loss_target, "a" if append_losses else "w", newline="", encoding="utf-8") as loss_file, open(metrics_target, metrics_mode, newline="", encoding="utf-8") as metrics_file, open(train_dice_target, "a" if append_train_dice else "w", newline="", encoding="utf-8") as train_dice_file, open(diagnostics_target, "a" if append_diagnostics else "w", newline="", encoding="utf-8") as diagnostics_file:
+        loss_writer = csv.DictWriter(loss_file, fieldnames=["epoch", "use_fptt", "task_loss", "reg_loss", "total_loss"])
+        if accelerator.is_main_process and not append_losses:
+            loss_writer.writeheader()
+        train_dice_writer = csv.DictWriter(train_dice_file, fieldnames=[
+            "epoch", "dice_ET", "dice_TC", "dice_WT", "dice_mean", "n_subjects",
+        ])
+        if accelerator.is_main_process and not append_train_dice:
+            train_dice_writer.writeheader()
+        diagnostic_fields = [
+            "epoch", "loss_function", "bce_loss", "dice_loss",
+            "weighted_bce_loss", "foreground_dice_loss", "reg_loss", "total_loss",
+        ] + [
+            f"{name}_{metric}"
+            for name in ("ET", "TC", "WT")
+            for metric in ("mean_positive_weight", "max_weight",
+                           "fraction_at_max_weight", "positive_windows", "absent_windows")
+        ]
+        diagnostics_writer = csv.DictWriter(diagnostics_file, fieldnames=diagnostic_fields)
+        if accelerator.is_main_process and not append_diagnostics:
+            diagnostics_writer.writeheader()
         metrics_writer = csv.DictWriter(metrics_file, fieldnames=[
             "epoch",
             "train_loss",
@@ -1183,13 +1564,36 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
         )
         for epoch in epoch_bar:
             print(f"\nEpoch {epoch}/{epochs}")
+            loss_metrics = {}
             tr_loss = train_epoch_snn_tbptt(model, train_loader, optimizer, accelerator,
                                     k, lambda_bce, lambda_dice,
                                     grad_clip, spkmon,
                                     alpha_fptt, beta_fptt,
-                                    rho_fptt, lambda_fptt)
-            scheduler.step(tr_loss)
-            print(f"  train_loss: {tr_loss:.4f}")
+                                    rho_fptt, lambda_fptt,
+                                    use_fptt=use_fptt, loss_metrics=loss_metrics,
+                                    loss_function=loss_function,
+                                    reference_sizes=reference_sizes,
+                                    size_aware_bce=size_aware_bce_cfg,
+                                    foreground_dice=foreground_dice_cfg)
+            step_training_scheduler(scheduler, tr_loss)
+            current_lr = optimizer.param_groups[0]["lr"]
+            print(f"  train_loss: {tr_loss:.4f} | lr: {current_lr:.8g}")
+            bce_label = "weighted_bce" if loss_function == "wbce_fdice" else "bce"
+            dice_label = "foreground_dice" if loss_function == "wbce_fdice" else "dice"
+            print(
+                f"  loss components: {bce_label}={loss_metrics['bce_loss']:.4f}  "
+                f"{dice_label}={loss_metrics['dice_loss']:.4f}  "
+                f"reg={loss_metrics['reg_loss']:.4f}  total={loss_metrics['total_loss']:.4f}"
+            )
+            if loss_function == "wbce_fdice":
+                for name in ("ET", "TC", "WT"):
+                    print(
+                        f"  {name} weights: mean={loss_metrics[f'{name}_mean_positive_weight']:.3f} "
+                        f"max={loss_metrics[f'{name}_max_weight']:.3f} "
+                        f"at_cap={loss_metrics[f'{name}_fraction_at_max_weight']:.1%} "
+                        f"positive={loss_metrics[f'{name}_positive_windows']} "
+                        f"absent={loss_metrics[f'{name}_absent_windows']}"
+                    )
 
             epoch_metrics = {
                 "epoch": epoch,
@@ -1205,7 +1609,19 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
             }
             best_improved = False
 
+            train_dice_metrics = None
             if epoch % eval_every == 0:
+                train_dice_metrics = evaluate_3d_snn(
+                    model, train_eval_loader, accelerator,
+                    prob_threshold=prob_threshold, k=k, spkmon=None,
+                )
+                print(f"  train dice: "
+                    f"ET={train_dice_metrics['dice_ET']:.4f}  "
+                    f"TC={train_dice_metrics['dice_TC']:.4f}  "
+                    f"WT={train_dice_metrics['dice_WT']:.4f}  "
+                    f"mean={train_dice_metrics['dice_mean']:.4f}  "
+                    f"(N={train_dice_metrics['n_subjects']})")
+
                 metrics = evaluate_3d_snn(model,
                                         val_loader,
                                         accelerator,
@@ -1266,6 +1682,22 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
             accelerator.wait_for_everyone()
 
             if accelerator.is_main_process:
+                loss_writer.writerow({
+                    "epoch": epoch, "use_fptt": use_fptt,
+                    "task_loss": loss_metrics["task_loss"],
+                    "reg_loss": loss_metrics["reg_loss"],
+                    "total_loss": loss_metrics["total_loss"],
+                })
+                loss_file.flush()
+                diagnostic_row = {
+                    "epoch": epoch, "loss_function": loss_function,
+                    **{key: loss_metrics.get(key) for key in diagnostic_fields[2:]},
+                }
+                diagnostics_writer.writerow(diagnostic_row)
+                diagnostics_file.flush()
+                if train_dice_metrics is not None:
+                    train_dice_writer.writerow({"epoch": epoch, **train_dice_metrics})
+                    train_dice_file.flush()
                 metrics_writer.writerow(epoch_metrics)
                 metrics_file.flush()
 
@@ -1329,7 +1761,13 @@ def train_epoch_snn_tbptt(model,
                           grad_clip: Optional[float] = 1.0,
                           spkmon: Optional[FiringRateMonitor] = None,
                           alpha=0.5, beta=0.5,  #fptt
-                          rho=0.0, lmbda=2.0):  # fptt
+                          rho=0.0, lmbda=2.0,
+                          use_fptt: bool = True,
+                          loss_metrics: Optional[Dict] = None,
+                          loss_function: str = "bce_dice",
+                          reference_sizes: Optional[torch.Tensor] = None,
+                          size_aware_bce: Optional[Dict] = None,
+                          foreground_dice: Optional[Dict] = None):
     """
     Train one epoch with TBPTT over per-subject slice sequences.
 
@@ -1342,6 +1780,8 @@ def train_epoch_snn_tbptt(model,
         k: TBPTT window size (slices per window)
         lambda_bce, lambda_dice: loss weights
         grad_clip: max grad-norm (None to disable)
+        use_fptt: enable regularization, auxiliary updates and epoch weight reset
+        loss_metrics: optional output mapping for task/reg/total epoch losses
         spkmon: optional FiringRateMonitor to track firing rates
 
     Returns:
@@ -1353,7 +1793,16 @@ def train_epoch_snn_tbptt(model,
         spkmon.reset()
 
     running_loss = torch.zeros((), device=accelerator.device)
+    task_loss_sum = torch.zeros((), device=accelerator.device)
+    reg_loss_sum = torch.zeros((), device=accelerator.device)
+    bce_loss_sum = torch.zeros((), device=accelerator.device)
+    dice_loss_sum = torch.zeros((), device=accelerator.device)
     update_count = torch.zeros((), device=accelerator.device)
+    weight_sum = torch.zeros(3, device=accelerator.device)
+    weight_max = torch.zeros(3, device=accelerator.device)
+    saturated_count = torch.zeros(3, device=accelerator.device)
+    positive_count = torch.zeros(3, device=accelerator.device)
+    absent_count = torch.zeros(3, device=accelerator.device)
     for xs, ys, meta in loader:
         xs = xs.to(accelerator.device, non_blocking=True)  # (B,S,4,H,W)
         ys = ys.to(accelerator.device, non_blocking=True)  # (B,S,3,H,W)
@@ -1370,19 +1819,35 @@ def train_epoch_snn_tbptt(model,
 
             # Targets to channel-first to match logits
             y_win_ck = y_win.permute(0, 2, 1, 3, 4).contiguous()  # (B,3,k,H,W)
-            # ---- loss ----
-            bce = F.binary_cross_entropy_with_logits(logits, y_win_ck) if lambda_bce > 0 else torch.tensor(0., device=logits.device)
-            # Soft Dice
-            probs = torch.sigmoid(logits)
-            reduce_dims = tuple(i for i in range(probs.ndim) if i != 1)  # sum over all except channel
-            intersect = (probs * y_win_ck).sum(dim=reduce_dims)
-            denom = probs.sum(dim=reduce_dims) + y_win_ck.sum(dim=reduce_dims)
-            dice = 1 - ((2 * intersect + 1e-6) / (denom + 1e-6)).mean()
-            
+            # ---- supervised loss ----
+            task_loss, bce, dice, class_weights = compute_supervised_loss(
+                logits, y_win_ck, loss_function, lambda_bce, lambda_dice,
+                reference_sizes=reference_sizes,
+                size_aware_bce=size_aware_bce,
+                foreground_dice=foreground_dice,
+            )
+            if class_weights is not None:
+                n_pos = y_win_ck.sum(dim=(2, 3, 4))
+                present = n_pos > 0
+                weight_sum += (class_weights * present).sum(dim=0).detach()
+                positive_count += present.sum(dim=0).detach()
+                absent_count += (~present).sum(dim=0).detach()
+                present_weights = torch.where(
+                    present, class_weights, torch.zeros_like(class_weights)
+                )
+                weight_max = torch.maximum(
+                    weight_max, present_weights.max(dim=0).values.detach()
+                )
+                max_weight = float((size_aware_bce or {}).get("max_weight", 5.0))
+                saturated_count += (present & (class_weights >= max_weight)).sum(dim=0).detach()
+
             # fptt
             reg_loss_value = torch.zeros([]).type_as(logits)
-            reg_loss = regularizer_loss(base_model, reg_loss_value, alpha, rho, lmbda)
-            loss = lambda_bce * bce + lambda_dice * dice + reg_loss
+            reg_loss = (
+                regularizer_loss(base_model, reg_loss_value, alpha, rho, lmbda)
+                if use_fptt else reg_loss_value
+            )
+            loss = task_loss + reg_loss
             # --------------
 
             accelerator.backward(loss)
@@ -1392,13 +1857,18 @@ def train_epoch_snn_tbptt(model,
             update_count += 1.0
             
             # fptt
-            update_running_params(base_model, alpha, beta)
+            if use_fptt:
+                update_running_params(base_model, alpha, beta)
             if hasattr(base_model, "detach_states"):
                 base_model.detach_states()
 
             
 
             running_loss += loss.detach() * xs.size(0)
+            task_loss_sum += task_loss.detach() * xs.size(0)
+            reg_loss_sum += reg_loss.detach() * xs.size(0)
+            bce_loss_sum += bce.detach() * xs.size(0)
+            dice_loss_sum += dice.detach() * xs.size(0)
 
     epoch_loss = reduce_loss_totals(accelerator, running_loss, update_count)
     
@@ -1408,8 +1878,36 @@ def train_epoch_snn_tbptt(model,
         spkmon.report(tag="Train")
 
     # ---- fptt ----
-    reset_running_params(base_model)
+    if use_fptt:
+        reset_running_params(base_model)
 
+    if loss_metrics is not None:
+        loss_metrics.update(
+            task_loss=reduce_loss_totals(accelerator, task_loss_sum, update_count),
+            bce_loss=reduce_loss_totals(accelerator, bce_loss_sum, update_count),
+            dice_loss=reduce_loss_totals(accelerator, dice_loss_sum, update_count),
+            reg_loss=reduce_loss_totals(accelerator, reg_loss_sum, update_count),
+            total_loss=epoch_loss,
+        )
+        if loss_function == "wbce_fdice":
+            global_weight_sum = accelerator.reduce(weight_sum, reduction="sum")
+            global_weight_max = accelerator.reduce(weight_max, reduction="max")
+            global_saturated = accelerator.reduce(saturated_count, reduction="sum")
+            global_positive = accelerator.reduce(positive_count, reduction="sum")
+            global_absent = accelerator.reduce(absent_count, reduction="sum")
+            loss_metrics["weighted_bce_loss"] = loss_metrics["bce_loss"]
+            loss_metrics["foreground_dice_loss"] = loss_metrics["dice_loss"]
+            for index, name in enumerate(("ET", "TC", "WT")):
+                count = global_positive[index].clamp_min(1)
+                loss_metrics[f"{name}_mean_positive_weight"] = (
+                    global_weight_sum[index] / count
+                ).item()
+                loss_metrics[f"{name}_max_weight"] = global_weight_max[index].item()
+                loss_metrics[f"{name}_fraction_at_max_weight"] = (
+                    global_saturated[index] / count
+                ).item()
+                loss_metrics[f"{name}_positive_windows"] = int(global_positive[index].item())
+                loss_metrics[f"{name}_absent_windows"] = int(global_absent[index].item())
     return epoch_loss
 
 

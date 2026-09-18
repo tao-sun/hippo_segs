@@ -235,7 +235,8 @@ class SNNBraTS(nn.Module):
                  linear_projection: bool = True,
                  residual_connections: bool = True,
                  dwconv2d_spiking: bool = True,
-                 patch_embedding_spiking: bool = False):
+                 patch_embedding_spiking: bool = False,
+                 input_skip: bool = False):
         super().__init__()
         if isinstance(patch_size, bool) or not isinstance(patch_size, int) or patch_size <= 0:
             raise ValueError("patch_size must be a positive integer")
@@ -247,6 +248,9 @@ class SNNBraTS(nn.Module):
             raise TypeError("dwconv2d_spiking must be a boolean")
         if not isinstance(patch_embedding_spiking, bool):
             raise TypeError("patch_embedding_spiking must be a boolean")
+        if not isinstance(input_skip, bool):
+            raise TypeError("input_skip must be a boolean")
+        self.input_skip = input_skip
         self.patch_size = patch_size
         self.linear_projection = linear_projection
         self.residual_connections = residual_connections
@@ -319,6 +323,10 @@ class SNNBraTS(nn.Module):
             spiking=False,
         )
 
+        if self.input_skip:
+            # Analog input features fused with the final decoder features.
+            self.input_proj = nn.Conv2d(4, 8, kernel_size=1, bias=False)
+            self.input_fuse = nn.Conv2d(128 + 8, 128, kernel_size=3, padding=1)
 
     def forward(self, x_win: torch.Tensor, t0: int = 0) -> torch.Tensor:
         B, k, C, H, W = x_win.shape
@@ -331,6 +339,9 @@ class SNNBraTS(nn.Module):
             x = x_win[:, i, :, :, :]  # (B,4,H,W)
             if pad_h or pad_w:
                 x = F.pad(x, (0, pad_w, 0, pad_h))
+
+            if self.input_skip:
+                input_features = self.input_proj(x)
 
             skip1 = self.conv_block1(x, time_step)
             skip2 = self.conv_block2(skip1, time_step)
@@ -348,6 +359,9 @@ class SNNBraTS(nn.Module):
             
             x = self.deconv_block3(x, time_step)
             x = self.deconv3_conv(x, time_step)
+
+            if self.input_skip:
+                x = self.input_fuse(torch.cat([x, input_features], dim=1))
 
             x = self.class_conv(x, time_step)  # (B,out_channels,H,W)
             x = x[..., :H, :W]

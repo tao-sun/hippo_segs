@@ -1,0 +1,23 @@
+# Checkpoint produced by snn_fptt.py. Model architecture is read from
+# checkpoint["config"], so it is intentionally not repeated here.
+checkpoint: experiments/brats24_sagittal_fold1_VSS_20260910_234656/checkpoint_best.pt
+
+data_root: /home/aurora/data/BRATS2024_preprocessed/BraTS2024TrainingData
+cache_root: /home/aurora/data/BRATS2024_subject_cache
+cache_required: true
+label_format: brats24
+
+val_fold: 1
+view: sagittal
+
+eval_batch_slices: 16
+prob_threshold: 0.5
+# testing = held-out val_fold; training = checkpoint training subjects; both = comparison
+split: training
+# Maximum total patients PER selected split; null = all available.
+# Deterministic first N subjects (training ordered by fold, then subject).
+number_patients: 40
+
+loader_workers: 2
+loader_prefetch_factor: 1
+device: auto

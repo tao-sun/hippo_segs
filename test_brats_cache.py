@@ -96,7 +96,11 @@ def test_cached_dataset_matches_original_dataset_bit_for_bit(tmp_path, monkeypat
 
     assert torch.equal(expected_images, expected_images_literal)
     assert torch.equal(expected_labels, expected_labels_literal)
-    assert expected_meta == {"sid": "BraTS-GLI-TEST-000", "xyz": (2, 3, 4)}
+    assert expected_meta == {
+        "sid": "BraTS-GLI-TEST-000",
+        "xyz": (2, 3, 4),
+        "raw_labels": (0, 1, 2, 3),
+    }
     assert torch.equal(actual_images, expected_images)
     assert torch.equal(actual_labels, expected_labels)
     assert actual_meta == expected_meta
@@ -310,3 +314,32 @@ def test_required_cache_is_checked_before_first_dataset_item(tmp_path):
             cache_root=str(tmp_path / "empty-cache"),
             cache_required=True,
         )
+
+
+def test_training_collate_accepts_subjects_with_different_raw_label_counts():
+    samples = [
+        (
+            torch.zeros(2, 4, 3, 4),
+            torch.zeros(2, 3, 3, 4),
+            {"sid": "subject-a", "xyz": (2, 3, 4), "raw_labels": (0, 2, 4)},
+        ),
+        (
+            torch.ones(2, 4, 3, 4),
+            torch.ones(2, 3, 3, 4),
+            {"sid": "subject-b", "xyz": (2, 3, 4), "raw_labels": (0, 1, 2, 3)},
+        ),
+    ]
+    loader = torch.utils.data.DataLoader(
+        samples,
+        batch_size=2,
+        collate_fn=snn_fptt.collate_training_subjects,
+    )
+
+    images, labels, metadata = next(iter(loader))
+
+    assert images.shape == (2, 2, 4, 3, 4)
+    assert labels.shape == (2, 2, 3, 3, 4)
+    assert [item["raw_labels"] for item in metadata] == [
+        (0, 2, 4),
+        (0, 1, 2, 3),
+    ]

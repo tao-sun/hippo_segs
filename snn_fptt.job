@@ -47,7 +47,9 @@ export PYTHONUNBUFFERED=1
 echo "Using virtual environment: $VIRTUAL_ENV"
 "$PYTHON_BIN" --version
 
-RUN_ID="brats23_sagittal_fold1_SS2D_nopooling_${SLURM_JOB_ID}"
+CONFIG_PATH="${1:-$SLURM_SUBMIT_DIR/experiments_snn_fptt.yaml}"
+EXPERIMENT_NAME=$("$PYTHON_BIN" -c 'import re, sys, yaml; print(re.sub(r"[^A-Za-z0-9_.-]+", "_", yaml.safe_load(open(sys.argv[1]))["name"]))' "$CONFIG_PATH")
+RUN_ID="${EXPERIMENT_NAME}_${SLURM_JOB_ID}"
 OUTPUT_DIR_PERSISTENT="$SLURM_SUBMIT_DIR/experiments/$RUN_ID"
 mkdir -p "$OUTPUT_DIR_PERSISTENT"
 export SNN_FPTT_RUN_ID="$RUN_ID"
@@ -110,4 +112,4 @@ fi
 echo "Launching Accelerate with $NUM_PROCESSES process(es)."
 "$ACCELERATE_BIN" launch "${ACCELERATE_ARGS[@]}" \
     "$SLURM_SUBMIT_DIR/snn_fptt.py" \
-    --config "$SLURM_SUBMIT_DIR/experiments_snn_fptt.yaml"
+    --config "$CONFIG_PATH"
