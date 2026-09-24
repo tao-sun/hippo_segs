@@ -18,13 +18,13 @@ from typing import Sequence, Tuple
 CurveSpec = Tuple[str, str, str]
 
 CURVES: list[CurveSpec] = [
-    ("experiments/brats24_sagittal_fold1_VSS_tbptt_20260914_112710/epoch_metrics.csv", "dice_mean", "Spiking Mamba - DICE - testing"),
+    # ("experiments/brats24_sagittal_fold1_VSS_tbptt_20260914_112710/epoch_metrics.csv", "dice_mean", "Spiking Mamba - DICE - testing"),
     ("experiments/brats24_sagittal_fold1_VSS_tbptt_20260914_112710/training_dice.csv", "dice_mean", "Spiking Mamba - DICE - training"),
-    ("experiments/brats24_sagittal_fold1_VSS_tbptt_20260915_133521/epoch_metrics.csv", "dice_mean", "Mamba - DICE - testing"),
+    # ("experiments/brats24_sagittal_fold1_VSS_tbptt_20260915_133521/epoch_metrics.csv", "dice_mean", "Mamba - DICE - testing"),
     ("experiments/brats24_sagittal_fold1_VSS_tbptt_20260915_133521/training_dice.csv", "dice_mean", "Mamba - DICE - training"),
 ]
-OUTPUT_PATH = "dice_trajectories.png"
-PLOT_TITLE = "DICE TRAINING - TESTING"
+OUTPUT_PATH = "dice_trajectories_training.png"
+PLOT_TITLE = "DICE TESTING"
 
 # CURVES: list[CurveSpec] = [
 #     ("experiments/brats24_sagittal_fold1_VSS_tbptt_20260914_112710/loss_components.csv", "total_loss", "Spiking Mamba"),

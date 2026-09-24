@@ -34,6 +34,10 @@ from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from accelerate import Accelerator
 from accelerate.utils import broadcast_object_list
 
+from postprocessing import (
+    postprocess_brats_prediction,
+    validate_postprocessing_parameters,
+)
 # ==== use your spiking UNet-like model ====
 # SNNBraTS: forward(x_win[B,k,4,H,W], t0) -> (B, out_channels, k, H, W)
 from model import SNNBraTS, SNNBraTSUNetShallow, SNNBraTSUNetMedium, SNNBraTSUNetDeep, print_model_info  # mirrors your SNN implementation with PLIF nodes
@@ -1184,6 +1188,17 @@ def load_experiment_from_yaml(config_path: str) -> Dict:
             raise ValueError(f"{key} must be a positive integer")
         raw[key] = value
 
+    apply_postprocessing, min_component_sizes, closing_radius = (
+        validate_postprocessing_parameters(
+            raw.get("apply_postprocessing", False),
+            raw.get("min_component_sizes", (0, 0, 0)),
+            raw.get("closing_radius", 1),
+        )
+    )
+    raw["apply_postprocessing"] = apply_postprocessing
+    raw["min_component_sizes"] = min_component_sizes
+    raw["closing_radius"] = closing_radius
+
     return raw
 
 def build_model(model_name, out_channels=3, patch_size=4,
@@ -1308,6 +1323,9 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
     eval_batch_slices = int(exp_cfg["eval_batch_slices"])
     eval_batch_subjects = exp_cfg["eval_batch_subjects"]
     prob_threshold = float(exp_cfg["prob_threshold"])
+    apply_postprocessing = exp_cfg.get("apply_postprocessing", False)
+    min_component_sizes = tuple(exp_cfg.get("min_component_sizes", (0, 0, 0)))
+    closing_radius = exp_cfg.get("closing_radius", 1)
     cache_root = exp_cfg.get("cache_root")
     cache_required = bool(exp_cfg.get("cache_required", False))
     loader_workers = int(exp_cfg.get("loader_workers", 2))
@@ -1361,6 +1379,9 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
         "eval_batch_slices": eval_batch_slices,
         "eval_batch_subjects": eval_batch_subjects,
         "prob_threshold": prob_threshold,
+        "apply_postprocessing": apply_postprocessing,
+        "min_component_sizes": min_component_sizes,
+        "closing_radius": closing_radius,
         "cache_root": cache_root,
         "cache_required": cache_required,
         "loader_workers": loader_workers,
@@ -1706,7 +1727,7 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
                                         val_loader,
                                         accelerator,
                                         prob_threshold=prob_threshold,
-                                        k=eval_batch_slices,
+                                        k=k,
                                         spkmon=spkmon)
 
                 print(f"  val dice: "
@@ -1997,7 +2018,10 @@ def evaluate_3d_snn(model,
                     accelerator,
                     prob_threshold: float = 0.5,
                     k: int = 16,
-                    spkmon: Optional[FiringRateMonitor] = None):
+                    spkmon: Optional[FiringRateMonitor] = None,
+                    apply_postprocessing: bool = False,
+                    min_component_sizes: Tuple[int, int, int] = (0, 0, 0),
+                    closing_radius: int = 1):
     """
     Evaluate batches of subjects with sequential slices and device-side Dice.
     Accumulate voxel counts over all windows separately for each subject, then
@@ -2012,6 +2036,9 @@ def evaluate_3d_snn(model,
         prob_threshold: binarization threshold for predictions
         k: TBPTT window size
         spkmon: optional FiringRateMonitor to track firing rates
+        apply_postprocessing: apply 3D CCA and closing to predictions
+        min_component_sizes: minimum ET/TC/WT component sizes in voxels
+        closing_radius: radius of the spherical 3D closing structure
 
     Returns:
         dict with dice_ET, dice_TC, dice_WT, dice_mean, n_subjects
@@ -2033,21 +2060,37 @@ def evaluate_3d_snn(model,
         # Counting voxels in slice order is equivalent to reconstructing 3D.
         for t0 in range(0, S, k):
             t1 = min(t0 + k, S)
-            logits = model(xs[:, t0:t1], t0=t0)     # (B,3,k,H,W)
-            predicted = torch.sigmoid(logits) >= prob_threshold
-            target = ys[:, t0:t1].permute(0, 2, 1, 3, 4).bool()
-            axes = (2, 3, 4)
-            intersection += (predicted & target).sum(dim=axes)
-            denominator += predicted.sum(dim=axes) + target.sum(dim=axes)
+            x_win = xs[:, t0:t1, ...]                # (1,k,4,H,W)
+            logits = model(x_win, t0=t0)             # (1,3,k,H,W)
+            probs  = torch.sigmoid(logits).cpu().numpy()   # (1,3,k,H,W)
+            probs = np.transpose(probs, (0, 2, 1, 3, 4))   # (1,k,3,H,W)
+            preds_seq.append(probs[0])               # (k,3,H,W)
+        preds = np.concatenate(preds_seq, axis=0)     # (S,3,H,W)
 
-        batch_dices = (2 * intersection.to(torch.float64) + 1e-6) / (
-            denominator.to(torch.float64) + 1e-6
-        )
-        # Keep Accelerate's removal of duplicated subjects in the final batch.
-        dices.append(accelerator.gather_for_metrics(batch_dices))
+        # Reassemble to 3D
+        target_np = ys.cpu().numpy()[0]               # (S,3,H,W)
+        vol_pred = stack_back(preds, loader.dataset.view, xyz)   # (3,X,Y,Z)
+        vol_gt   = stack_back(target_np, loader.dataset.view, xyz)
 
-    # Only the small per-subject Dice table leaves the device.
-    dices = torch.cat(dices).cpu().numpy() if dices else np.zeros((0, 3), dtype=np.float64)
+        # Binarize predictions; GT already {0,1}
+        vol_bin  = (vol_pred >= prob_threshold).astype(np.uint8)
+        vol_gtb  = vol_gt.astype(np.uint8)
+
+        # Dice per channel
+        K = vol_bin.shape[0]
+        d = []
+        for ch in range(K):
+            p = vol_bin[ch].reshape(-1).astype(np.uint8)
+            t = vol_gtb[ch].reshape(-1).astype(np.uint8)
+            inter = (p & t).sum()
+            denom = p.sum() + t.sum()
+            d.append((2 * inter + 1e-6) / (denom + 1e-6))
+        batch_dices = torch.tensor([d], dtype=torch.float64,
+                                    device=accelerator.device)
+        gathered_dices = accelerator.gather_for_metrics(batch_dices)
+        dices.extend(gathered_dices.cpu().numpy())
+
+    dices = np.array(dices) if len(dices) else np.zeros((0, 3), dtype=np.float64)
     mean_per_class = dices.mean(axis=0) if len(dices) else np.array([0.0, 0.0, 0.0], dtype=np.float64)
 
     # ---- firing-rate report ----

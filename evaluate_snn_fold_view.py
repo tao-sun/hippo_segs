@@ -12,6 +12,11 @@ import yaml
 from torch.utils.data import ConcatDataset, DataLoader, Subset
 from tqdm import tqdm
 
+from postprocessing import (
+    postprocess_brats_prediction,
+    validate_postprocessing_parameters,
+)
+
 
 VALID_VIEWS = {"sagittal", "coronal", "axial"}
 VALID_LABEL_FORMATS = {"auto", "brats17", "brats23", "brats24"}
@@ -35,6 +40,9 @@ class EvalConfig:
     evaluate_train: bool = False
     split: Optional[str] = None
     number_patients: Optional[int] = None
+    apply_postprocessing: bool = False
+    min_component_sizes: Tuple[int, int, int] = (0, 0, 0)
+    closing_radius: int = 1
 
 
 def _path_from_config(value: str, config_dir: Path) -> Path:
@@ -109,6 +117,14 @@ def load_eval_config(config_path: Path) -> EvalConfig:
     if "number_patients" in raw:
         subject_limit = None
 
+    apply_postprocessing, min_component_sizes, closing_radius = (
+        validate_postprocessing_parameters(
+            raw.get("apply_postprocessing", False),
+            raw.get("min_component_sizes", (0, 0, 0)),
+            raw.get("closing_radius", 1),
+        )
+    )
+
     config_dir = config_path.parent
     cache_value = raw.get("cache_root")
     cache_root = _path_from_config(cache_value, config_dir) if cache_value else None
@@ -132,6 +148,9 @@ def load_eval_config(config_path: Path) -> EvalConfig:
         evaluate_train=evaluate_train,
         split=split,
         number_patients=number_patients,
+        apply_postprocessing=apply_postprocessing,
+        min_component_sizes=min_component_sizes,
+        closing_radius=closing_radius,
     )
 
 
@@ -210,7 +229,12 @@ def _metadata_labels(raw_labels) -> list:
 
 
 @torch.no_grad()
-def evaluate_loader(model, loader, device, view: str, window_size: int, threshold: float) -> Dict[str, Any]:
+def evaluate_loader(
+    model, loader, device, view: str, window_size: int, threshold: float,
+    apply_postprocessing: bool = False,
+    min_component_sizes: Tuple[int, int, int] = (0, 0, 0),
+    closing_radius: int = 1,
+) -> Dict[str, Any]:
     model.eval()
     subject_metrics = []
 
@@ -233,6 +257,12 @@ def evaluate_loader(model, loader, device, view: str, window_size: int, threshol
         volume_probabilities = _stack_slices(slice_probabilities, view, shape)
         volume_targets = _stack_slices(slice_targets, view, shape).astype(np.uint8)
         volume_prediction = (volume_probabilities >= threshold).astype(np.uint8)
+        if apply_postprocessing:
+            volume_prediction = postprocess_brats_prediction(
+                volume_prediction,
+                min_component_sizes=min_component_sizes,
+                closing_radius=closing_radius,
+            )
         dice = _dice_per_channel(volume_prediction, volume_targets)
         gt_voxel_counts = volume_targets.reshape(3, -1).sum(axis=1)
 
@@ -353,6 +383,9 @@ def run_evaluation(config: EvalConfig) -> Dict[str, Any]:
         results[selected] = evaluate_loader(
             model, progress, device=device, view=config.view,
             window_size=config.eval_batch_slices, threshold=config.prob_threshold,
+            apply_postprocessing=config.apply_postprocessing,
+            min_component_sizes=config.min_component_sizes,
+            closing_radius=config.closing_radius,
         )
         # Free this split's worker processes before creating the next loader.
         del progress, loader
