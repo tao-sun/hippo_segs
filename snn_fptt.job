@@ -1,13 +1,13 @@
 #!/bin/bash
-#SBATCH --job-name=SS2D_nopooling_fptt
-#SBATCH --output=slurm_output_sagittal_SS2D_nopooling_fptt%j.out
-#SBATCH --error=slurm_output_sagittal_SS2D_nopooling_fptt%j.err
+#SBATCH --job-name=spikMamba_fptt
+#SBATCH --output=slurm_output_sagittal_spikMamba%j.out
+#SBATCH --error=slurm_output_sagittal_spikMamba%j.err
 #SBATCH --time=5-00:00:00
-#SBATCH --partition=gpu_h100
+#SBATCH --partition=gpu_a100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=72
-#SBATCH --gpus=2
+#SBATCH --gpus=4
 #SBATCH --mem=64G
 
 set -euo pipefail

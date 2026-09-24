@@ -183,14 +183,16 @@ def validate_checkpoint_scheduler(checkpoint: Dict, requested: str) -> None:
 
 
 def step_training_scheduler(scheduler, train_loss: float) -> None:
+    # This scheduler advances once per epoch. Accelerate's optimizer-step
+    # wrapper can repeat step() once per process, shortening epoch schedules.
     base_scheduler = getattr(scheduler, "scheduler", scheduler)
     if isinstance(
         base_scheduler,
         torch.optim.lr_scheduler.ReduceLROnPlateau,
     ):
-        scheduler.step(train_loss)
+        base_scheduler.step(train_loss)
     else:
-        scheduler.step()
+        base_scheduler.step()
 
 
 def save_training_checkpoint_if_main(accelerator: Accelerator,
@@ -255,7 +257,10 @@ def load_training_checkpoint(accelerator: Accelerator,
                              checkpoint_path: Path,
                              train_generator: torch.Generator,
                              resume_scheduler: bool = True,
-                             use_fptt: bool = True) -> Dict:
+                             use_fptt: bool = True,
+                             resume_lr: Optional[float] = None) -> Dict:
+    if resume_lr is not None and resume_scheduler:
+        raise ValueError("resume_lr requires resume_scheduler=false")
     checkpoint = torch.load(
         checkpoint_path,
         map_location="cpu",
@@ -290,15 +295,18 @@ def load_training_checkpoint(accelerator: Accelerator,
         scheduler.load_state_dict(checkpoint["scheduler"])
     else:
         base_scheduler = getattr(scheduler, "scheduler", scheduler)
-        checkpoint_lrs = [
+        if resume_lr is not None:
+            for group in optimizer.param_groups:
+                group["lr"] = float(resume_lr)
+        restart_lrs = [
             float(group["lr"]) for group in optimizer.param_groups
         ]
         if hasattr(base_scheduler, "base_lrs"):
-            base_scheduler.base_lrs = checkpoint_lrs
+            base_scheduler.base_lrs = restart_lrs
         if hasattr(base_scheduler, "_last_lr"):
-            base_scheduler._last_lr = checkpoint_lrs
-        for group, checkpoint_lr in zip(optimizer.param_groups, checkpoint_lrs):
-            group["initial_lr"] = checkpoint_lr
+            base_scheduler._last_lr = restart_lrs
+        for group, restart_lr in zip(optimizer.param_groups, restart_lrs):
+            group["initial_lr"] = restart_lr
 
     parameters = dict(base_model.named_parameters())
     for state_name, checkpoint_key in (
@@ -524,14 +532,25 @@ def build_subject_cache_file(
     if cache_path.is_file() and not overwrite:
         return cache_path
 
-    images, segmentation, xyz = load_subject_source_uint8(subject_dir, view)
+    images, segmentation, _xyz = load_subject_source_uint8(subject_dir, view)
+    return write_subject_cache_file(cache_path, subject_dir.name, view, images, segmentation)
+
+
+def write_subject_cache_file(
+    cache_path: Path,
+    subject_id: str,
+    view: str,
+    images: np.ndarray,
+    segmentation: np.ndarray,
+) -> Path:
+    """Atomically save uint8 data from PNGs or directly preprocessed volumes."""
     payload = {
         "format_version": CACHE_FORMAT_VERSION,
-        "subject_id": subject_dir.name,
+        "subject_id": subject_id,
         "view": view,
         "images": torch.from_numpy(np.ascontiguousarray(images)),
         "segmentation": torch.from_numpy(np.ascontiguousarray(segmentation)),
-        "xyz": xyz,
+        "xyz": tuple(int(size) for size in segmentation.shape),
     }
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -688,7 +707,24 @@ class BratsVolumeDataset(Dataset):
         self.label_format = label_format
         if view not in VALID_VIEWS:
             raise ValueError(f"view must be one of {VALID_VIEWS}")
-        subjects = find_subject_dirs(rootp, [val_fold])
+        if self.cache_required and self.cache_root is None:
+            raise ValueError("cache_required=True requires cache_root")
+        if self.cache_required and (
+            rootp.resolve() == self.cache_root or not (rootp / str(self.fold)).is_dir()
+        ):
+            view_root = self.cache_root / view
+            folds_manifest = view_root / "folds_manifest.json"
+            if folds_manifest.is_file():
+                fold_subjects = json.loads(folds_manifest.read_text()).get(str(self.fold), [])
+            else:
+                manifest = json.loads((view_root / "manifest.json").read_text())
+                fold_subjects = [
+                    key.split("/", 1)[1] for key in manifest["subjects"]
+                    if key.split("/", 1)[0] == str(self.fold)
+                ]
+            subjects = [rootp / str(self.fold) / sid for sid in sorted(fold_subjects)]
+        else:
+            subjects = find_subject_dirs(rootp, [val_fold])
         self.subjects = limit_subject_dirs(subjects, subjects_per_fold, f"fold {val_fold}")
         if self.cache_required:
             if self.cache_root is None:
@@ -1019,6 +1055,14 @@ def load_experiment_from_yaml(config_path: str) -> Dict:
     if not isinstance(use_fptt, bool):
         raise ValueError("use_fptt must be a boolean")
     raw["use_fptt"] = use_fptt
+    eval_batch_subjects = raw.get("eval_batch_subjects", 1)
+    if (
+        isinstance(eval_batch_subjects, bool)
+        or not isinstance(eval_batch_subjects, int)
+        or eval_batch_subjects <= 0
+    ):
+        raise ValueError("eval_batch_subjects must be a positive integer")
+    raw["eval_batch_subjects"] = eval_batch_subjects
     if use_fptt and float(raw["alpha_fptt"]) <= 0:
         raise ValueError("alpha_fptt must be positive when use_fptt=true")
     if isinstance(raw["tbptt_k"], bool) or not isinstance(raw["tbptt_k"], int) or raw["tbptt_k"] <= 0:
@@ -1054,6 +1098,19 @@ def load_experiment_from_yaml(config_path: str) -> Dict:
     if not isinstance(resume_scheduler, bool):
         raise ValueError("resume_scheduler must be a boolean")
     raw["resume_scheduler"] = resume_scheduler
+    resume_lr = raw.get("resume_lr")
+    if resume_lr is not None:
+        if (
+            isinstance(resume_lr, bool)
+            or not isinstance(resume_lr, (int, float))
+            or not np.isfinite(resume_lr)
+            or resume_lr <= 0
+        ):
+            raise ValueError("resume_lr must be null or a finite positive number")
+        if raw["resume_from"] is None or resume_scheduler:
+            raise ValueError("resume_lr requires resume_from and resume_scheduler=false")
+        resume_lr = float(resume_lr)
+    raw["resume_lr"] = resume_lr
     scheduler_name = raw.get("scheduler", "cosine")
     if scheduler_name not in ("cosine", "reduce_plateau"):
         raise ValueError("scheduler must be 'cosine' or 'reduce_plateau'")
@@ -1102,6 +1159,16 @@ def load_experiment_from_yaml(config_path: str) -> Dict:
     if cache_required and raw["cache_root"] is None:
         raise ValueError("cache_required=true requires cache_root")
     raw["cache_required"] = cache_required
+
+    data_root = raw["data_root"]
+    if data_root is None:
+        if not cache_required:
+            raise ValueError("data_root may be null only when cache_required=true")
+        raw["data_root"] = raw["cache_root"]
+    elif not isinstance(data_root, str) or not data_root.strip():
+        raise ValueError("data_root must be null or a non-empty directory")
+    else:
+        raw["data_root"] = data_root.strip()
 
     label_format = raw.get("label_format", "auto")
     if label_format not in {"auto", "brats17", "brats23", "brats24"}:
@@ -1153,6 +1220,7 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
     exp_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", exp_cfg["name"])
     resume_from = exp_cfg.get("resume_from")
     resume_scheduler = exp_cfg.get("resume_scheduler", True)
+    resume_lr = exp_cfg.get("resume_lr")
     scheduler_name = exp_cfg.get("scheduler", "cosine")
     loss_function = exp_cfg.get("loss_function", "bce_dice")
     size_aware_bce_cfg = dict(exp_cfg.get("size_aware_bce", {}))
@@ -1238,6 +1306,7 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
     lambda_dice = float(exp_cfg["lambda_dice"])
     eval_every = int(exp_cfg["eval_every"])
     eval_batch_slices = int(exp_cfg["eval_batch_slices"])
+    eval_batch_subjects = exp_cfg["eval_batch_subjects"]
     prob_threshold = float(exp_cfg["prob_threshold"])
     cache_root = exp_cfg.get("cache_root")
     cache_required = bool(exp_cfg.get("cache_required", False))
@@ -1260,6 +1329,7 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
         "tmux_session": tmux_session,
         "resume_from": str(run_dir) if resume_from is not None else None,
         "resume_scheduler": resume_scheduler,
+        "resume_lr": resume_lr,
         "scheduler": scheduler_name,
         "data_root": data_root,
         "val_fold": val_fold,
@@ -1289,6 +1359,7 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
         "foreground_dice": foreground_dice_cfg,
         "eval_every": eval_every,
         "eval_batch_slices": eval_batch_slices,
+        "eval_batch_subjects": eval_batch_subjects,
         "prob_threshold": prob_threshold,
         "cache_root": cache_root,
         "cache_required": cache_required,
@@ -1429,12 +1500,14 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
     )
     train_eval_ds = ViewSubset(train_ds, list(range(len(train_ds))), view)
     train_eval_loader = DataLoader(
-        train_eval_ds, batch_size=1, shuffle=False, **loader_options
+        train_eval_ds, batch_size=eval_batch_subjects, shuffle=False,
+        collate_fn=collate_training_subjects, **loader_options
     )
     val_loader = DataLoader(
         val_ds,
-        batch_size=1,
+        batch_size=eval_batch_subjects,
         shuffle=False,
+        collate_fn=collate_training_subjects,
         **loader_options,
     )
 
@@ -1488,6 +1561,7 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
             g,
             resume_scheduler=resume_scheduler,
             use_fptt=use_fptt,
+            resume_lr=resume_lr,
         )
         start_epoch = int(checkpoint["epoch"]) + 1
         best_dice = float(checkpoint["best_dice"])
@@ -1499,9 +1573,15 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
         scheduler_status = (
             "restored from checkpoint"
             if resume_scheduler
-            else "reset from checkpoint optimizer LR"
+            else (
+                "reset with configured resume_lr"
+                if resume_lr is not None
+                else "reset from checkpoint optimizer LR"
+            )
         )
         print(f"  Scheduler state: {scheduler_status}")
+        if resume_lr is not None:
+            print(f"  Learning rate overridden by resume_lr: {resume_lr:.8g}")
         accelerator.wait_for_everyone()
 
     append_metrics = (
@@ -1611,22 +1691,22 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
 
             train_dice_metrics = None
             if epoch % eval_every == 0:
-                train_dice_metrics = evaluate_3d_snn(
-                    model, train_eval_loader, accelerator,
-                    prob_threshold=prob_threshold, k=k, spkmon=None,
-                )
-                print(f"  train dice: "
-                    f"ET={train_dice_metrics['dice_ET']:.4f}  "
-                    f"TC={train_dice_metrics['dice_TC']:.4f}  "
-                    f"WT={train_dice_metrics['dice_WT']:.4f}  "
-                    f"mean={train_dice_metrics['dice_mean']:.4f}  "
-                    f"(N={train_dice_metrics['n_subjects']})")
+                # train_dice_metrics = evaluate_3d_snn(
+                #     model, train_eval_loader, accelerator,
+                #     prob_threshold=prob_threshold, k=eval_batch_slices, spkmon=None,
+                # )
+                # print(f"  train dice: "
+                #     f"ET={train_dice_metrics['dice_ET']:.4f}  "
+                #     f"TC={train_dice_metrics['dice_TC']:.4f}  "
+                #     f"WT={train_dice_metrics['dice_WT']:.4f}  "
+                #     f"mean={train_dice_metrics['dice_mean']:.4f}  "
+                #     f"(N={train_dice_metrics['n_subjects']})")
 
                 metrics = evaluate_3d_snn(model,
                                         val_loader,
                                         accelerator,
                                         prob_threshold=prob_threshold,
-                                        k=k,
+                                        k=eval_batch_slices,
                                         spkmon=spkmon)
 
                 print(f"  val dice: "
@@ -1919,14 +1999,14 @@ def evaluate_3d_snn(model,
                     k: int = 16,
                     spkmon: Optional[FiringRateMonitor] = None):
     """
-    Evaluate per subject:
-      - run TBPTT over slices
-      - stack per-slice predictions back to 3D volumes
-      - compute Dice for ET/TC/WT
+    Evaluate batches of subjects with sequential slices and device-side Dice.
+    Accumulate voxel counts over all windows separately for each subject, then
+    average subject Dice scores (not window Dice or pooled batch counts).
 
     Args:
         model: SNN model; forward(x_win[B,k,4,H,W], t0) -> logits[B,3,k,H,W]
-        loader: DataLoader yielding (xs[S,4,H,W], ys[S,3,H,W], meta{'xyz',...})
+        loader: DataLoader yielding xs[B,S,4,H,W], ys[B,S,3,H,W], metadata.
+            Volumes have matching fixed spatial shapes, without batch padding.
         accelerator: Hugging Face Accelerator controlling device placement
             and distributed metric gathering
         prob_threshold: binarization threshold for predictions
@@ -1941,47 +2021,33 @@ def evaluate_3d_snn(model,
         spkmon.reset()
 
     dices = []
-    for xs, ys, meta in loader:
-        xs = xs.to(accelerator.device)   # (1,S,4,H,W)
-        ys = ys.to(accelerator.device)   # (1,S,3,H,W)
+    for xs, ys, _meta in loader:
+        xs = xs.to(accelerator.device)   # (B,S,4,H,W)
+        ys = ys.to(accelerator.device)   # (B,S,3,H,W)
         S = xs.shape[1]
-        xyz = meta["xyz"]
-
-        preds_seq = []
-        # Iterate windows, collect per-slice probs
+        intersection = torch.zeros(
+            (xs.shape[0], ys.shape[2]), dtype=torch.int64, device=xs.device
+        )
+        denominator = torch.zeros_like(intersection)
+        # t0=0 resets neuron states for every batch, including a shorter tail.
+        # Counting voxels in slice order is equivalent to reconstructing 3D.
         for t0 in range(0, S, k):
             t1 = min(t0 + k, S)
-            x_win = xs[:, t0:t1, ...]                # (1,k,4,H,W)
-            logits = model(x_win, t0=t0)             # (1,3,k,H,W)
-            probs  = torch.sigmoid(logits).cpu().numpy()   # (1,3,k,H,W)
-            probs = np.transpose(probs, (0, 2, 1, 3, 4))   # (1,k,3,H,W)
-            preds_seq.append(probs[0])               # (k,3,H,W)
-        preds = np.concatenate(preds_seq, axis=0)     # (S,3,H,W)
+            logits = model(xs[:, t0:t1], t0=t0)     # (B,3,k,H,W)
+            predicted = torch.sigmoid(logits) >= prob_threshold
+            target = ys[:, t0:t1].permute(0, 2, 1, 3, 4).bool()
+            axes = (2, 3, 4)
+            intersection += (predicted & target).sum(dim=axes)
+            denominator += predicted.sum(dim=axes) + target.sum(dim=axes)
 
-        # Reassemble to 3D
-        target_np = ys.cpu().numpy()[0]               # (S,3,H,W)
-        vol_pred = stack_back(preds, loader.dataset.view, xyz)   # (3,X,Y,Z)
-        vol_gt   = stack_back(target_np, loader.dataset.view, xyz)
+        batch_dices = (2 * intersection.to(torch.float64) + 1e-6) / (
+            denominator.to(torch.float64) + 1e-6
+        )
+        # Keep Accelerate's removal of duplicated subjects in the final batch.
+        dices.append(accelerator.gather_for_metrics(batch_dices))
 
-        # Binarize predictions; GT already {0,1}
-        vol_bin  = (vol_pred >= prob_threshold).astype(np.uint8)
-        vol_gtb  = vol_gt.astype(np.uint8)
-
-        # Dice per channel
-        K = vol_bin.shape[0]
-        d = []
-        for ch in range(K):
-            p = vol_bin[ch].reshape(-1).astype(np.uint8)
-            t = vol_gtb[ch].reshape(-1).astype(np.uint8)
-            inter = (p & t).sum()
-            denom = p.sum() + t.sum()
-            d.append((2 * inter + 1e-6) / (denom + 1e-6))
-        batch_dices = torch.tensor([d], dtype=torch.float64,
-                                    device=accelerator.device)
-        gathered_dices = accelerator.gather_for_metrics(batch_dices)
-        dices.extend(gathered_dices.cpu().numpy())
-
-    dices = np.array(dices) if len(dices) else np.zeros((0, 3), dtype=np.float64)
+    # Only the small per-subject Dice table leaves the device.
+    dices = torch.cat(dices).cpu().numpy() if dices else np.zeros((0, 3), dtype=np.float64)
     mean_per_class = dices.mean(axis=0) if len(dices) else np.array([0.0, 0.0, 0.0], dtype=np.float64)
 
     # ---- firing-rate report ----

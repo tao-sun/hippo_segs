@@ -16,6 +16,7 @@ dependencies = [
     "pillow>=11.3.0",
     "pyyaml>=6.0.3",
     "scikit-learn>=1.6.1",
+    "synapseclient>=4.10.0",
     "torch==2.5.1",
     "torchinfo>=1.8.0",
     "torchmetrics>=1.8.2",
