@@ -1,6 +1,6 @@
 # Checkpoint produced by snn_fptt.py. Model architecture is read from
 # checkpoint["config"], so it is intentionally not repeated here.
-checkpoint: experiments/brats24_sagittal_fold1_VSS_20260910_234656/checkpoint_best.pt
+checkpoint: experiments/brats24_sagittal_fold1_VSS_tbptt_20260914_112710/checkpoint_best.pt
 
 data_root: /home/aurora/data/BRATS2024_preprocessed/BraTS2024TrainingData
 cache_root: /home/aurora/data/BRATS2024_subject_cache
@@ -12,11 +12,16 @@ view: sagittal
 
 eval_batch_slices: 16
 prob_threshold: 0.5
+# Applied only to thresholded prediction volumes; ground truth is untouched.
+apply_postprocessing: true
+# ET, TC, WT minimum connected-component sizes in voxels.
+min_component_sizes: [0, 20, 50]
+closing_radius: 1
 # testing = held-out val_fold; training = checkpoint training subjects; both = comparison
-split: training
+split: testing
 # Maximum total patients PER selected split; null = all available.
 # Deterministic first N subjects (training ordered by fold, then subject).
-number_patients: 40
+number_patients: 20
 
 loader_workers: 2
 loader_prefetch_factor: 1

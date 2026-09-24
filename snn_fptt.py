@@ -34,6 +34,10 @@ from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from accelerate import Accelerator
 from accelerate.utils import broadcast_object_list
 
+from postprocessing import (
+    postprocess_brats_prediction,
+    validate_postprocessing_parameters,
+)
 # ==== use your spiking UNet-like model ====
 # SNNBraTS: forward(x_win[B,k,4,H,W], t0) -> (B, out_channels, k, H, W)
 from model import SNNBraTS, SNNBraTSUNetShallow, SNNBraTSUNetMedium, SNNBraTSUNetDeep, print_model_info  # mirrors your SNN implementation with PLIF nodes
@@ -1117,6 +1121,17 @@ def load_experiment_from_yaml(config_path: str) -> Dict:
             raise ValueError(f"{key} must be a positive integer")
         raw[key] = value
 
+    apply_postprocessing, min_component_sizes, closing_radius = (
+        validate_postprocessing_parameters(
+            raw.get("apply_postprocessing", False),
+            raw.get("min_component_sizes", (0, 0, 0)),
+            raw.get("closing_radius", 1),
+        )
+    )
+    raw["apply_postprocessing"] = apply_postprocessing
+    raw["min_component_sizes"] = min_component_sizes
+    raw["closing_radius"] = closing_radius
+
     return raw
 
 def build_model(model_name, out_channels=3, patch_size=4,
@@ -1239,6 +1254,9 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
     eval_every = int(exp_cfg["eval_every"])
     eval_batch_slices = int(exp_cfg["eval_batch_slices"])
     prob_threshold = float(exp_cfg["prob_threshold"])
+    apply_postprocessing = exp_cfg.get("apply_postprocessing", False)
+    min_component_sizes = tuple(exp_cfg.get("min_component_sizes", (0, 0, 0)))
+    closing_radius = exp_cfg.get("closing_radius", 1)
     cache_root = exp_cfg.get("cache_root")
     cache_required = bool(exp_cfg.get("cache_required", False))
     loader_workers = int(exp_cfg.get("loader_workers", 2))
@@ -1290,6 +1308,9 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
         "eval_every": eval_every,
         "eval_batch_slices": eval_batch_slices,
         "prob_threshold": prob_threshold,
+        "apply_postprocessing": apply_postprocessing,
+        "min_component_sizes": min_component_sizes,
+        "closing_radius": closing_radius,
         "cache_root": cache_root,
         "cache_required": cache_required,
         "loader_workers": loader_workers,
@@ -1614,6 +1635,9 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
                 train_dice_metrics = evaluate_3d_snn(
                     model, train_eval_loader, accelerator,
                     prob_threshold=prob_threshold, k=k, spkmon=None,
+                    apply_postprocessing=apply_postprocessing,
+                    min_component_sizes=min_component_sizes,
+                    closing_radius=closing_radius,
                 )
                 print(f"  train dice: "
                     f"ET={train_dice_metrics['dice_ET']:.4f}  "
@@ -1627,7 +1651,10 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
                                         accelerator,
                                         prob_threshold=prob_threshold,
                                         k=k,
-                                        spkmon=spkmon)
+                                        spkmon=spkmon,
+                                        apply_postprocessing=apply_postprocessing,
+                                        min_component_sizes=min_component_sizes,
+                                        closing_radius=closing_radius)
 
                 print(f"  val dice: "
                     f"ET={metrics['dice_ET']:.4f}  "
@@ -1917,7 +1944,10 @@ def evaluate_3d_snn(model,
                     accelerator,
                     prob_threshold: float = 0.5,
                     k: int = 16,
-                    spkmon: Optional[FiringRateMonitor] = None):
+                    spkmon: Optional[FiringRateMonitor] = None,
+                    apply_postprocessing: bool = False,
+                    min_component_sizes: Tuple[int, int, int] = (0, 0, 0),
+                    closing_radius: int = 1):
     """
     Evaluate per subject:
       - run TBPTT over slices
@@ -1932,6 +1962,9 @@ def evaluate_3d_snn(model,
         prob_threshold: binarization threshold for predictions
         k: TBPTT window size
         spkmon: optional FiringRateMonitor to track firing rates
+        apply_postprocessing: apply 3D CCA and closing to predictions
+        min_component_sizes: minimum ET/TC/WT component sizes in voxels
+        closing_radius: radius of the spherical 3D closing structure
 
     Returns:
         dict with dice_ET, dice_TC, dice_WT, dice_mean, n_subjects
@@ -1965,6 +1998,12 @@ def evaluate_3d_snn(model,
 
         # Binarize predictions; GT already {0,1}
         vol_bin  = (vol_pred >= prob_threshold).astype(np.uint8)
+        if apply_postprocessing:
+            vol_bin = postprocess_brats_prediction(
+                vol_bin,
+                min_component_sizes=min_component_sizes,
+                closing_radius=closing_radius,
+            )
         vol_gtb  = vol_gt.astype(np.uint8)
 
         # Dice per channel

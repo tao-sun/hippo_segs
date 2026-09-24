@@ -1,4 +1,4 @@
-name: brats24_sagittal_fold1_VSS_tbptt
+name: brats24_sagittal_fold1_VSS_fptt
 data_root: /home/aurora/data/BRATS2024_preprocessed/BraTS2024TrainingData
 label_format: brats24
 val_fold: 1
@@ -8,12 +8,12 @@ model: orig
 patch_size: 2
 linear_projection: true
 residual_connections: true
-dwconv2d_spiking: false
-patch_embedding_spiking: false
+dwconv2d_spiking: true
+patch_embedding_spiking: true
 input_skip: false  # orig only: input 4->8 projection + full-resolution 3x3 fusion
 # training
 # Set this to an existing run directory to resume from checkpoint_last.pt.
-resume_from: experiments/brats24_sagittal_fold1_VSS_tbptt_20260915_133521
+resume_from: null
 # true restores the checkpoint scheduler; false starts it from the checkpoint LR.
 resume_scheduler: false
 scheduler: reduce_plateau  # cosine or reduce_plateau
@@ -35,7 +35,7 @@ rho_fptt: 0.0
 lambda_fptt: 1.5
 lambda_bce: 0.5
 lambda_dice: 0.5
-loss_function: "bce_dice"  # bce_dice or wbce_fdice
+loss_function: "wbce_fdice"  # bce_dice or wbce_fdice
 size_aware_bce:
   gamma: 0.5
   max_weight: 5.0
@@ -45,5 +45,10 @@ foreground_dice:
 eval_every: 1
 eval_batch_slices: 16
 prob_threshold: 0.5
-subjects_per_fold: 20  # null/commented = use all subjects; otherwise first n per train/val fold
+# Applied only to thresholded prediction volumes; ground truth is untouched.
+apply_postprocessing: false
+# ET, TC, WT minimum connected-component sizes in voxels.
+min_component_sizes: [0, 20, 50]
+closing_radius: 1
+subjects_per_fold: 40  # null/commented = use all subjects; otherwise first n per train/val fold
 # overfit_subjects: 5
