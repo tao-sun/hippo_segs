@@ -17,7 +17,14 @@ resume_from: null
 # true restores the checkpoint scheduler; false starts it from the checkpoint LR.
 resume_scheduler: false
 scheduler: reduce_plateau  # cosine or reduce_plateau
-# Optional lossless uint8 cache built with build_brats_cache.py.
+# Independent ablations: minmax/false reproduces the old input and sampling.
+preprocessing_normalization: minmax  # zscore requires a new float32 cache
+preserve_float32: false             # true with zscore
+lesion_volume_sampling: false
+lesion_sampling_classes: [ET, TC]
+lesion_sampling_gamma: 0.5
+lesion_sampling_max_weight: 4.0
+# Cache from build_brats_cache.py (legacy) or data/preprocess_brats24.py.
 cache_root: /home/aurora/data/BRATS2024_subject_cache
 cache_required: true
 loader_workers: 2          # one GPU; applies to both train and validation loaders

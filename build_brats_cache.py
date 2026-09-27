@@ -45,6 +45,7 @@ def _cache_one_subject(
         cache_path,
         expected_subject_id=subject_dir.name,
         expected_view=view,
+        expected_normalization="minmax",
     )
     record = {
         "cache_file": str(cache_path.relative_to(cache_root / view)),
@@ -83,7 +84,10 @@ def _scan_view_cache(cache_root: Path, view: str) -> Tuple[Dict, Dict]:
                 cache_path,
                 expected_subject_id=cache_path.stem,
                 expected_view=view,
+                expected_normalization="minmax",
             )
+        except snn_fptt.PreprocessingMismatchError:
+            raise
         except Exception as exc:
             invalid_files[str(relative_path)] = str(exc)
             continue

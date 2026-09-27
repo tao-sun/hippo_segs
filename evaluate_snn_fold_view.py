@@ -313,6 +313,7 @@ def build_training_dataset(config: EvalConfig, checkpoint_config: Mapping[str, A
             subjects_per_fold=checkpoint_config.get("subjects_per_fold"),
             cache_root=str(config.cache_root) if config.cache_root is not None else None,
             cache_required=config.cache_required, label_format=config.label_format,
+            preprocessing_normalization=checkpoint_config.get("preprocessing_normalization", "minmax"),
         )
         for f in range(1, 6) if f != fold
     ]
@@ -373,6 +374,7 @@ def run_evaluation(config: EvalConfig) -> Dict[str, Any]:
                 subjects_per_fold=config.subjects_per_fold,
                 cache_root=str(config.cache_root) if config.cache_root is not None else None,
                 cache_required=config.cache_required, label_format=config.label_format,
+                preprocessing_normalization=payload["config"].get("preprocessing_normalization", "minmax"),
             )
         available = len(dataset)
         if config.number_patients is not None:

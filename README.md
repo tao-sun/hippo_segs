@@ -32,37 +32,22 @@ These settings are read at startup; an already running process keeps its loaded
 code and configuration. Measure evaluation time and memory on the target GPUs
 before assuming a speedup from a larger batch.
 
-## BraTS24 preprocessing and cache
+## BraTS24 preprocessing and sampling
 
-BraTS24 preprocessing writes only the subject cache, directly from
-the raw NIfTI volumes in memory. No intermediate PNGs or NIfTI masks are saved:
+See [the preprocessing and ablation guide](BRATS_PREPROCESSING.md)
+for ZIP/directory input, float32 Z-score caches, safe resume and independent
+patient lesion-volume sampling. Legacy minmax/uint8 remains the default.
 
 ```bash
 .venv/bin/python data/preprocess_brats24.py \
-  --input /home/aurora/data/BRATS2024 \
-  --cache-root /home/aurora/data/BRATS2024_subject_cache \
-  --view sagittal \
-  --workers 4
+  --input /path/BraTS2024.zip \
+  --cache-root /path/BRATS2024_cache_zscore \
+  --preprocessing-normalization zscore --preserve-float32 \
+  --view sagittal --workers 1
 ```
 
-The selected view is saved under `<cache-root>/<view>/<fold>/<subject>.pt`,
-with fold and source manifests alongside the cache. Existing valid cache files
-are skipped; pass
-`--overwrite-cache` to rebuild them. By default it includes both BraTS24
-training folders. Pass `--exclude-additional` to use only `training_data1_v2`.
-
-For training without a preprocessing directory, configure:
-
-```yaml
-data_root: /home/aurora/data/BRATS2024_subject_cache
-cache_root: /home/aurora/data/BRATS2024_subject_cache
-cache_required: true
-label_format: brats24
-```
-
-The loader uses the cache manifests to discover subjects and checks for missing
-files. Fold assignments still follow `FOLD_NAMES` in `data/preprocess_brats24.py`.
-Keep the raw input volumes to regenerate other views or rebuild the cache.
+The normalization is performed on each 3D modality before view extraction.
+Use a new cache directory for each preprocessing configuration.
 
 ## BraTS subject cache
 

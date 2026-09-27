@@ -34,6 +34,11 @@ from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from accelerate import Accelerator
 from accelerate.utils import broadcast_object_list
 
+from lesion_sampling import (
+    PatientWeightedSampler, collect_training_lesion_records, compute_patient_weights,
+    sampling_summary, validate_sampling_options,
+)
+
 from postprocessing import (
     postprocess_brats_prediction,
     validate_postprocessing_parameters,
@@ -520,7 +525,7 @@ def subject_cache_path(
     fold: int,
     subject_id: str,
 ) -> Path:
-    return Path(cache_root) / view / str(int(fold)) / f"{subject_id}.pt"
+    return Path(cache_root) / view / ("validation" if fold == "validation" else str(int(fold))) / f"{subject_id}.pt"
 
 
 def build_subject_cache_file(
@@ -534,6 +539,7 @@ def build_subject_cache_file(
     subject_dir = Path(subject_dir)
     cache_path = subject_cache_path(cache_root, view, fold, subject_dir.name)
     if cache_path.is_file() and not overwrite:
+        load_subject_cache_file(cache_path, subject_dir.name, view, expected_normalization="minmax")
         return cache_path
 
     images, segmentation, _xyz = load_subject_source_uint8(subject_dir, view)
@@ -545,18 +551,36 @@ def write_subject_cache_file(
     subject_id: str,
     view: str,
     images: np.ndarray,
-    segmentation: np.ndarray,
+    segmentation: Optional[np.ndarray],
+    normalization: str = "minmax",
+    lesion_volumes: Optional[Dict] = None,
+    label_format: Optional[str] = None,
+    split: str = "training",
+    xyz: Optional[Tuple[int, int, int]] = None,
 ) -> Path:
-    """Atomically save uint8 data from PNGs or directly preprocessed volumes."""
+    """Atomically save legacy uint8 or normalized float32 view tensors."""
+    expected_dtype = np.float32 if normalization == "zscore" else np.uint8
+    if normalization not in {"minmax", "zscore"} or images.dtype != expected_dtype:
+        raise ValueError("Images dtype does not match preprocessing normalization")
+    if not np.isfinite(images).all():
+        raise ValueError("Non-finite cached MRI intensities")
+    if segmentation is None and (split != "validation" or xyz is None or lesion_volumes is not None):
+        raise ValueError("Unlabeled caches require validation split, explicit xyz and no lesion volumes")
     payload = {
-        "format_version": CACHE_FORMAT_VERSION,
+        "split": split,
+        "format_version": 2 if normalization == "zscore" else CACHE_FORMAT_VERSION,
+        "normalization": normalization,
+        "preserve_float32": normalization == "zscore",
         "subject_id": subject_id,
         "view": view,
         "images": torch.from_numpy(np.ascontiguousarray(images)),
-        "segmentation": torch.from_numpy(np.ascontiguousarray(segmentation)),
-        "xyz": tuple(int(size) for size in segmentation.shape),
+        "segmentation": None if segmentation is None else torch.from_numpy(np.ascontiguousarray(segmentation)),
+        "xyz": tuple(int(size) for size in (segmentation.shape if segmentation is not None else xyz)),
     }
 
+    if lesion_volumes is not None:
+        payload["lesion_volumes"] = lesion_volumes
+        payload["label_format"] = label_format
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = cache_path.with_name(
         f".{cache_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
@@ -569,10 +593,16 @@ def write_subject_cache_file(
     return cache_path
 
 
+class PreprocessingMismatchError(ValueError):
+    """Requested preprocessing must never fall back to incompatible PNG data."""
+
+
 def load_subject_cache_file(
     cache_path: Path,
     expected_subject_id: Optional[str] = None,
     expected_view: Optional[str] = None,
+    expected_normalization: Optional[str] = None,
+    allow_unlabeled: bool = False,
 ) -> Dict:
     """Load and validate one materialized subject cache."""
     cache_path = Path(cache_path)
@@ -589,7 +619,7 @@ def load_subject_cache_file(
         raise ValueError(
             f"Invalid cache file {cache_path}; missing: {', '.join(missing_keys)}"
         )
-    if payload["format_version"] != CACHE_FORMAT_VERSION:
+    if payload["format_version"] not in {CACHE_FORMAT_VERSION, 2}:
         raise ValueError(
             f"Unsupported cache format in {cache_path}: "
             f"{payload['format_version']}"
@@ -602,15 +632,35 @@ def load_subject_cache_file(
         raise ValueError(f"Invalid view in cache file: {cache_path}")
     if not isinstance(payload["images"], torch.Tensor):
         raise ValueError(f"Cached images must be a tensor: {cache_path}")
-    if not isinstance(payload["segmentation"], torch.Tensor):
+    unlabeled = payload["segmentation"] is None
+    if payload.get("split", "training") not in {"training", "validation"}:
+        raise ValueError(f"Invalid cache split: {cache_path}")
+    if (unlabeled or payload.get("split") == "validation") and not allow_unlabeled:
+        raise ValueError(f"Validation/unlabeled cache cannot be used for supervised training: {cache_path}")
+    if unlabeled:
+        if payload.get("split") != "validation" or "lesion_volumes" in payload:
+            raise ValueError(f"Invalid unlabeled cache metadata: {cache_path}")
+    elif not isinstance(payload["segmentation"], torch.Tensor):
         raise ValueError(f"Cached segmentation must be a tensor: {cache_path}")
-    if payload["images"].dtype != torch.uint8:
-        raise ValueError(f"Cached images must be uint8: {cache_path}")
-    if payload["segmentation"].dtype != torch.uint8:
+    normalization = "zscore" if payload["format_version"] == 2 else "minmax"
+    if payload.get("normalization", "minmax") != normalization:
+        raise ValueError(f"Invalid preprocessing metadata: {cache_path}")
+    if payload.get("preserve_float32", False) != (normalization == "zscore"):
+        raise ValueError(f"Invalid preprocessing precision metadata: {cache_path}")
+    if expected_normalization is not None and normalization != expected_normalization:
+        raise PreprocessingMismatchError(
+            f"Incompatible preprocessing cache {cache_path}: {normalization}; "
+            f"requested {expected_normalization}. Regenerate in a separate cache directory.")
+    expected_dtype = torch.float32 if normalization == "zscore" else torch.uint8
+    if payload["images"].dtype != expected_dtype:
+        raise ValueError(f"Cached images must be {expected_dtype}: {cache_path}")
+    if normalization == "zscore" and not torch.isfinite(payload["images"]).all():
+        raise ValueError(f"Non-finite cached MRI intensities: {cache_path}")
+    if not unlabeled and payload["segmentation"].dtype != torch.uint8:
         raise ValueError(f"Cached segmentation must be uint8: {cache_path}")
 
     xyz = tuple(int(size) for size in payload["xyz"])
-    if tuple(payload["segmentation"].shape) != xyz:
+    if not unlabeled and tuple(payload["segmentation"].shape) != xyz:
         raise ValueError(
             f"Cached segmentation shape does not match xyz: {cache_path}"
         )
@@ -696,6 +746,7 @@ class BratsVolumeDataset(Dataset):
         cache_root: Optional[str] = None,
         cache_required: bool = False,
         label_format: str = "auto",
+        preprocessing_normalization: str = "minmax",
     ):
         rootp = ensure_train_root(Path(root))
         self.view = view
@@ -706,6 +757,15 @@ class BratsVolumeDataset(Dataset):
             else None
         )
         self.cache_required = bool(cache_required)
+        if preprocessing_normalization not in {"minmax", "zscore"}:
+            raise ValueError("preprocessing_normalization must be minmax or zscore")
+        self.preprocessing_normalization = preprocessing_normalization
+        if preprocessing_normalization == "zscore" and (not self.cache_required or self.cache_root is None):
+            raise ValueError("zscore requires cache_root and cache_required=true; PNG fallback cannot preserve float32")
+        if self.cache_root is not None and (self.cache_root / "preprocessing.json").exists():
+            metadata = json.loads((self.cache_root / "preprocessing.json").read_text())
+            if metadata["normalization"] != preprocessing_normalization:
+                raise PreprocessingMismatchError("Requested preprocessing normalization does not match cache metadata")
         if label_format not in {"auto", "brats17", "brats23", "brats24"}:
             raise ValueError(f"Unknown label format: {label_format}")
         self.label_format = label_format
@@ -730,6 +790,11 @@ class BratsVolumeDataset(Dataset):
         else:
             subjects = find_subject_dirs(rootp, [val_fold])
         self.subjects = limit_subject_dirs(subjects, subjects_per_fold, f"fold {val_fold}")
+        if self.cache_root is not None and (self.cache_root / "preprocessing.json").exists():
+            for subject in self.subjects:
+                marker = self.cache_root / "completion" / str(self.fold) / f"{subject.name}.json"
+                if not marker.is_file():
+                    raise ValueError(f"Subject cache incomplete: missing completion marker for {subject.name}; resume preprocessing")
         if self.cache_required:
             if self.cache_root is None:
                 raise ValueError("cache_required=True requires cache_root")
@@ -756,6 +821,7 @@ class BratsVolumeDataset(Dataset):
     def __getitem__(self, idx: int):
         subj_dir = self.subjects[idx]
         images = None
+        cached_label_format = None
         seg = None
         xyz = None
         if self.cache_root is not None:
@@ -771,9 +837,10 @@ class BratsVolumeDataset(Dataset):
                         cache_path,
                         expected_subject_id=subj_dir.name,
                         expected_view=self.view,
+                        expected_normalization=self.preprocessing_normalization,
                     )
                 except Exception as exc:
-                    if self.cache_required:
+                    if self.cache_required or isinstance(exc, PreprocessingMismatchError):
                         raise
                     warnings.warn(
                         f"Invalid cache {cache_path}: {exc}. "
@@ -781,6 +848,9 @@ class BratsVolumeDataset(Dataset):
                         RuntimeWarning,
                     )
                 else:
+                    if payload.get("label_format") and self.label_format not in {"auto", payload["label_format"]}:
+                        raise ValueError("Requested label_format does not match cache")
+                    cached_label_format = payload.get("label_format")
                     images = payload["images"].numpy()
                     seg = payload["segmentation"].numpy()
                     xyz = payload["xyz"]
@@ -793,10 +863,15 @@ class BratsVolumeDataset(Dataset):
             images, seg, xyz = load_subject_source_uint8(subj_dir, self.view)
 
         # segmentation → multilabel → (S,3,H,W)
-        ml = brats_to_multilabel(seg, self.label_format)    # (3,X,Y,Z)
+        label_format = self.label_format
+        if label_format == "auto" and cached_label_format is not None:
+            label_format = cached_label_format
+        ml = brats_to_multilabel(seg, label_format)    # (3,X,Y,Z)
         ys = take_view(ml, self.view)    # (S,3,H,W)
 
-        xs = images.astype(np.float32) / 255.0          # (S,4,H,W)
+        xs = images.astype(np.float32, copy=False)      # (S,4,H,W)
+        if self.preprocessing_normalization == "minmax":
+            xs = xs / 255.0
 
         metadata = {
             "sid": subj_dir.name,
@@ -806,9 +881,74 @@ class BratsVolumeDataset(Dataset):
         return torch.from_numpy(xs).float(), torch.from_numpy(ys).float(), metadata
 
 
+class BratsInferenceDataset(Dataset):
+    """Official held-out validation: return MRI and metadata, never fabricated GT."""
+    def __init__(self, cache_root, view, preprocessing_normalization="minmax"):
+        self.cache_root = Path(cache_root)
+        self.view = view
+        self.preprocessing_normalization = preprocessing_normalization
+        if view not in VALID_VIEWS or preprocessing_normalization not in {"minmax", "zscore"}:
+            raise ValueError("Invalid view or preprocessing normalization")
+        config = json.loads((self.cache_root / "preprocessing.json").read_text())
+        if config["normalization"] != preprocessing_normalization:
+            raise PreprocessingMismatchError("Requested preprocessing normalization does not match cache metadata")
+        manifest = json.loads((self.cache_root / view / "validation_manifest.json").read_text())
+        self.subjects = manifest["subjects"]
+        for sid in self.subjects:
+            if not (self.cache_root / "completion" / "validation" / f"{sid}.json").is_file():
+                raise ValueError(f"Subject cache incomplete: missing completion marker for {sid}")
+            if not subject_cache_path(self.cache_root, view, "validation", sid).is_file():
+                raise FileNotFoundError(f"Required validation cache missing for {sid}")
+
+    def __len__(self):
+        return len(self.subjects)
+
+    def __getitem__(self, index):
+        sid = self.subjects[index]
+        payload = load_subject_cache_file(
+            subject_cache_path(self.cache_root, self.view, "validation", sid),
+            sid, self.view, self.preprocessing_normalization, allow_unlabeled=True)
+        if payload.get("split") != "validation":
+            raise ValueError("Expected an official validation cache")
+        images = payload["images"].float()
+        if self.preprocessing_normalization == "minmax":
+            images = images / 255.0
+        return images, {"sid": sid, "xyz": payload["xyz"], "split": "validation"}
+
+
 def collate_training_subjects(batch):
     images, labels, metadata = zip(*batch)
     return torch.stack(images), torch.stack(labels), list(metadata)
+
+
+def build_subject_loaders(train_ds, val_ds, view, batch_size_subjects,
+                          eval_batch_subjects, g, loader_options, patient_sampler=None):
+    """Weight training patients only; evaluation always traverses natural membership."""
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size_subjects,
+        shuffle=patient_sampler is None,
+        sampler=patient_sampler,
+        drop_last=False,
+        worker_init_fn=seed_worker,
+        generator=g,
+        collate_fn=collate_training_subjects,
+        **loader_options,
+    )
+    train_eval_ds = ViewSubset(train_ds, list(range(len(train_ds))), view)
+    train_eval_loader = DataLoader(
+        train_eval_ds, batch_size=eval_batch_subjects, shuffle=False,
+        collate_fn=collate_training_subjects, **loader_options
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=eval_batch_subjects,
+        shuffle=False,
+        collate_fn=collate_training_subjects,
+        **loader_options,
+    )
+
+    return train_loader, train_eval_loader, val_loader
 
 
 class ViewSubset(Dataset):
@@ -1149,6 +1289,22 @@ def load_experiment_from_yaml(config_path: str) -> Dict:
     raw["size_aware_bce"] = bce_defaults
     raw["foreground_dice"] = dice_defaults
 
+    normalization = raw.get("preprocessing_normalization", "minmax")
+    if normalization not in {"minmax", "zscore"}:
+        raise ValueError("preprocessing_normalization must be minmax or zscore")
+    preserve = raw.get("preserve_float32", normalization == "zscore")
+    if not isinstance(preserve, bool) or preserve != (normalization == "zscore"):
+        raise ValueError("preserve_float32 must be true for zscore and false for minmax")
+    raw["preprocessing_normalization"] = normalization
+    raw["preserve_float32"] = preserve
+    enabled = raw.get("lesion_volume_sampling", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("lesion_volume_sampling must be a boolean")
+    raw["lesion_volume_sampling"] = enabled
+    raw.setdefault("lesion_sampling_classes", ["ET", "TC"])
+    raw.setdefault("lesion_sampling_gamma", 0.5)
+    raw.setdefault("lesion_sampling_max_weight", 4.0)
+    validate_sampling_options(raw["lesion_sampling_classes"], raw["lesion_sampling_gamma"], raw["lesion_sampling_max_weight"])
     cache_root = raw.get("cache_root")
     if cache_root is not None:
         if not isinstance(cache_root, str) or not cache_root.strip():
@@ -1163,6 +1319,8 @@ def load_experiment_from_yaml(config_path: str) -> Dict:
     if cache_required and raw["cache_root"] is None:
         raise ValueError("cache_required=true requires cache_root")
     raw["cache_required"] = cache_required
+    if normalization == "zscore" and not cache_required:
+        raise ValueError("zscore requires cache_required=true and a float32 cache")
 
     data_root = raw["data_root"]
     if data_root is None:
@@ -1441,6 +1599,7 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
             cache_root=cache_root,
             cache_required=cache_required,
             label_format=exp_cfg["label_format"],
+            preprocessing_normalization=exp_cfg.get("preprocessing_normalization", "minmax"),
         )
         train_subjects.append(dset)
     if not train_subjects:
@@ -1456,6 +1615,7 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
         cache_root=cache_root,
         cache_required=cache_required,
         label_format=exp_cfg["label_format"],
+        preprocessing_normalization=exp_cfg.get("preprocessing_normalization", "minmax"),
     )
     print(f"Train subjects: {len(train_ds)} | Val subjects: {len(val_ds)}")
     if overfit_subjects is not None:
@@ -1496,6 +1656,35 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
     else:
         print("Loss configuration -> bce_dice (exact baseline reduction)")
 
+    sampling_keys = ("preprocessing_normalization", "preserve_float32", "lesion_volume_sampling",
+                     "lesion_sampling_classes", "lesion_sampling_gamma", "lesion_sampling_max_weight")
+    defaults = ("minmax", False, False, ["ET", "TC"], 0.5, 4.0)
+    for key, default in zip(sampling_keys, defaults):
+        config[key] = exp_cfg.get(key, default)
+        if resume_from is not None and resume_checkpoint_config.get(key, default) != config[key]:
+            raise ValueError(f"Resume configuration mismatch for {key}; start a new run for ablations")
+    patient_sampler = None
+    if config["lesion_volume_sampling"]:
+        sampling_payload = [None]
+        if accelerator.is_main_process:
+            try:
+                records = collect_training_lesion_records(train_ds)
+                weights, statistics = compute_patient_weights(
+                    records, config["lesion_sampling_classes"], config["lesion_sampling_gamma"],
+                    config["lesion_sampling_max_weight"])
+                sampling_payload[0] = {"weights": weights, "statistics": statistics}
+            except Exception as exc:
+                sampling_payload[0] = {"error": str(exc)}
+        broadcast_object_list(sampling_payload, from_process=0)
+        if "error" in sampling_payload[0]:
+            raise ValueError(f"Lesion sampling initialization failed: {sampling_payload[0]['error']}")
+        weights = sampling_payload[0]["weights"]
+        statistics = sampling_payload[0]["statistics"]
+        config["lesion_sampling_statistics"] = statistics
+        patient_sampler = PatientWeightedSampler(weights, seed=SEED)
+        if accelerator.is_main_process:
+            print(sampling_summary(weights, statistics, config["lesion_sampling_max_weight"]))
+
     if accelerator.is_main_process:
         with open(hyperparams_path, "w", encoding="utf-8") as handle:
             yaml.safe_dump(config, handle, sort_keys=False)
@@ -1509,28 +1698,9 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
         "persistent_workers": True,
         "prefetch_factor": loader_prefetch_factor,
     }
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size_subjects,
-        shuffle=True,
-        drop_last=False,
-        worker_init_fn=seed_worker,
-        generator=g,
-        collate_fn=collate_training_subjects,
-        **loader_options,
-    )
-    train_eval_ds = ViewSubset(train_ds, list(range(len(train_ds))), view)
-    train_eval_loader = DataLoader(
-        train_eval_ds, batch_size=eval_batch_subjects, shuffle=False,
-        collate_fn=collate_training_subjects, **loader_options
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=eval_batch_subjects,
-        shuffle=False,
-        collate_fn=collate_training_subjects,
-        **loader_options,
-    )
+    train_loader, train_eval_loader, val_loader = build_subject_loaders(
+        train_ds, val_ds, view, batch_size_subjects, eval_batch_subjects,
+        g, loader_options, patient_sampler)
 
     print(f"Loss weights -> lambda_bce={lambda_bce}, lambda_dice={lambda_dice}")
 
@@ -1664,6 +1834,10 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
             disable=not accelerator.is_local_main_process,
         )
         for epoch in epoch_bar:
+            if patient_sampler is not None:
+                # Set prepared loader iteration too: DataLoaderShard forwards this
+                # epoch to the underlying sampler when iteration begins.
+                train_loader.set_epoch(epoch - 1)
             print(f"\nEpoch {epoch}/{epochs}")
             loss_metrics = {}
             tr_loss = train_epoch_snn_tbptt(model, train_loader, optimizer, accelerator,
@@ -2056,37 +2230,36 @@ def evaluate_3d_snn(model,
             (xs.shape[0], ys.shape[2]), dtype=torch.int64, device=xs.device
         )
         denominator = torch.zeros_like(intersection)
-        # t0=0 resets neuron states for every batch, including a shorter tail.
-        # Counting voxels in slice order is equivalent to reconstructing 3D.
+        predictions = [] if apply_postprocessing else None
+        # t0=0 resets neuron states; windows remain in anatomical order.
         for t0 in range(0, S, k):
             t1 = min(t0 + k, S)
-            x_win = xs[:, t0:t1, ...]                # (1,k,4,H,W)
-            logits = model(x_win, t0=t0)             # (1,3,k,H,W)
-            probs  = torch.sigmoid(logits).cpu().numpy()   # (1,3,k,H,W)
-            probs = np.transpose(probs, (0, 2, 1, 3, 4))   # (1,k,3,H,W)
-            preds_seq.append(probs[0])               # (k,3,H,W)
-        preds = np.concatenate(preds_seq, axis=0)     # (S,3,H,W)
-
-        # Reassemble to 3D
-        target_np = ys.cpu().numpy()[0]               # (S,3,H,W)
-        vol_pred = stack_back(preds, loader.dataset.view, xyz)   # (3,X,Y,Z)
-        vol_gt   = stack_back(target_np, loader.dataset.view, xyz)
-
-        # Binarize predictions; GT already {0,1}
-        vol_bin  = (vol_pred >= prob_threshold).astype(np.uint8)
-        vol_gtb  = vol_gt.astype(np.uint8)
-
-        # Dice per channel
-        K = vol_bin.shape[0]
-        d = []
-        for ch in range(K):
-            p = vol_bin[ch].reshape(-1).astype(np.uint8)
-            t = vol_gtb[ch].reshape(-1).astype(np.uint8)
-            inter = (p & t).sum()
-            denom = p.sum() + t.sum()
-            d.append((2 * inter + 1e-6) / (denom + 1e-6))
-        batch_dices = torch.tensor([d], dtype=torch.float64,
-                                    device=accelerator.device)
+            logits = model(xs[:, t0:t1, ...], t0=t0)  # (B,3,k,H,W)
+            predicted = torch.sigmoid(logits) >= prob_threshold
+            target = ys[:, t0:t1].permute(0, 2, 1, 3, 4).bool()
+            if apply_postprocessing:
+                predictions.append(predicted.cpu())
+            else:
+                intersection += (predicted & target).sum(dim=(2, 3, 4))
+                denominator += predicted.sum(dim=(2, 3, 4)) + target.sum(dim=(2, 3, 4))
+        if apply_postprocessing:
+            pred_seq = torch.cat(predictions, dim=2).permute(0, 2, 1, 3, 4).numpy()
+            target_seq = ys.cpu().numpy()
+            view = loader.dataset.view
+            height, width = xs.shape[-2:]
+            xyz = ((S, height, width) if view == "sagittal" else
+                   (height, S, width) if view == "coronal" else (height, width, S))
+            scores = []
+            for index in range(xs.shape[0]):
+                pred = stack_back(pred_seq[index], view, xyz)
+                truth = stack_back(target_seq[index], view, xyz)
+                pred = postprocess_brats_prediction(
+                    pred, min_component_sizes=min_component_sizes,
+                    closing_radius=closing_radius)
+                scores.append(dice_per_channel(pred, truth))
+            batch_dices = torch.as_tensor(np.asarray(scores), dtype=torch.float64, device=xs.device)
+        else:
+            batch_dices = (2 * intersection.double() + 1e-6) / (denominator.double() + 1e-6)
         gathered_dices = accelerator.gather_for_metrics(batch_dices)
         dices.extend(gathered_dices.cpu().numpy())
 
