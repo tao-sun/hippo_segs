@@ -1,5 +1,121 @@
 # hippo_segs
 
+## Running `snn_fptt.py`
+
+### 1. Create the environment
+
+The project is managed with [uv](https://docs.astral.sh/uv/). From the
+repository root, create the Python 3.9 environment and install the locked
+dependencies:
+
+```bash
+uv sync --frozen --python 3.9
+```
+
+### 2. Download and preprocess the BraTS data
+
+Download the BraTS dataset and place its original ZIP archives in a dedicated
+input directory. The archives do not need to be extracted: the preprocessing
+script reads subjects directly from the ZIP files, processes one subject at a
+time, and writes training-ready `.pt` cache files.
+
+Run the preprocessing separately for every dataset or preprocessing variant.
+Keep different BraTS releases in dedicated input directories. The same input
+directory may be reused to compare preprocessing variants, but every dataset
+and normalization method must have its own `--cache-root`. Multiple anatomical
+views may share one cache root because each view is stored in its own
+subdirectory.
+
+For the current BraTS24 experiments, we are testing foreground Z-score
+normalization instead of the previous min-max normalization. The normalized
+values are kept as `float32` rather than being quantized to `uint8`:
+
+```bash
+uv run python data/preprocess_brats24.py \
+  --input /path/to/folder-containing-brats24-zips \
+  --input-mode archives \
+  --cache-root /path/to/BRATS2024_cache_zscore \
+  --preprocessing-normalization zscore \
+  --preserve-float32 \
+  --view sagittal \
+  --workers 1
+```
+
+Replace `sagittal` with `axial` or `coronal`, or pass multiple views after
+`--view`, when required by the experiment. Normalization is applied to each
+3D modality before view extraction. The preprocessing command is restartable:
+completed subjects are validated and skipped when it is run again with the
+same configuration.
+
+The options in the training YAML must match the cache. For the legacy
+min-max/`uint8` baseline, use
+`--preprocessing-normalization minmax`, omit `--preserve-float32`, and write to
+a different cache directory.
+
+For already preprocessed legacy datasets, `build_brats_cache.py` can still be
+used to convert the existing files to the subject-cache format. The direct
+`data/preprocess_brats24.py` ZIP-to-cache workflow above is recommended for
+BraTS24.
+
+### 3. Configure the experiment
+
+Edit `experiments_snn_fptt.yaml` before starting the training. At minimum,
+choose the experiment name, validation fold, anatomical view, cache location,
+model, batch size, learning rate, and number of epochs.
+
+For the Z-score cache created above, the relevant data options are:
+
+```yaml
+data_root: null
+cache_root: /path/to/BRATS2024_cache_zscore
+cache_required: true
+label_format: brats24
+view: sagittal
+val_fold: 1
+
+preprocessing_normalization: zscore
+preserve_float32: true
+```
+
+Keeping `cache_required: true` is recommended because it prevents training
+from silently falling back to slower source-file loading. `cache_root` must
+point to the output of the matching preprocessing run. With a required cache,
+`data_root` is not used as a separate image source and may be set to `null`;
+the loader then uses `cache_root` for dataset discovery as well. A real
+`data_root` is only needed when cache fallback is allowed or when using an
+uncached legacy dataset.
+
+The main experimental switches are:
+
+```yaml
+# Weight the probability of selecting training patients according to lesion
+# volume. Sampling changes which patients are seen during an epoch, but not
+# the total number of draws per epoch.
+lesion_volume_sampling: true
+lesion_sampling_classes: [ET, TC]
+lesion_sampling_gamma: 0.5
+lesion_sampling_max_weight: 4.0
+
+# true enables FPTT; false uses plain TBPTT and ignores the FPTT parameters.
+use_fptt: true
+
+# Postprocess thresholded prediction volumes during evaluation.
+apply_postprocessing: true
+
+# Minimum connected-component sizes, in voxels, in ET, TC, WT order.
+# Use non-zero values to remove components smaller than these thresholds.
+min_component_sizes: [50, 50, 50]
+closing_radius: 1
+```
+
+Set `lesion_volume_sampling: false`, `use_fptt: false`, or
+`apply_postprocessing: false` to disable the corresponding feature. When
+postprocessing is disabled, `min_component_sizes` and `closing_radius` do not
+affect predictions. Postprocessing is applied only to predictions; the ground
+truth is never modified.
+
+`loader_workers` is configured per Accelerate process. For example, four GPU
+processes with `loader_workers: 2` create eight DataLoader workers in total.
 ## Learning-rate scheduling and resume
 
 Training schedulers advance once per epoch, regardless of the number of GPUs.
@@ -32,52 +148,26 @@ These settings are read at startup; an already running process keeps its loaded
 code and configuration. Measure evaluation time and memory on the target GPUs
 before assuming a speedup from a larger batch.
 
-## BraTS24 preprocessing and sampling
+### 4. Start the training
 
-See [the preprocessing and ablation guide](BRATS_PREPROCESSING.md)
-for ZIP/directory input, float32 Z-score caches, safe resume and independent
-patient lesion-volume sampling. Legacy minmax/uint8 remains the default.
+Run a single-process experiment from the repository root with:
 
 ```bash
-.venv/bin/python data/preprocess_brats24.py \
-  --input /path/BraTS2024.zip \
-  --cache-root /path/BRATS2024_cache_zscore \
-  --preprocessing-normalization zscore --preserve-float32 \
-  --view sagittal --workers 1
+uv run accelerate launch --num_processes 1 \
+  snn_fptt.py --config experiments_snn_fptt.yaml
 ```
 
-The normalization is performed on each 3D modality before view extraction.
-Use a new cache directory for each preprocessing configuration.
-
-## BraTS subject cache
-
-`snn_fptt.py` can read one lossless uint8 `.pt` file per subject instead of
-opening every modality PNG and the NIfTI segmentation at every epoch. Build
-the cache once, separately from training:
+For multi-GPU training, set the number of processes to the number of GPUs and
+add `--multi_gpu`, for example:
 
 ```bash
-.venv/bin/python build_brats_cache.py \
-  --data-root /gpfs/scratch1/shared/apiaghiardelli/BRATS2023_preprocessed/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData \
-  --cache-root /gpfs/scratch1/shared/apiaghiardelli/BRATS2023_subject_cache \
-  --view sagittal \
-  --workers 4
+uv run accelerate launch --multi_gpu --num_processes 4 \
+  snn_fptt.py --config experiments_snn_fptt.yaml
 ```
 
-The command is restartable. It validates and skips complete cache files,
-rebuilds incompatible files, writes each subject atomically, and creates
-`<cache-root>/<view>/manifest.json`. Use `--overwrite` to rebuild every
-subject deliberately.
+The supplied `snn_fptt.job` provides the equivalent SLURM workflow. Its first
+argument may be used to select a YAML file other than the default:
 
-Enable the completed cache in `experiments_snn_fptt.yaml`:
-
-```yaml
-cache_root: /gpfs/scratch1/shared/apiaghiardelli/BRATS2023_subject_cache
-cache_required: true
-loader_workers: 2
-loader_prefetch_factor: 1
+```bash
+sbatch snn_fptt.job /path/to/experiment.yaml
 ```
-
-`loader_workers` is per Accelerate process. With four GPUs, two workers means
-eight DataLoader workers in total. Cached and original loading return the
-same float32 images, ET/TC/WT labels, and metadata, so existing training
-checkpoints remain compatible.

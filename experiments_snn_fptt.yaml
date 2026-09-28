@@ -1,5 +1,7 @@
 name: brats24_sagittal_fold1_VSS_fptt
-data_root: /home/aurora/data/BRATS2024_preprocessed/BraTS2024TrainingData
+data_root: /gpfs/scratch1/shared/apiaghiardelli/BRATS2024
+cache_root: /gpfs/scratch1/shared/apiaghiardelli/BRATS2024_subject_cache_zscore
+cache_required: true
 label_format: brats24
 val_fold: 1
 view: sagittal
@@ -18,15 +20,14 @@ resume_from: null
 resume_scheduler: false
 scheduler: reduce_plateau  # cosine or reduce_plateau
 # Independent ablations: minmax/false reproduces the old input and sampling.
-preprocessing_normalization: minmax  # zscore requires a new float32 cache
-preserve_float32: false             # true with zscore
-lesion_volume_sampling: false
+preprocessing_normalization: zscore  # zscore requires a new float32 cache
+preserve_float32: true             # true with zscore
+lesion_volume_sampling: true
 lesion_sampling_classes: [ET, TC]
 lesion_sampling_gamma: 0.5
 lesion_sampling_max_weight: 4.0
 # Cache from build_brats_cache.py (legacy) or data/preprocess_brats24.py.
-cache_root: /home/aurora/data/BRATS2024_subject_cache
-cache_required: true
+
 loader_workers: 2          # one GPU; applies to both train and validation loaders
 loader_prefetch_factor: 1  # subjects are large, so keep RAM usage bounded
 batch_size_subjects: 8
@@ -42,7 +43,7 @@ rho_fptt: 0.0
 lambda_fptt: 1.5
 lambda_bce: 0.5
 lambda_dice: 0.5
-loss_function: "wbce_fdice"  # bce_dice or wbce_fdice
+loss_function: "bce_dice"  # bce_dice or wbce_fdice
 size_aware_bce:
   gamma: 0.5
   max_weight: 5.0
@@ -53,9 +54,9 @@ eval_every: 1
 eval_batch_slices: 16
 prob_threshold: 0.5
 # Applied only to thresholded prediction volumes; ground truth is untouched.
-apply_postprocessing: false
+apply_postprocessing: true
 # ET, TC, WT minimum connected-component sizes in voxels.
-min_component_sizes: [0, 20, 50]
+min_component_sizes: [50, 50, 50]
 closing_radius: 1
-subjects_per_fold: 40  # null/commented = use all subjects; otherwise first n per train/val fold
+subjects_per_fold:   # null/commented = use all subjects; otherwise first n per train/val fold
 # overfit_subjects: 5
