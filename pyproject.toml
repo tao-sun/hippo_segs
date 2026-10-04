@@ -6,12 +6,13 @@ readme = "README.md"
 authors = [
     { name = "auryghia", email = "auryghia05@gmail.com" }
 ]
-requires-python = ">=3.9"
+requires-python = ">=3.10,<3.11"
 dependencies = [
     "accelerate>=1.10,<2",
     "mamba-ssm",
     "matplotlib>=3.9.4",
     "nibabel>=5.3.3",
+    "nnunetv2==2.8.1",
     "numpy>=2.0.2",
     "pillow>=11.3.0",
     "pyyaml>=6.0.3",
@@ -31,7 +32,15 @@ dev = [
 ]
 
 [tool.uv]
-package = false
+package = true
 
 [tool.uv.sources]
-mamba-ssm = { url = "https://github.com/state-spaces/mamba/releases/download/v2.2.6.post3/mamba_ssm-2.2.6.post3%2Bcu12torch2.5cxx11abiFALSE-cp39-cp39-linux_x86_64.whl" }
+mamba-ssm = { url = "https://github.com/state-spaces/mamba/releases/download/v2.2.6.post3/mamba_ssm-2.2.6.post3%2Bcu12torch2.5cxx11abiFALSE-cp310-cp310-linux_x86_64.whl" }
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["snn_nnunet"]
+py-modules = ["model", "spike_neurons", "spikmamba", "surrogate"]
