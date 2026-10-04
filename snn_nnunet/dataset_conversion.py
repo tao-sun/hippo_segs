@@ -151,7 +151,7 @@ def _check_formatted_source(source: Path, dataset_id: int, dataset_name: str) ->
     metadata = json.loads((source / "dataset.json").read_text())
     if int(match["id"]) != dataset_id or match["name"] != dataset_name:
         raise ValueError("Formatted dataset ID/name does not match the request")
-    if metadata.get("name") != dataset_name:
+    if "name" in metadata and metadata["name"] != dataset_name:
         raise ValueError("Formatted dataset.json name does not match the request")
 
 

@@ -7,6 +7,7 @@ import shutil
 import nibabel as nib
 import numpy as np
 import pytest
+from nnunetv2.dataset_conversion.generate_dataset_json import generate_dataset_json
 
 from snn_nnunet.dataset_conversion import (
     convert_or_register_dataset,
@@ -185,6 +186,35 @@ def test_formatted_dataset_id_and_name_must_match_request(tmp_path):
         convert_or_register_dataset(source, 13, "GLI", raw)
 
     assert not raw.exists()
+
+
+def test_native_formatted_dataset_without_optional_json_name_registers_unchanged(tmp_path):
+    extracted = tmp_path / "extracted"
+    _subject(extracted, "Case-A")
+    source = convert_or_register_dataset(extracted, 12, "GLI", tmp_path / "first_raw")
+    generate_dataset_json(
+        str(source),
+        {"0": "T1", "1": "T1ce", "2": "T2", "3": "FLAIR"},
+        {
+            "background": 0,
+            "whole_tumor": (1, 2, 3),
+            "tumor_core": (1, 3),
+            "enhancing_tumor": 3,
+        },
+        1,
+        ".nii.gz",
+        regions_class_order=(2, 1, 3),
+    )
+    assert "name" not in json.loads((source / "dataset.json").read_text())
+    raw = tmp_path / "second_raw"
+
+    destination = convert_or_register_dataset(source, 12, "GLI", raw)
+
+    assert destination == raw / "Dataset012_GLI"
+    assert is_nnunet_raw_dataset(destination)
+    assert {p.relative_to(source): p.read_bytes() for p in source.rglob("*") if p.is_file()} == {
+        p.relative_to(destination): p.read_bytes() for p in destination.rglob("*") if p.is_file()
+    }
 
 
 def test_interrupted_formatted_copy_leaves_no_partial_destination(tmp_path, monkeypatch):
