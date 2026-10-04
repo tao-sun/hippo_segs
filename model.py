@@ -243,8 +243,8 @@ class SNNBraTS(nn.Module):
                  residual_connections: bool = True,
                  dwconv2d_spiking: bool = True,
                  patch_embedding_spiking: bool = False,
-                 vss_output_spiking: bool = True,
-                 input_skip: bool = False):
+                 input_skip: bool = False,
+                 vss_output_spiking: bool = True):
         super().__init__()
         if isinstance(patch_size, bool) or not isinstance(patch_size, int) or patch_size <= 0:
             raise ValueError("patch_size must be a positive integer")

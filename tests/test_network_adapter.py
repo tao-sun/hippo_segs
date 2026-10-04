@@ -79,6 +79,18 @@ def test_legacy_factory_retains_shared_factory_defaults():
     assert model.input_skip is False
 
 
+def test_direct_orig_constructor_keeps_positional_input_skip_slot():
+    model = SNNBraTS(3, None, 16, "auto", 4, True, True, True, False, True)
+    assert model.input_skip is True
+    assert model.vss_output_spiking is True
+
+
+def test_legacy_factory_keeps_positional_input_skip_slot():
+    model = build_legacy_model("orig", 3, 4, True, True, True, False, True)
+    assert model.input_skip is True
+    assert model.vss_output_spiking is True
+
+
 @pytest.mark.parametrize("factory", [build_model, build_legacy_model])
 def test_factories_reject_unknown_names(factory):
     with pytest.raises(ValueError, match="Unknown model"):

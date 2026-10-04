@@ -1364,8 +1364,8 @@ def build_model(model_name, out_channels=3, patch_size=4,
                 residual_connections=True,
                 dwconv2d_spiking=True,
                 patch_embedding_spiking=False,
-                vss_output_spiking=True,
-                input_skip=False):
+                input_skip=False,
+                vss_output_spiking=True):
     return build_shared_model(
         model_name=model_name,
         out_channels=out_channels,
