@@ -68,12 +68,16 @@ class _SpikMambaEncoderAdapter(nn.Module):
         residual_connections: bool = True,
         dwconv2d_spiking: bool = True,
         patch_embedding_spiking: bool = False,
+        vss_output_spiking: bool = True,
     ) -> None:
         super().__init__()
+        if not isinstance(vss_output_spiking, bool):
+            raise TypeError("vss_output_spiking must be a boolean")
         self.in_channels = int(in_channels)
         self.out_channels = int(out_channels)
         self.channels = self.out_channels
         self.patch_size = int(patch_size)
+        self.vss_output_spiking = vss_output_spiking
         self.patch_embed = Spiking2DPatchEmbedding(
             in_channels=self.in_channels,
             embed_dim=self.out_channels,
@@ -121,7 +125,8 @@ class _SpikMambaEncoderAdapter(nn.Module):
         )
 
         x = self.post_norm(x)
-        x, _ = self.post_plif(x, time_step)
+        if self.vss_output_spiking:
+            x, _ = self.post_plif(x, time_step)
         return x
 
 
@@ -135,7 +140,8 @@ class ConvBlock(nn.Module):
                  patch_size=4, linear_projection=True,
                  residual_connections=True,
                  dwconv2d_spiking=True,
-                 patch_embedding_spiking=False):
+                 patch_embedding_spiking=False,
+                 vss_output_spiking=True):
         super().__init__()
         self.dropout = float(dropout)
         self.normalization = normalization
@@ -155,6 +161,7 @@ class ConvBlock(nn.Module):
                 residual_connections=residual_connections,
                 dwconv2d_spiking=dwconv2d_spiking,
                 patch_embedding_spiking=patch_embedding_spiking,
+                vss_output_spiking=vss_output_spiking,
             )
         else:
             self.conv = nn.Conv2d(
@@ -236,6 +243,7 @@ class SNNBraTS(nn.Module):
                  residual_connections: bool = True,
                  dwconv2d_spiking: bool = True,
                  patch_embedding_spiking: bool = False,
+                 vss_output_spiking: bool = True,
                  input_skip: bool = False):
         super().__init__()
         if isinstance(patch_size, bool) or not isinstance(patch_size, int) or patch_size <= 0:
@@ -248,6 +256,8 @@ class SNNBraTS(nn.Module):
             raise TypeError("dwconv2d_spiking must be a boolean")
         if not isinstance(patch_embedding_spiking, bool):
             raise TypeError("patch_embedding_spiking must be a boolean")
+        if not isinstance(vss_output_spiking, bool):
+            raise TypeError("vss_output_spiking must be a boolean")
         if not isinstance(input_skip, bool):
             raise TypeError("input_skip must be a boolean")
         self.input_skip = input_skip
@@ -256,6 +266,7 @@ class SNNBraTS(nn.Module):
         self.residual_connections = residual_connections
         self.dwconv2d_spiking = dwconv2d_spiking
         self.patch_embedding_spiking = patch_embedding_spiking
+        self.vss_output_spiking = vss_output_spiking
         self.encoder_scale = self.patch_size ** 3
         # Encoder
         spik_mamba_kwargs = {
@@ -268,6 +279,7 @@ class SNNBraTS(nn.Module):
             "residual_connections": self.residual_connections,
             "dwconv2d_spiking": self.dwconv2d_spiking,
             "patch_embedding_spiking": self.patch_embedding_spiking,
+            "vss_output_spiking": self.vss_output_spiking,
         }
         self.conv_block1 = ConvBlock(
             4,
@@ -533,3 +545,32 @@ class SNNBraTSUNetShallow(nn.Module):
     def detach_states(self):
         for m in self.modules():
             if hasattr(m,"detach") and callable(m.detach): m.detach()
+
+
+def build_model(model_name: str, out_channels: int = 3, patch_size: int = 4,
+                linear_projection: bool = True,
+                residual_connections: bool = True,
+                dwconv2d_spiking: bool = True,
+                patch_embedding_spiking: bool = False,
+                vss_output_spiking: bool = True,
+                input_skip: bool = False) -> nn.Module:
+    if input_skip and model_name != "orig":
+        raise ValueError("input_skip=true is supported only for model: orig")
+    if model_name == "orig":
+        return SNNBraTS(
+            out_channels=out_channels,
+            patch_size=patch_size,
+            linear_projection=linear_projection,
+            residual_connections=residual_connections,
+            dwconv2d_spiking=dwconv2d_spiking,
+            patch_embedding_spiking=patch_embedding_spiking,
+            vss_output_spiking=vss_output_spiking,
+            input_skip=input_skip,
+        )
+    if model_name == "shallow":
+        return SNNBraTSUNetShallow(out_channels=out_channels)
+    if model_name == "medium":
+        return SNNBraTSUNetMedium(out_channels=out_channels)
+    if model_name == "deep":
+        return SNNBraTSUNetDeep(out_channels=out_channels)
+    raise ValueError(f"Unknown model: {model_name}")

@@ -45,7 +45,7 @@ from postprocessing import (
 )
 # ==== use your spiking UNet-like model ====
 # SNNBraTS: forward(x_win[B,k,4,H,W], t0) -> (B, out_channels, k, H, W)
-from model import SNNBraTS, SNNBraTSUNetShallow, SNNBraTSUNetMedium, SNNBraTSUNetDeep, print_model_info  # mirrors your SNN implementation with PLIF nodes
+from model import build_model as build_shared_model, print_model_info
 
 # ------------------ SEEDING ------------------
 SEED = 2025
@@ -1364,26 +1364,19 @@ def build_model(model_name, out_channels=3, patch_size=4,
                 residual_connections=True,
                 dwconv2d_spiking=True,
                 patch_embedding_spiking=False,
+                vss_output_spiking=True,
                 input_skip=False):
-    if input_skip and model_name != "orig":
-        raise ValueError("input_skip=true is supported only for model: orig")
-    if model_name == "orig":
-        return SNNBraTS(
-            out_channels=out_channels,
-            patch_size=patch_size,
-            linear_projection=linear_projection,
-            residual_connections=residual_connections,
-            dwconv2d_spiking=dwconv2d_spiking,
-            patch_embedding_spiking=patch_embedding_spiking,
-            input_skip=input_skip,
-        )
-    if model_name == "shallow":
-        return SNNBraTSUNetShallow(out_channels=out_channels)
-    if model_name == "medium":
-        return SNNBraTSUNetMedium(out_channels=out_channels)
-    if model_name == "deep":
-        return SNNBraTSUNetDeep(out_channels=out_channels)
-    raise ValueError(f"Unknown model: {model_name}")
+    return build_shared_model(
+        model_name=model_name,
+        out_channels=out_channels,
+        patch_size=patch_size,
+        linear_projection=linear_projection,
+        residual_connections=residual_connections,
+        dwconv2d_spiking=dwconv2d_spiking,
+        patch_embedding_spiking=patch_embedding_spiking,
+        vss_output_spiking=vss_output_spiking,
+        input_skip=input_skip,
+    )
 
 
 def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
