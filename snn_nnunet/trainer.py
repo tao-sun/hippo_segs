@@ -3,15 +3,18 @@
 import os
 
 import torch
+from torch import autocast
 from torch import nn
+from torch import distributed as dist
 from torch._dynamo import OptimizedModule
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
+from nnunetv2.utilities.helpers import dummy_context
 from nnunetv2.utilities.plans_handling.plans_handler import ConfigurationManager, PlansManager
 
-from snn_nnunet import network_adapter
-from snn_nnunet.network_adapter import SNNConfig, SNNnnUNetAdapter
+from snn_nnunet import fptt, network_adapter
+from snn_nnunet.network_adapter import SNNConfig, SNNnnUNetAdapter, slice_temporal_window
 
 
 _EPOCH_METRICS = (
@@ -89,14 +92,90 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
             raise TypeError("Trainer network is not an SNNnnUNetAdapter")
         return network
 
+    def initialize(self):
+        super().initialize()
+        if self.snn_config.use_fptt:
+            fptt.init_running_params(self._get_adapter())
+
+    def train_step(self, batch: dict) -> dict:
+        data = batch["data"].to(self.device, non_blocking=True)
+        target = batch["target"].to(self.device, non_blocking=True)
+        config = self.snn_config
+        axis = config.temporal_axis
+        length = data.shape[2 + axis]
+        adapter = self._get_adapter()
+        task_sum = 0.0
+        regularization_sum = 0.0
+        total_sum = 0.0
+        updates = 0
+
+        for t0 in range(0, length, config.k):
+            end = min(t0 + config.k, length)
+            window_length = end - t0
+            data_window = slice_temporal_window(data, t0, end, axis)
+            target_window = slice_temporal_window(target, t0, end, axis)
+            self.optimizer.zero_grad(set_to_none=True)
+            with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
+                logits = self.network(data_window, t0=t0, chunk_size=window_length)
+                task_loss = self.loss(logits, target_window)
+                regularization = torch.zeros_like(task_loss)
+                if config.use_fptt:
+                    regularization = fptt.regularizer_loss(
+                        adapter, regularization, config.fptt_alpha,
+                        config.fptt_rho, config.fptt_lambda,
+                    )
+                total_loss = task_loss + regularization
+
+            if self.grad_scaler is not None:
+                self.grad_scaler.scale(total_loss).backward()
+                self.grad_scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+                self.grad_scaler.step(self.optimizer)
+                self.grad_scaler.update()
+            else:
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+                self.optimizer.step()
+
+            if config.use_fptt:
+                fptt.update_running_params(adapter, config.fptt_alpha, config.fptt_beta)
+            adapter.detach_states()
+            task_sum += float(task_loss.detach())
+            regularization_sum += float(regularization.detach())
+            total_sum += float(total_loss.detach())
+            updates += 1
+
+        return {
+            "loss": total_sum / updates,
+            "task_loss": task_sum / updates,
+            "fptt_regularization": regularization_sum / updates,
+            "total_loss": total_sum / updates,
+            "optimizer_updates": updates,
+            "k": config.k,
+            "fptt_mode": config.use_fptt,
+        }
+
     def on_train_epoch_end(self, train_outputs: list[dict]):
+        if self.snn_config.use_fptt:
+            fptt.reset_running_params(self._get_adapter())
         super().on_train_epoch_end(train_outputs)
-        native_loss = float(self.logger.get_value("train_losses", self.current_epoch))
+        keys = ("task_loss", "fptt_regularization", "total_loss")
+        local_updates = sum(int(row["optimizer_updates"]) for row in train_outputs)
+        local_sums = {
+            key: sum(float(row[key]) * int(row["optimizer_updates"]) for row in train_outputs)
+            for key in keys
+        }
+        if self.is_ddp:
+            gathered = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered, (local_updates, local_sums))
+        else:
+            gathered = [(local_updates, local_sums)]
+        global_updates = sum(item[0] for item in gathered)
         values = {
-            "task_losses": native_loss,
-            "fptt_regularization": 0.0,
-            "total_losses": native_loss,
-            "optimizer_updates": len(train_outputs),
+            "task_losses": sum(item[1]["task_loss"] for item in gathered) / global_updates,
+            "fptt_regularization": sum(item[1]["fptt_regularization"] for item in gathered) / global_updates,
+            "total_losses": sum(item[1]["total_loss"] for item in gathered) / global_updates,
+            "optimizer_updates": global_updates // len(gathered),
             "k": self.snn_config.k,
             "fptt_mode": self.snn_config.use_fptt,
         }

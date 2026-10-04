@@ -1,6 +1,7 @@
 """Native trainer construction contracts for the SNN adapter."""
 
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,7 @@ from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 from nnunetv2.utilities.find_objects import recursive_find_trainer_class_by_name
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 
-from snn_nnunet import network_adapter
+from snn_nnunet import fptt, network_adapter
 import snn_nnunet.trainer as trainer_module
 from snn_nnunet.prepare_plans import DEFAULT_SNN_CONFIG
 from snn_nnunet.trainer import nnUNetTrainerSNNFPTT
@@ -153,12 +154,192 @@ def test_custom_metrics_extend_native_local_logger_without_shortening_epoch(trai
 
 
 def test_completed_native_epoch_fills_all_custom_logger_lists(trainer):
-    trainer.on_train_epoch_end([{"loss": 1.0}, {"loss": 3.0}])
+    trainer.network = network_adapter.SNNnnUNetAdapter(trainer.snn_config, core=StatefulTinyCore())
+    fptt.init_running_params(trainer.network)
+    trainer.on_train_epoch_end([
+        {"loss": 1.0, "task_loss": 0.8, "fptt_regularization": 0.2,
+         "total_loss": 1.0, "optimizer_updates": 2},
+        {"loss": 3.0, "task_loss": 2.6, "fptt_regularization": 0.4,
+         "total_loss": 3.0, "optimizer_updates": 1},
+    ])
     logged = trainer.logger.get_checkpoint()
     assert logged["train_losses"] == [2.0]
-    assert logged["task_losses"] == [2.0]
-    assert logged["fptt_regularization"] == [0.0]
-    assert logged["total_losses"] == [2.0]
-    assert logged["optimizer_updates"] == [2]
+    assert logged["task_losses"] == [pytest.approx(1.4)]
+    assert logged["fptt_regularization"] == [pytest.approx(0.2666666667)]
+    assert logged["total_losses"] == [pytest.approx(1.6666666667)]
+    assert logged["optimizer_updates"] == [3]
     assert logged["k"] == [16]
     assert logged["fptt_mode"] == [True]
+
+
+class StatefulTinyCore(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.tensor(0.1))
+        self.state = None
+        self.starts = []
+        self.had_previous_state = []
+
+    def forward(self, x, t0):
+        self.starts.append(t0)
+        self.had_previous_state.append(self.state is not None and t0 != 0)
+        if t0 == 0:
+            self.state = None
+        logits = x[:, :, :3].movedim(1, 2) * self.weight
+        if self.state is not None:
+            logits = logits + self.state
+        self.state = logits.mean()
+        return logits
+
+    def detach_states(self):
+        if self.state is not None:
+            self.state = self.state.detach()
+
+
+class RecordingNetwork(torch.nn.Module):
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+        self.calls = []
+
+    def forward(self, x, *, t0, chunk_size):
+        self.calls.append((t0, chunk_size, x.shape))
+        return self.module(x, t0=t0, chunk_size=chunk_size)
+
+
+def prepare_window_trainer(trainer, monkeypatch, *, k=16, axis=0, use_fptt=False):
+    trainer.snn_config = replace(trainer.snn_config, k=k, temporal_axis=axis, use_fptt=use_fptt)
+    core = StatefulTinyCore()
+    adapter = network_adapter.SNNnnUNetAdapter(trainer.snn_config, core=core)
+    wrapper = RecordingNetwork(adapter)
+    monkeypatch.setattr(trainer_module, "DDP", RecordingNetwork)
+    trainer.network = wrapper
+    trainer.optimizer = torch.optim.SGD(wrapper.parameters(), lr=0.001)
+    trainer.grad_scaler = None
+    seen_targets = []
+
+    def loss(logits, target):
+        seen_targets.append(target.detach().clone())
+        return torch.nn.functional.mse_loss(logits, target)
+
+    trainer.loss = loss
+    return core, wrapper, seen_targets
+
+
+@pytest.mark.parametrize("k,updates", [(16, 8), (8, 16), (1, 128)])
+def test_train_step_updates_once_per_complete_window(trainer, monkeypatch, k, updates):
+    core, wrapper, targets = prepare_window_trainer(trainer, monkeypatch, k=k)
+    steps = []
+    original_step = trainer.optimizer.step
+
+    def step(*args, **kwargs):
+        steps.append(len(wrapper.calls))
+        return original_step(*args, **kwargs)
+
+    monkeypatch.setattr(trainer.optimizer, "step", step)
+    output = trainer.train_step({
+        "data": torch.ones(1, 4, 128, 1, 1),
+        "target": torch.zeros(1, 3, 128, 1, 1),
+    })
+
+    assert len(steps) == updates
+    assert steps == list(range(1, updates + 1))
+    assert [call[:2] for call in wrapper.calls] == [(i * k, k) for i in range(updates)]
+    assert core.starts == [i * k for i in range(updates)]
+    assert core.had_previous_state == [False] + [True] * (updates - 1)
+    assert core.state.grad_fn is None
+    assert len(targets) == updates
+    assert output["optimizer_updates"] == updates
+
+
+@pytest.mark.parametrize("axis", [0, 1, 2])
+def test_train_step_slices_native_target_axis_and_partial_final_window(trainer, monkeypatch, axis):
+    core, wrapper, targets = prepare_window_trainer(trainer, monkeypatch, axis=axis)
+    shape = [1, 1, 1, 1, 1]
+    shape[2 + axis] = 17
+    target = torch.arange(17, dtype=torch.float32).reshape(shape).expand(1, 3, *shape[2:]) / 100
+    data = torch.ones(1, 4, *shape[2:])
+
+    output = trainer.train_step({"data": data, "target": target})
+
+    assert [(t0, size) for t0, size, _ in wrapper.calls] == [(0, 16), (16, 1)]
+    assert [tuple(t.shape) for t in targets] == [tuple(target.narrow(2 + axis, 0, 16).shape),
+                                                   tuple(target.narrow(2 + axis, 16, 1).shape)]
+    torch.testing.assert_close(targets[0], target.narrow(2 + axis, 0, 16))
+    torch.testing.assert_close(targets[1], target.narrow(2 + axis, 16, 1))
+    assert core.starts == [0, 16]
+    assert output["optimizer_updates"] == 2
+
+
+def test_disabled_fptt_never_calls_auxiliary_functions(trainer, monkeypatch):
+    prepare_window_trainer(trainer, monkeypatch, use_fptt=False)
+    monkeypatch.setattr(trainer_module, "fptt", fptt, raising=False)
+    for name in ("init_running_params", "regularizer_loss", "update_running_params", "reset_running_params"):
+        monkeypatch.setattr(trainer_module.fptt, name, lambda *args, **kwargs: pytest.fail("FPTT was called"))
+    monkeypatch.setattr(nnUNetTrainer, "initialize", lambda self: setattr(self, "was_initialized", True))
+
+    trainer.initialize()
+    trainer.train_step({"data": torch.ones(1, 4, 17, 1, 1),
+                        "target": torch.zeros(1, 3, 17, 1, 1)})
+    trainer.on_train_epoch_end([{"loss": 1.0, "task_loss": 1.0,
+                                 "fptt_regularization": 0.0, "total_loss": 1.0,
+                                 "optimizer_updates": 2}])
+
+
+def test_epoch_metrics_reduce_window_sums_without_multiplying_ddp_update_count(trainer, monkeypatch):
+    trainer.snn_config = replace(trainer.snn_config, use_fptt=False)
+    trainer.is_ddp = True
+    monkeypatch.setattr(nnUNetTrainer, "on_train_epoch_end", lambda self, outputs: None)
+    monkeypatch.setattr(trainer_module.dist, "get_world_size", lambda: 2)
+
+    def gather(output, local):
+        output[:] = [local, (3, {"task_loss": 9.0,
+                                 "fptt_regularization": 3.0, "total_loss": 12.0})]
+
+    monkeypatch.setattr(trainer_module.dist, "all_gather_object", gather)
+    trainer.on_train_epoch_end([
+        {"loss": 1.0, "task_loss": 0.8, "fptt_regularization": 0.2,
+         "total_loss": 1.0, "optimizer_updates": 2},
+        {"loss": 3.0, "task_loss": 2.6, "fptt_regularization": 0.4,
+         "total_loss": 3.0, "optimizer_updates": 1},
+    ])
+
+    logged = trainer.logger.get_checkpoint()
+    assert logged["task_losses"] == [pytest.approx(2.2)]
+    assert logged["fptt_regularization"] == [pytest.approx(3.8 / 6)]
+    assert logged["total_losses"] == [pytest.approx(17 / 6)]
+    assert logged["optimizer_updates"] == [3]
+
+
+def test_train_step_uses_native_scaler_and_clipping_order_for_each_window(trainer, monkeypatch):
+    prepare_window_trainer(trainer, monkeypatch)
+    events = []
+    original_clip = torch.nn.utils.clip_grad_norm_
+
+    class RecordingScaler:
+        def scale(self, loss):
+            events.append("scale")
+            return loss
+
+        def unscale_(self, optimizer):
+            events.append("unscale")
+
+        def step(self, optimizer):
+            events.append("step")
+            optimizer.step()
+
+        def update(self):
+            events.append("update")
+
+    def clip(parameters, max_norm):
+        assert max_norm == 12
+        events.append("clip")
+        return original_clip(parameters, max_norm)
+
+    trainer.grad_scaler = RecordingScaler()
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", clip)
+    output = trainer.train_step({"data": torch.ones(1, 4, 17, 1, 1),
+                                 "target": torch.zeros(1, 3, 17, 1, 1)})
+
+    assert events == ["scale", "unscale", "clip", "step", "update"] * 2
+    assert output["optimizer_updates"] == 2

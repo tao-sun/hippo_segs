@@ -1,5 +1,9 @@
 import pytest
 import torch
+from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
+
+import snn_nnunet.fptt as fptt_module
+from test_trainer import prepare_window_trainer, trainer
 
 from snn_nnunet.fptt import (
     export_fptt_tensors,
@@ -96,3 +100,52 @@ def test_export_copies_cpu_tensors_and_restore_matches_each_parameter():
             assert tensor.device == parameter.device
             assert tensor.dtype == parameter.dtype
             torch.testing.assert_close(tensor, state[field][name].to(dtype=torch.float64))
+
+
+def test_enabled_fptt_initializes_then_regularizes_each_window_and_resets_before_native_epoch(
+    trainer, monkeypatch
+):
+    prepare_window_trainer(trainer, monkeypatch, use_fptt=True)
+    events = []
+    native_epoch = nnUNetTrainer.on_train_epoch_end
+
+    def native_initialize(self):
+        if self.was_initialized:
+            raise RuntimeError("already initialized")
+        events.append("native_initialize")
+        self.was_initialized = True
+
+    def native_on_train_epoch_end(self, outputs):
+        events.append("native_epoch")
+        return native_epoch(self, outputs)
+
+    monkeypatch.setattr(nnUNetTrainer, "initialize", native_initialize)
+    monkeypatch.setattr(nnUNetTrainer, "on_train_epoch_end", native_on_train_epoch_end)
+    for name in ("init_running_params", "regularizer_loss", "update_running_params", "reset_running_params"):
+        original = getattr(fptt_module, name)
+
+        def record(*args, _name=name, _original=original, **kwargs):
+            events.append(_name)
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(fptt_module, name, record)
+
+    trainer.initialize()
+    assert events == ["native_initialize", "init_running_params"]
+    with pytest.raises(RuntimeError, match="already initialized"):
+        trainer.initialize()
+    output = trainer.train_step({"data": torch.ones(1, 4, 128, 1, 1),
+                                 "target": torch.zeros(1, 3, 128, 1, 1)})
+    assert events.count("regularizer_loss") == 8
+    assert events.count("update_running_params") == 8
+    assert events.count("reset_running_params") == 0
+    assert output["optimizer_updates"] == 8
+    assert output["fptt_mode"] is True
+    assert output["total_loss"] == pytest.approx(
+        output["task_loss"] + output["fptt_regularization"]
+    )
+
+    trainer.on_train_epoch_end([output])
+    assert events[-2:] == ["reset_running_params", "native_epoch"]
+    assert events.count("reset_running_params") == 1
+    assert trainer.logger.get_checkpoint()["optimizer_updates"] == [8]
