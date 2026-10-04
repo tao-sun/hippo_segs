@@ -1,6 +1,7 @@
 """Plans-driven SNN trainer that retains nnU-Net's native pipeline."""
 
 import os
+import tempfile
 
 import torch
 from torch import autocast
@@ -24,6 +25,9 @@ _EPOCH_METRICS = (
     "optimizer_updates",
     "k",
     "fptt_mode",
+)
+_CHECKPOINT_CONFIG_FIELDS = (
+    "use_fptt", "k", "fptt_alpha", "fptt_beta", "fptt_rho", "fptt_lambda",
 )
 
 
@@ -96,6 +100,57 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
         super().initialize()
         if self.snn_config.use_fptt:
             fptt.init_running_params(self._get_adapter())
+
+    def save_checkpoint(self, filename: str) -> None:
+        super().save_checkpoint(filename)
+        if self.local_rank != 0 or self.disable_checkpointing:
+            return
+
+        checkpoint = torch.load(filename, map_location="cpu", weights_only=False)
+        state = {name: getattr(self.snn_config, name) for name in _CHECKPOINT_CONFIG_FIELDS}
+        if self.snn_config.use_fptt:
+            state.update(fptt.export_fptt_tensors(self._get_adapter()))
+        checkpoint["fptt_state"] = state
+
+        directory = os.path.dirname(os.path.abspath(filename))
+        descriptor, temporary = tempfile.mkstemp(prefix=".checkpoint-", suffix=".pth", dir=directory)
+        os.close(descriptor)
+        try:
+            torch.save(checkpoint, temporary)
+            os.replace(temporary, filename)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def load_checkpoint(self, filename_or_checkpoint: dict | str) -> None:
+        if isinstance(filename_or_checkpoint, str):
+            checkpoint = torch.load(filename_or_checkpoint, map_location="cpu", weights_only=False)
+        else:
+            checkpoint = filename_or_checkpoint
+        state = checkpoint.get("fptt_state")
+        if not isinstance(state, dict):
+            raise ValueError("Checkpoint is missing fptt_state")
+        for name in _CHECKPOINT_CONFIG_FIELDS:
+            if name not in state or state[name] != getattr(self.snn_config, name):
+                raise ValueError(f"Checkpoint {name} does not match the current SNN plans")
+        if self.snn_config.use_fptt and not all(
+            name in state for name in ("avg_weights", "lambdas")
+        ):
+            raise ValueError("Checkpoint is missing FPTT tensors")
+
+        if isinstance(filename_or_checkpoint, str):
+            super().load_checkpoint(filename_or_checkpoint)
+        else:
+            # nnU-Net 2.8.1 advertises dict loads but leaves its local
+            # checkpoint variable unset on that path. A file keeps all native
+            # model, optimizer, logger, and scaler restoration in super().
+            with tempfile.NamedTemporaryFile(suffix=".pth") as temporary:
+                torch.save(checkpoint, temporary.name)
+                super().load_checkpoint(temporary.name)
+        if self.snn_config.use_fptt:
+            adapter = self._get_adapter()
+            fptt.init_running_params(adapter)
+            fptt.restore_fptt_tensors(adapter, state)
 
     def train_step(self, batch: dict) -> dict:
         data = batch["data"].to(self.device, non_blocking=True)
