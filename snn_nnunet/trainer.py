@@ -108,6 +108,7 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
         regularization_sum = 0.0
         total_sum = 0.0
         updates = 0
+        windows = 0
 
         for t0 in range(0, length, config.k):
             end = min(t0 + config.k, length)
@@ -130,26 +131,31 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
                 self.grad_scaler.scale(total_loss).backward()
                 self.grad_scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+                scale_before = self.grad_scaler.get_scale()
                 self.grad_scaler.step(self.optimizer)
                 self.grad_scaler.update()
+                did_step = self.grad_scaler.get_scale() >= scale_before
             else:
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
                 self.optimizer.step()
+                did_step = True
 
-            if config.use_fptt:
+            if config.use_fptt and did_step:
                 fptt.update_running_params(adapter, config.fptt_alpha, config.fptt_beta)
             adapter.detach_states()
             task_sum += float(task_loss.detach())
             regularization_sum += float(regularization.detach())
             total_sum += float(total_loss.detach())
-            updates += 1
+            updates += int(did_step)
+            windows += 1
 
         return {
-            "loss": total_sum / updates,
-            "task_loss": task_sum / updates,
-            "fptt_regularization": regularization_sum / updates,
-            "total_loss": total_sum / updates,
+            "loss": total_sum / windows,
+            "task_loss": task_sum / windows,
+            "fptt_regularization": regularization_sum / windows,
+            "total_loss": total_sum / windows,
+            "window_count": windows,
             "optimizer_updates": updates,
             "k": config.k,
             "fptt_mode": config.use_fptt,
@@ -160,21 +166,23 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
             fptt.reset_running_params(self._get_adapter())
         super().on_train_epoch_end(train_outputs)
         keys = ("task_loss", "fptt_regularization", "total_loss")
+        local_windows = sum(int(row.get("window_count", row["optimizer_updates"])) for row in train_outputs)
         local_updates = sum(int(row["optimizer_updates"]) for row in train_outputs)
         local_sums = {
-            key: sum(float(row[key]) * int(row["optimizer_updates"]) for row in train_outputs)
+            key: sum(float(row[key]) * int(row.get("window_count", row["optimizer_updates"])) for row in train_outputs)
             for key in keys
         }
         if self.is_ddp:
             gathered = [None] * dist.get_world_size()
-            dist.all_gather_object(gathered, (local_updates, local_sums))
+            dist.all_gather_object(gathered, (local_windows, local_updates, local_sums))
         else:
-            gathered = [(local_updates, local_sums)]
-        global_updates = sum(item[0] for item in gathered)
+            gathered = [(local_windows, local_updates, local_sums)]
+        global_windows = sum(item[0] for item in gathered)
+        global_updates = sum(item[1] for item in gathered)
         values = {
-            "task_losses": sum(item[1]["task_loss"] for item in gathered) / global_updates,
-            "fptt_regularization": sum(item[1]["fptt_regularization"] for item in gathered) / global_updates,
-            "total_losses": sum(item[1]["total_loss"] for item in gathered) / global_updates,
+            "task_losses": sum(item[2]["task_loss"] for item in gathered) / global_windows,
+            "fptt_regularization": sum(item[2]["fptt_regularization"] for item in gathered) / global_windows,
+            "total_losses": sum(item[2]["total_loss"] for item in gathered) / global_windows,
             "optimizer_updates": global_updates // len(gathered),
             "k": self.snn_config.k,
             "fptt_mode": self.snn_config.use_fptt,

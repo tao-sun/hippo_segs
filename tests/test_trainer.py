@@ -293,8 +293,8 @@ def test_epoch_metrics_reduce_window_sums_without_multiplying_ddp_update_count(t
     monkeypatch.setattr(trainer_module.dist, "get_world_size", lambda: 2)
 
     def gather(output, local):
-        output[:] = [local, (3, {"task_loss": 9.0,
-                                 "fptt_regularization": 3.0, "total_loss": 12.0})]
+        output[:] = [local, (3, 3, {"task_loss": 9.0,
+                                    "fptt_regularization": 3.0, "total_loss": 12.0})]
 
     monkeypatch.setattr(trainer_module.dist, "all_gather_object", gather)
     trainer.on_train_epoch_end([
@@ -317,6 +317,9 @@ def test_train_step_uses_native_scaler_and_clipping_order_for_each_window(traine
     original_clip = torch.nn.utils.clip_grad_norm_
 
     class RecordingScaler:
+        def get_scale(self):
+            return 8.0
+
         def scale(self, loss):
             events.append("scale")
             return loss
@@ -343,3 +346,108 @@ def test_train_step_uses_native_scaler_and_clipping_order_for_each_window(traine
 
     assert events == ["scale", "unscale", "clip", "step", "update"] * 2
     assert output["optimizer_updates"] == 2
+
+
+def test_scaler_skipped_window_does_not_count_optimizer_or_fptt_update(trainer, monkeypatch):
+    core, wrapper, _ = prepare_window_trainer(trainer, monkeypatch, use_fptt=True)
+    fptt.init_running_params(wrapper.module)
+    events = []
+    original_optimizer_step = trainer.optimizer.step
+    original_running_update = fptt.update_running_params
+    original_detach = core.detach_states
+
+    def optimizer_step(*args, **kwargs):
+        events.append("optimizer")
+        return original_optimizer_step(*args, **kwargs)
+
+    def running_update(*args, **kwargs):
+        events.append("fptt")
+        return original_running_update(*args, **kwargs)
+
+    def detach_states():
+        events.append("detach")
+        return original_detach()
+
+    class SkippingScaler:
+        def __init__(self):
+            self.scale_value = 8.0
+            self.windows = 0
+
+        def get_scale(self):
+            return self.scale_value
+
+        def scale(self, loss):
+            return loss
+
+        def unscale_(self, optimizer):
+            pass
+
+        def step(self, optimizer):
+            self.windows += 1
+            if self.windows == 1:
+                events.append("skipped")
+            else:
+                optimizer.step()
+
+        def update(self):
+            if self.windows == 1:
+                self.scale_value = 4.0
+
+    trainer.loss = lambda logits, target: logits.mean() * 0 + float(len(wrapper.calls) * 2 - 1)
+    trainer.grad_scaler = SkippingScaler()
+    monkeypatch.setattr(trainer.optimizer, "step", optimizer_step)
+    monkeypatch.setattr(fptt, "update_running_params", running_update)
+    monkeypatch.setattr(core, "detach_states", detach_states)
+
+    output = trainer.train_step({"data": torch.ones(1, 4, 17, 1, 1),
+                                 "target": torch.zeros(1, 3, 17, 1, 1)})
+
+    assert events == ["skipped", "detach", "optimizer", "fptt", "detach"]
+    assert output["optimizer_updates"] == 1
+    assert output["window_count"] == 2
+    assert output["task_loss"] == pytest.approx(2.0)
+    assert output["total_loss"] == pytest.approx(output["task_loss"] + output["fptt_regularization"])
+    assert core.state.grad_fn is None
+    trainer.on_train_epoch_end([output, {
+        "loss": 4.0, "task_loss": 4.0, "fptt_regularization": 0.0,
+        "total_loss": 4.0, "window_count": 2, "optimizer_updates": 2,
+        "k": 16, "fptt_mode": True,
+    }])
+    logged = trainer.logger.get_checkpoint()
+    assert logged["task_losses"] == [pytest.approx(3.0)]
+    assert logged["optimizer_updates"] == [3]
+
+
+def test_all_scaler_skips_still_report_window_losses_and_detach_state(trainer, monkeypatch):
+    core, wrapper, _ = prepare_window_trainer(trainer, monkeypatch)
+
+    class AlwaysSkippingScaler:
+        def __init__(self):
+            self.scale_value = 8.0
+
+        def get_scale(self):
+            return self.scale_value
+
+        def scale(self, loss):
+            return loss
+
+        def unscale_(self, optimizer):
+            pass
+
+        def step(self, optimizer):
+            pass
+
+        def update(self):
+            self.scale_value /= 2
+
+    trainer.grad_scaler = AlwaysSkippingScaler()
+    output = trainer.train_step({"data": torch.ones(1, 4, 17, 1, 1),
+                                 "target": torch.zeros(1, 3, 17, 1, 1)})
+
+    assert len(wrapper.calls) == 2
+    assert output["window_count"] == 2
+    assert output["optimizer_updates"] == 0
+    assert output["loss"] > 0
+    assert core.state.grad_fn is None
+    trainer.on_train_epoch_end([output])
+    assert trainer.logger.get_checkpoint()["optimizer_updates"] == [0]
