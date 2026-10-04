@@ -46,6 +46,12 @@ from postprocessing import (
 # ==== use your spiking UNet-like model ====
 # SNNBraTS: forward(x_win[B,k,4,H,W], t0) -> (B, out_channels, k, H, W)
 from model import build_model as build_shared_model, print_model_info
+from snn_nnunet.fptt import (
+    init_running_params,
+    regularizer_loss,
+    reset_running_params,
+    update_running_params,
+)
 
 # ------------------ SEEDING ------------------
 SEED = 2025
@@ -1986,35 +1992,6 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
 # -----------------------------
 # FPTT
 # -----------------------------
-
-# init before training, lambdas is the gradient \Delta l_t(W_{t+1}, avg_weights is \overline{w}_t.
-def init_running_params(model):
-        model.avg_weights = {}
-        model.lambdas = {}
-        for name, param in model.named_parameters():
-            model.avg_weights[name] = param.detach().clone().type_as(param)
-            model.lambdas[name] = 0.0 * param.detach().clone().type_as(param)
-
-# reset after each epoch
-def reset_running_params(model):
-    for name, param in model.named_parameters():
-        param.data.copy_(model.avg_weights[name].data)
-
-# add a loss item
-def regularizer_loss(model, reg_loss, alpha, rho=0.0, _lambda=2.0,):
-    # print(f"\nalpha: {model.alpha}, beta: {model.beta}, rho: {rho}, _lambda: {_lambda}")
-    for name, param in model.named_parameters():
-        reg_loss += (rho-1.) * torch.sum(param * model.lambdas[name])
-        reg_loss += _lambda * 0.5 * alpha * torch.sum(torch.square(param - model.avg_weights[name]))
-    return reg_loss
-
-# update after each parameter udpate
-def update_running_params(model, alpha, beta):
-    for name, param in model.named_parameters():
-        model.lambdas[name].data.add_(-alpha * (param - model.avg_weights[name]))
-        model.avg_weights[name].data.mul_((1.0-beta))
-        model.avg_weights[name].data.add_(beta*param-(beta/alpha)*model.lambdas[name])
-
 
 # -----------------------------
 # SNN Train / Eval (TBPTT over per-subject sequences)
