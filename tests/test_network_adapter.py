@@ -1,6 +1,7 @@
 from dataclasses import FrozenInstanceError
 
 import pytest
+import torch
 
 from model import (
     SNNBraTS,
@@ -10,6 +11,7 @@ from model import (
     build_model,
 )
 from snn_nnunet.network_adapter import SNNConfig, build_core
+import snn_nnunet.network_adapter as adapter_module
 from snn_fptt import build_model as build_legacy_model
 
 
@@ -180,3 +182,29 @@ def test_plans_config_rejects_missing_or_extra_schema():
     data = {**APPROVED_CONFIG, "extra": 1}
     with pytest.raises(ValueError, match="extra"):
         SNNConfig.from_plans({"snn_config": data})
+
+
+def test_adapter_builds_core_from_config_when_one_is_not_supplied(monkeypatch):
+    class Core(torch.nn.Module):
+        def forward(self, x_win, t0):
+            return x_win[:, :, :3].movedim(1, 2)
+
+        def detach_states(self):
+            pass
+
+    core = Core()
+    monkeypatch.setattr(adapter_module, "build_core", lambda config: core)
+    config = SNNConfig.from_plans({"snn_config": APPROVED_CONFIG})
+
+    adapter = adapter_module.SNNnnUNetAdapter(config)
+
+    assert adapter.core is core
+    assert adapter(torch.ones(1, 4, 2, 3, 4)).shape == (1, 3, 2, 3, 4)
+
+
+def test_adapter_rejects_input_with_wrong_channel_count():
+    config = SNNConfig.from_plans({"snn_config": APPROVED_CONFIG})
+    adapter = adapter_module.SNNnnUNetAdapter(config, core=torch.nn.Identity())
+
+    with pytest.raises(ValueError, match="channels"):
+        adapter(torch.ones(1, 3, 2, 3, 4))
