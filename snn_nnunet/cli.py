@@ -7,7 +7,6 @@ modules. Checkpoints and result plans remain the source of truth at inference.
 from __future__ import annotations
 
 import argparse
-from copy import deepcopy
 import json
 import os
 from pathlib import Path
@@ -141,10 +140,11 @@ def _results_folder(dataset_id: int) -> Path:
     return Path(get_output_folder(dataset_id, TRAINER, PLANS, CONFIGURATION))
 
 
-def _requested_config(args: argparse.Namespace) -> dict:
-    from snn_nnunet.prepare_plans import DEFAULT_SNN_CONFIG
+def _requested_config(args: argparse.Namespace, plans_path: Path) -> dict:
+    from snn_nnunet.network_adapter import SNNConfig
 
-    config = deepcopy(DEFAULT_SNN_CONFIG)
+    with plans_path.open(encoding="utf-8") as stream:
+        config = SNNConfig.from_plans(json.load(stream)).to_dict()
     config.update(model_name=args.model, temporal_axis=args.temporal_axis,
                   k=args.k, use_fptt=args.use_fptt)
     return config
@@ -161,14 +161,14 @@ def _check_saved_results(dataset_id: int) -> None:
 def _persist_training_config(args: argparse.Namespace) -> None:
     from snn_nnunet.prepare_plans import update_snn_config
 
-    update_snn_config(_plans_path(args.dataset_id), _requested_config(args),
-                      _results_folder(args.dataset_id))
+    plans_path = _plans_path(args.dataset_id)
+    update_snn_config(plans_path, _requested_config(args, plans_path), _results_folder(args.dataset_id))
 
 
 def _run_training(args: argparse.Namespace, fold: int, *, validation: bool) -> None:
     from nnunetv2.run.run_training import run_training
 
-    run_training(dataset_name_or_id=args.dataset_id, configuration=CONFIGURATION, fold=fold,
+    run_training(dataset_name_or_id=str(args.dataset_id), configuration=CONFIGURATION, fold=fold,
                  trainer_class_name=TRAINER, plans_identifier=PLANS, num_gpus=args.gpus,
                  continue_training=False if validation else args.continue_training,
                  only_run_validation=validation, val_with_best=args.best if validation else False,

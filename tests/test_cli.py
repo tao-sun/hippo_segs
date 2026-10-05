@@ -81,7 +81,7 @@ def test_train_persists_complete_config_and_passes_native_flags(tmp_path, monkey
     monkeypatch.setattr(training, "run_training", lambda *a, **kw: calls.append((a, kw)))
     assert cli.main(["train", "--dataset-id", "11", "--fold", "2", "--model", "medium",
                      "--temporal-axis", "1", "--k", "8", "--no-fptt", "--gpus", "2", "--continue"]) == 0
-    assert calls == [((), {"dataset_name_or_id": 11, "configuration": "3d_fullres", "fold": 2,
+    assert calls == [((), {"dataset_name_or_id": "11", "configuration": "3d_fullres", "fold": 2,
                           "trainer_class_name": "nnUNetTrainerSNNFPTT", "plans_identifier": "SNNPlans",
                           "num_gpus": 2, "continue_training": True, "only_run_validation": False,
                           "val_with_best": False, "export_validation_probabilities": False})]
@@ -110,7 +110,7 @@ def test_validate_uses_saved_config_and_native_best_flag(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(training, "run_training", lambda *a, **kw: calls.append(kw))
     assert cli.main(["validate", "--dataset-id", "11", "--fold", "3", "--best", "--save-probabilities"]) == 0
-    assert calls == [{"dataset_name_or_id": 11, "configuration": "3d_fullres", "fold": 3,
+    assert calls == [{"dataset_name_or_id": "11", "configuration": "3d_fullres", "fold": 3,
                       "trainer_class_name": "nnUNetTrainerSNNFPTT", "plans_identifier": "SNNPlans",
                       "num_gpus": 1, "continue_training": False, "only_run_validation": True,
                       "val_with_best": True, "export_validation_probabilities": True}]
@@ -125,6 +125,68 @@ def test_full_cv_runs_folds_sequentially_with_one_config(tmp_path, monkeypatch):
     monkeypatch.setattr(training, "run_training", run)
     assert cli.main(["full-cv", "--dataset-id", "11", "--k", "4"]) == 0
     assert seen == [(0, 4), (1, 4), (2, 4), (3, 4), (4, 4)]
+
+
+def test_training_dataset_id_reaches_native_trainer_preconstruction(tmp_path, monkeypatch):
+    plans_path = _workspace(tmp_path, monkeypatch)
+    (plans_path.parent / "dataset.json").write_text("{}")
+    native = importlib.import_module("nnunetv2.run.run_training")
+    constructed = []
+
+    class Trainer:
+        def __init__(self, **kwargs):
+            constructed.append(kwargs)
+
+    monkeypatch.setattr(native, "recursive_find_trainer_class_by_name", lambda name: Trainer)
+
+    def enter_native(**kwargs):
+        native.get_trainer_from_args(
+            kwargs["dataset_name_or_id"], kwargs["configuration"], kwargs["fold"],
+            kwargs["trainer_class_name"], kwargs["plans_identifier"], kwargs["continue_training"],
+        )
+
+    monkeypatch.setattr(native, "run_training", enter_native)
+    assert cli.main(["train", "--dataset-id", "11", "--fold", "0"]) == 0
+    assert len(constructed) == 1
+    assert constructed[0]["plans"]["snn_config"]["k"] == 16
+    assert constructed[0]["configuration"] == "3d_fullres"
+    assert constructed[0]["fold"] == 0
+
+
+def test_training_preserves_valid_edited_plans_fields_outside_cli_overrides(tmp_path, monkeypatch):
+    plans_path = _workspace(tmp_path, monkeypatch)
+    plans = json.loads(plans_path.read_text())
+    plans["snn_config"]["model_kwargs"]["linear_projection"] = False
+    plans["snn_config"]["model_kwargs"]["patch_embedding_spiking"] = False
+    plans["snn_config"]["fptt_alpha"] = 0.75
+    plans["snn_config"]["fptt_lambda"] = 3.0
+    plans_path.write_text(json.dumps(plans))
+    native = importlib.import_module("nnunetv2.run.run_training")
+    monkeypatch.setattr(native, "run_training", lambda **kwargs: None)
+
+    assert cli.main(["train", "--dataset-id", "11", "--fold", "0", "--model", "deep",
+                     "--temporal-axis", "2", "--k", "8", "--no-fptt"]) == 0
+    saved = json.loads(plans_path.read_text())["snn_config"]
+    assert saved["model_kwargs"] == plans["snn_config"]["model_kwargs"]
+    assert saved["fptt_alpha"] == 0.75
+    assert saved["fptt_lambda"] == 3.0
+    assert (saved["model_name"], saved["temporal_axis"], saved["k"], saved["use_fptt"]) == (
+        "deep", 2, 8, False,
+    )
+
+
+def test_training_rejects_invalid_existing_plans_config_before_native_launch(tmp_path, monkeypatch):
+    plans_path = _workspace(tmp_path, monkeypatch)
+    plans = json.loads(plans_path.read_text())
+    plans["snn_config"]["model_kwargs"]["patch_size"] = 0
+    plans_path.write_text(json.dumps(plans))
+    native = importlib.import_module("nnunetv2.run.run_training")
+    calls = []
+    monkeypatch.setattr(native, "run_training", lambda **kwargs: calls.append(kwargs))
+    with pytest.raises(ValueError, match="patch_size"):
+        cli.main(["train", "--dataset-id", "11", "--fold", "0"])
+    assert calls == []
+    assert json.loads(plans_path.read_text()) == plans
 
 
 def test_predict_uses_exact_native_predictor_and_normalizes_checkpoint(tmp_path, monkeypatch):
