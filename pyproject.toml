@@ -43,4 +43,4 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["snn_nnunet"]
-py-modules = ["model", "spike_neurons", "spikmamba", "surrogate"]
+py-modules = ["model", "spike_neurons", "spikmamba", "surrogate", "accelerating", "spike_neuron", "spike_activations"]
