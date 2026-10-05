@@ -1,5 +1,6 @@
 """Plans-driven SNN trainer that retains nnU-Net's native pipeline."""
 
+from collections.abc import Mapping
 import os
 import tempfile
 
@@ -133,10 +134,34 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
         for name in _CHECKPOINT_CONFIG_FIELDS:
             if name not in state or state[name] != getattr(self.snn_config, name):
                 raise ValueError(f"Checkpoint {name} does not match the current SNN plans")
-        if self.snn_config.use_fptt and not all(
-            name in state for name in ("avg_weights", "lambdas")
-        ):
-            raise ValueError("Checkpoint is missing FPTT tensors")
+        restored_tensors = {}
+        if self.snn_config.use_fptt:
+            if not self.was_initialized:
+                self.initialize()
+            parameters = dict(self._get_adapter().named_parameters())
+            for field in ("avg_weights", "lambdas"):
+                saved = state.get(field)
+                if not isinstance(saved, Mapping):
+                    raise ValueError(f"Checkpoint {field} must be a parameter mapping")
+                missing = set(parameters) - set(saved)
+                extra = set(saved) - set(parameters)
+                if missing or extra:
+                    raise ValueError(
+                        f"Checkpoint {field} parameter names differ: "
+                        f"missing {sorted(missing)}, extra {sorted(extra)}"
+                    )
+                prepared = {}
+                for name, parameter in parameters.items():
+                    tensor = saved[name]
+                    if not isinstance(tensor, torch.Tensor) or tensor.shape != parameter.shape:
+                        raise ValueError(f"Checkpoint {field}[{name}] has an invalid tensor or shape")
+                    try:
+                        prepared[name] = tensor.detach().to(
+                            device=parameter.device, dtype=parameter.dtype
+                        ).clone()
+                    except (RuntimeError, TypeError) as error:
+                        raise ValueError(f"Checkpoint {field}[{name}] cannot be restored") from error
+                restored_tensors[field] = prepared
 
         if isinstance(filename_or_checkpoint, str):
             super().load_checkpoint(filename_or_checkpoint)
@@ -149,8 +174,8 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
                 super().load_checkpoint(temporary.name)
         if self.snn_config.use_fptt:
             adapter = self._get_adapter()
-            fptt.init_running_params(adapter)
-            fptt.restore_fptt_tensors(adapter, state)
+            adapter.avg_weights = restored_tensors["avg_weights"]
+            adapter.lambdas = restored_tensors["lambdas"]
 
     def train_step(self, batch: dict) -> dict:
         data = batch["data"].to(self.device, non_blocking=True)

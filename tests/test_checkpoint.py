@@ -1,5 +1,6 @@
 """Native checkpoint compatibility for the SNN trainer."""
 
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 
@@ -155,6 +156,54 @@ def test_config_mismatch_fails_before_native_state_mutation(tmp_path, field, oth
     assert target.current_epoch == 81
     for name, value in target.network.state_dict().items():
         torch.testing.assert_close(value, before[name])
+
+
+@pytest.mark.parametrize("field", ["avg_weights", "lambdas"])
+@pytest.mark.parametrize("damage", ["missing", "extra", "non_tensor", "wrong_shape", "not_mapping"])
+@pytest.mark.parametrize("load_as_dict", [False, True])
+def test_malformed_fptt_payload_rejected_without_restoring_any_state(
+    tmp_path, field, damage, load_as_dict
+):
+    _, filename = make_saved_checkpoint(tmp_path)
+    checkpoint = torch.load(filename, map_location="cpu", weights_only=False)
+    saved = checkpoint["fptt_state"][field]
+    if damage == "missing":
+        del saved["core.weight"]
+    elif damage == "extra":
+        saved["unexpected.weight"] = torch.tensor(1.0)
+    elif damage == "non_tensor":
+        saved["core.weight"] = 2.5
+    elif damage == "wrong_shape":
+        saved["core.weight"] = torch.ones(2)
+    else:
+        checkpoint["fptt_state"][field] = []
+    if not load_as_dict:
+        torch.save(checkpoint, filename)
+
+    target = prepared_trainer(tmp_path)
+    parameter = next(target.network.parameters())
+    parameter.grad = torch.full_like(parameter, 3.0)
+    target.optimizer.step()
+    target.optimizer.zero_grad(set_to_none=True)
+    target.current_epoch = 81
+    target._best_ema = 0.13
+    target.logger.log("train_losses", 8.1, 0)
+    target.network.avg_weights["core.weight"].fill_(7.0)
+    target.network.lambdas["core.weight"].fill_(9.0)
+    before_network = deepcopy(target.network.state_dict())
+    before_optimizer = deepcopy(target.optimizer.state_dict())
+    before_logging = deepcopy(target.logger.get_checkpoint())
+    before_auxiliary = fptt.export_fptt_tensors(target.network)
+
+    with pytest.raises(ValueError, match=field):
+        target.load_checkpoint(checkpoint if load_as_dict else str(filename))
+
+    torch.testing.assert_close(target.network.state_dict(), before_network)
+    torch.testing.assert_close(target.optimizer.state_dict(), before_optimizer)
+    assert target.logger.get_checkpoint() == before_logging
+    assert target.current_epoch == 81
+    assert target._best_ema == 0.13
+    torch.testing.assert_close(fptt.export_fptt_tensors(target.network), before_auxiliary)
 
 
 def test_native_predictor_fields_remain_directly_readable(tmp_path):
