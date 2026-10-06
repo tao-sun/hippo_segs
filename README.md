@@ -11,7 +11,8 @@ uv sync --python 3.10
 
 export nnUNet_raw=/path/to/nnUNet_raw
 export nnUNet_preprocessed=/path/to/nnUNet_preprocessed
-export nnUNet_results=/path/to/nnUNet_results
+export SNN_RESULTS_BASE=/path/to/nnUNet_results
+export nnUNet_results="$SNN_RESULTS_BASE"
 export nnUNet_extTrainer="$PWD/snn_nnunet"
 export nnUNet_compile=false
 ~~~
@@ -37,46 +38,51 @@ Preparation runs native nnU-Net fingerprinting, planning, and preprocessing with
 
 ## Train and resume
 
-Use a fresh `--run-dir` for each experiment. The CLI stores a configuration and plans snapshot there; retain it for resume, validation, and prediction. `full-cv` trains folds 0 through 4 sequentially with the same configuration:
+Use a distinct `nnUNet_results` root for each experiment. Keep its path: resume, validation, and prediction must point to that same root. The native result folders and checkpoints live beneath it. `full-cv` trains folds 0 through 4 sequentially with the same configuration:
 
 ~~~bash
-export SNN_RUN="$nnUNet_results/brats24_orig_axis0_k16_fptt"
+export SNN_RUN="$SNN_RESULTS_BASE/brats24_orig_axis0_k16_fptt"
+export nnUNet_results="$SNN_RUN"
 uv run --python 3.10 python -m snn_nnunet.cli full-cv \
-  --dataset-id 501 --run-dir "$SNN_RUN"
+  --dataset-id 501
 ~~~
 
-To train one fold, start in a different fresh run directory:
+To train one fold, point `nnUNet_results` at a different fresh root:
 
 ~~~bash
-export SNN_SINGLE_RUN="$nnUNet_results/brats24_fold0"
+export SNN_SINGLE_RUN="$SNN_RESULTS_BASE/brats24_fold0"
+export nnUNet_results="$SNN_SINGLE_RUN"
 uv run --python 3.10 python -m snn_nnunet.cli train \
-  --dataset-id 501 --fold 0 --run-dir "$SNN_SINGLE_RUN"
+  --dataset-id 501 --fold 0
 ~~~
 
 Defaults are model `orig`, temporal axis `0`, `k=16`, and FPTT enabled. Select another model (`orig`, `shallow`, `medium`, or `deep`), axis (`0`, `1`, or `2`), window length, or plain TBPTT with `--model`, `--temporal-axis`, `--k`, or `--no-fptt`. These choices must match for every fold in a run.
 
-Resume with `--continue` and the same `--run-dir`. Repeat every nondefault configuration flag: omitted flags revert to defaults and can conflict with the stored plans. For example, a run originally started with `--model shallow --temporal-axis 2 --k 8 --no-fptt` resumes as follows:
+Resume with `--continue` after restoring the original `nnUNet_results` root. Repeat every nondefault configuration flag: omitted flags revert to defaults and can conflict with the saved plans. For example, a run originally started with `--model shallow --temporal-axis 2 --k 8 --no-fptt` resumes as follows:
 
 ~~~bash
+export nnUNet_results=/path/to/existing/shallow_axis2_k8_results
 uv run --python 3.10 python -m snn_nnunet.cli full-cv \
-  --dataset-id 501 --run-dir /path/to/existing/shallow_axis2_k8_run \
+  --dataset-id 501 \
   --model shallow --temporal-axis 2 --k 8 --no-fptt --continue
 ~~~
 
 For the default example run:
 
 ~~~bash
+export nnUNet_results="$SNN_RUN"
 uv run --python 3.10 python -m snn_nnunet.cli full-cv \
-  --dataset-id 501 --run-dir "$SNN_RUN" --continue
+  --dataset-id 501 --continue
 ~~~
 
-The CLI delegates checkpoint continuation to native nnU-Net. An occupied run directory is rejected without `--continue`. Resume, validation, and prediction require an existing run directory.
+The CLI delegates checkpoint continuation to native nnU-Net. A fresh results root keeps experiments separate; reuse the same root for a continuation or for reading its checkpoints.
 
-For multiple GPUs, pass `--gpus` to training; this example starts a separate four-GPU run:
+For multiple GPUs, pass `--gpus` to training; this example starts a separate four-GPU results root:
 
 ~~~bash
+export nnUNet_results="$SNN_RESULTS_BASE/brats24_4gpu"
 uv run --python 3.10 python -m snn_nnunet.cli full-cv \
-  --dataset-id 501 --run-dir "$nnUNet_results/brats24_4gpu" --gpus 4
+  --dataset-id 501 --gpus 4
 ~~~
 
 Each fold uses native nnU-Net distributed training, while `full-cv` runs the folds one after another.
@@ -86,11 +92,12 @@ Each fold uses native nnU-Net distributed training, while `full-cv` runs the fol
 After training, native full-volume validation uses the final checkpoint by default; `--best` selects `checkpoint_best.pth`:
 
 ~~~bash
+export nnUNet_results="$SNN_RUN"
 uv run --python 3.10 python -m snn_nnunet.cli validate \
-  --dataset-id 501 --fold 0 --run-dir "$SNN_RUN"
+  --dataset-id 501 --fold 0
 
 uv run --python 3.10 python -m snn_nnunet.cli validate \
-  --dataset-id 501 --fold 0 --run-dir "$SNN_RUN" --best
+  --dataset-id 501 --fold 0 --best
 ~~~
 
 The training log's native pseudo-Dice is computed on sampled validation patches. For fold-level Dice reporting, use the true full-volume native validation output.
@@ -98,8 +105,9 @@ The training log's native pseudo-Dice is computed on sampled validation patches.
 Prediction input is a folder of raw nnU-Net channels named like `case_0000.nii.gz` through `case_0003.nii.gz`. For example, use the prepared dataset's `imagesTs` if it contains unlabeled cases. One-fold prediction:
 
 ~~~bash
+export nnUNet_results="$SNN_RUN"
 uv run --python 3.10 python -m snn_nnunet.cli predict \
-  --dataset-id 501 --run-dir "$SNN_RUN" \
+  --dataset-id 501 \
   --input "$nnUNet_raw/Dataset501_BraTS24GLI/imagesTs" \
   --output /path/to/predictions_fold0 --folds 0
 ~~~
@@ -107,21 +115,23 @@ uv run --python 3.10 python -m snn_nnunet.cli predict \
 Once all five folds have checkpoints, omit `--folds` to use the native five-fold prediction ensemble. `--checkpoint best` selects best instead of final checkpoints:
 
 ~~~bash
+export nnUNet_results="$SNN_RUN"
 uv run --python 3.10 python -m snn_nnunet.cli predict \
-  --dataset-id 501 --run-dir "$SNN_RUN" \
+  --dataset-id 501 \
   --input "$nnUNet_raw/Dataset501_BraTS24GLI/imagesTs" \
   --output /path/to/predictions_5fold
 ~~~
 
-Optional postprocessing uses nnU-Net's selected connected-component rules. To request it, start a full five-fold run with `--select-best` so native configuration and postprocessing selection runs after training, then predict from that run with `--postprocess`:
+Optional postprocessing uses nnU-Net's selected connected-component rules. To request it, start a full five-fold run with `--select-best` so native configuration and postprocessing selection runs after training, then predict with the same results root and `--postprocess`:
 
 ~~~bash
-export SNN_POST_RUN="$nnUNet_results/brats24_with_selection"
+export SNN_POST_RUN="$SNN_RESULTS_BASE/brats24_with_selection"
+export nnUNet_results="$SNN_POST_RUN"
 uv run --python 3.10 python -m snn_nnunet.cli full-cv \
-  --dataset-id 501 --run-dir "$SNN_POST_RUN" --select-best
+  --dataset-id 501 --select-best
 
 uv run --python 3.10 python -m snn_nnunet.cli predict \
-  --dataset-id 501 --run-dir "$SNN_POST_RUN" \
+  --dataset-id 501 \
   --input "$nnUNet_raw/Dataset501_BraTS24GLI/imagesTs" \
   --output /path/to/predictions_5fold_selected --postprocess
 ~~~
@@ -138,7 +148,7 @@ The trainer uses native region Dice/BCE loss. For each `k`-slice window, it take
 
 - If native nnU-Net reports missing paths, export `nnUNet_raw`, `nnUNet_preprocessed`, and `nnUNet_results` in the current shell. Native commands also need `nnUNet_extTrainer` to find the custom trainer.
 - If conversion rejects a ZIP or a case, extract the archive and check for exactly one file of each modality per subject. An existing raw destination with different contents is deliberately rejected.
-- If resume reports incompatible plans or results, use the original run directory, dataset ID, model, temporal axis, `k`, and FPTT mode. Repeat all nondefault flags with `--continue`.
+- If resume or validation reports incompatible plans or results, restore the original `nnUNet_results` root and matching dataset ID, model, temporal axis, `k`, and FPTT mode. Repeat all nondefault training flags with `--continue`. The shared preprocessed `SNNPlans.json` must also match the selected run for validation.
 - The nnU-Net 2.8.1 native Python training API expects the dataset argument as a **string**. This CLI converts it; direct API calls should use `str(dataset_id)` (for example, `"501"`).
 - Native prediction needs checkpoints for each requested fold. Its five-fold default needs all five; use `--folds 0` for a completed single fold.
 
