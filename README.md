@@ -1,173 +1,147 @@
 # hippo_segs
 
-## Running `snn_fptt.py`
+This repository trains the existing sequential SNN/SpikMamba models with nn-U-Net v2.8.1. nnU-Net handles dataset planning and preprocessing, sampling, augmentation, region loss, cross-validation, checkpointing, full-volume validation, inference, and postprocessing. The project supplies an external trainer and a thin CLI.
 
-### 1. Create the environment
+## Set up
 
-The project is managed with [uv](https://docs.astral.sh/uv/). From the
-repository root, create the Python 3.9 environment and install the locked
-dependencies:
+Use Python 3.10 and [uv](https://docs.astral.sh/uv/) from the repository root. The project pins `nnunetv2==2.8.1` and PyTorch 2.5.1; its Mamba wheel targets Python 3.10, CUDA 12, and PyTorch 2.5. Production model execution needs a compatible NVIDIA GPU environment.
 
-```bash
-uv sync --frozen --python 3.9
-```
+~~~bash
+uv sync --python 3.10
 
-### 2. Download and preprocess the BraTS data
+export nnUNet_raw=/path/to/nnUNet_raw
+export nnUNet_preprocessed=/path/to/nnUNet_preprocessed
+export nnUNet_results=/path/to/nnUNet_results
+export nnUNet_extTrainer="$PWD/snn_nnunet"
+export nnUNet_compile=false
+~~~
 
-Download the BraTS dataset and place its original ZIP archives in a dedicated
-input directory. The archives do not need to be extracted: the preprocessing
-script reads subjects directly from the ZIP files, processes one subject at a
-time, and writes training-ready `.pt` cache files.
+Set the three nnU-Net data paths to writable, persistent directories. The project CLI sets `nnUNet_extTrainer` and defaults `nnUNet_compile=false` itself. Keep these exports when invoking native nnU-Net commands directly: the installed package discovers the external `nnUNetTrainerSNNFPTT` through `nnUNet_extTrainer`. Compilation defaults to false because the SNN has mutable neuron state and custom Mamba operations.
 
-Run the preprocessing separately for every dataset or preprocessing variant.
-Keep different BraTS releases in dedicated input directories. The same input
-directory may be reused to compare preprocessing variants, but every dataset
-and normalization method must have its own `--cache-root`. Multiple anatomical
-views may share one cache root because each view is stored in its own
-subdirectory.
+Run the following commands from the repository root in a shell with these exports. Dataset ID `501` and name `BraTS24GLI` are examples; choose an unused ID and use it consistently.
 
-For the current BraTS24 experiments, we are testing foreground Z-score
-normalization instead of the previous min-max normalization. The normalized
-values are kept as `float32` rather than being quantized to `uint8`:
+## Prepare extracted BraTS24 data
 
-```bash
-uv run python data/preprocess_brats24.py \
-  --input /path/to/folder-containing-brats24-zips \
-  --input-mode archives \
-  --cache-root /path/to/BRATS2024_cache_zscore \
-  --preprocessing-normalization zscore \
-  --preserve-float32 \
-  --view sagittal \
-  --workers 1
-```
+Extract the BraTS24 GLI archive first. `--dataset-root` must point to an extracted directory, not a ZIP file. The converter finds subject directories recursively. Each case needs one each of `*t1n*.nii.gz`, `*t1c*.nii.gz`, `*t2w*.nii.gz`, and `*t2f*.nii.gz`, plus one `*seg*.nii.gz` for a labeled training case.
 
-Replace `sagittal` with `axial` or `coronal`, or pass multiple views after
-`--view`, when required by the experiment. Normalization is applied to each
-3D modality before view extraction. The preprocessing command is restartable:
-completed subjects are validated and skipped when it is run again with the
-same configuration.
+~~~bash
+export BRATS24_EXTRACTED=/path/to/extracted/BraTS24-GLI
+uv run --python 3.10 python -m snn_nnunet.cli prepare \
+  --dataset-root "$BRATS24_EXTRACTED" \
+  --dataset-id 501 --dataset-name BraTS24GLI
+~~~
 
-The options in the training YAML must match the cache. For the legacy
-min-max/`uint8` baseline, use
-`--preprocessing-normalization minmax`, omit `--preserve-float32`, and write to
-a different cache directory.
+The converter writes `Dataset501_BraTS24GLI` under `nnUNet_raw`. Channels `_0000` through `_0003` are T1, T1ce, T2, and FLAIR. Only segmentation value `4` is changed to background `0`; image intensities and geometry are preserved. Unlabeled cases go to `imagesTs`. An already formatted `Dataset501_BraTS24GLI` raw directory can also be passed as `--dataset-root`.
 
-For already preprocessed legacy datasets, `build_brats_cache.py` can still be
-used to convert the existing files to the subject-cache format. The direct
-`data/preprocess_brats24.py` ZIP-to-cache workflow above is recommended for
-BraTS24.
+Preparation runs native nnU-Net fingerprinting, planning, and preprocessing with dataset integrity checks. It derives `SNNPlans.json` from stock plans, retaining the stock preprocessed data identifier. The SNN `3d_fullres` plan uses a **[128, 128, 128] voxel patch** and **batch size 4**. Its `model_kwargs.patch_size: 4` is the internal 2D SpikMamba patch-embedding factor, not the nnU-Net spatial patch size.
 
-### 3. Configure the experiment
+## Train and resume
 
-Edit `experiments_snn_fptt.yaml` before starting the training. At minimum,
-choose the experiment name, validation fold, anatomical view, cache location,
-model, batch size, learning rate, and number of epochs.
+Use a fresh `--run-dir` for each experiment. The CLI stores a configuration and plans snapshot there; retain it for resume, validation, and prediction. `full-cv` trains folds 0 through 4 sequentially with the same configuration:
 
-For the Z-score cache created above, the relevant data options are:
+~~~bash
+export SNN_RUN="$nnUNet_results/brats24_orig_axis0_k16_fptt"
+uv run --python 3.10 python -m snn_nnunet.cli full-cv \
+  --dataset-id 501 --run-dir "$SNN_RUN"
+~~~
 
-```yaml
-data_root: null
-cache_root: /path/to/BRATS2024_cache_zscore
-cache_required: true
-label_format: brats24
-view: sagittal
-val_fold: 1
+To train one fold, start in a different fresh run directory:
 
-preprocessing_normalization: zscore
-preserve_float32: true
-```
+~~~bash
+export SNN_SINGLE_RUN="$nnUNet_results/brats24_fold0"
+uv run --python 3.10 python -m snn_nnunet.cli train \
+  --dataset-id 501 --fold 0 --run-dir "$SNN_SINGLE_RUN"
+~~~
 
-Keeping `cache_required: true` is recommended because it prevents training
-from silently falling back to slower source-file loading. `cache_root` must
-point to the output of the matching preprocessing run. With a required cache,
-`data_root` is not used as a separate image source and may be set to `null`;
-the loader then uses `cache_root` for dataset discovery as well. A real
-`data_root` is only needed when cache fallback is allowed or when using an
-uncached legacy dataset.
+Defaults are model `orig`, temporal axis `0`, `k=16`, and FPTT enabled. Select another model (`orig`, `shallow`, `medium`, or `deep`), axis (`0`, `1`, or `2`), window length, or plain TBPTT with `--model`, `--temporal-axis`, `--k`, or `--no-fptt`. These choices must match for every fold in a run.
 
-The main experimental switches are:
+Resume with `--continue` and the same `--run-dir`. Repeat every nondefault configuration flag: omitted flags revert to defaults and can conflict with the stored plans. For example, a run originally started with `--model shallow --temporal-axis 2 --k 8 --no-fptt` resumes as follows:
 
-```yaml
-# Weight the probability of selecting training patients according to lesion
-# volume. Sampling changes which patients are seen during an epoch, but not
-# the total number of draws per epoch.
-lesion_volume_sampling: true
-lesion_sampling_classes: [ET, TC]
-lesion_sampling_gamma: 0.5
-lesion_sampling_max_weight: 4.0
+~~~bash
+uv run --python 3.10 python -m snn_nnunet.cli full-cv \
+  --dataset-id 501 --run-dir /path/to/existing/shallow_axis2_k8_run \
+  --model shallow --temporal-axis 2 --k 8 --no-fptt --continue
+~~~
 
-# true enables FPTT; false uses plain TBPTT and ignores the FPTT parameters.
-use_fptt: true
+For the default example run:
 
-# Postprocess thresholded prediction volumes during evaluation.
-apply_postprocessing: true
+~~~bash
+uv run --python 3.10 python -m snn_nnunet.cli full-cv \
+  --dataset-id 501 --run-dir "$SNN_RUN" --continue
+~~~
 
-# Minimum connected-component sizes, in voxels, in ET, TC, WT order.
-# Use non-zero values to remove components smaller than these thresholds.
-min_component_sizes: [50, 50, 50]
-closing_radius: 1
-```
+The CLI delegates checkpoint continuation to native nnU-Net. An occupied run directory is rejected without `--continue`. Resume, validation, and prediction require an existing run directory.
 
-Set `lesion_volume_sampling: false`, `use_fptt: false`, or
-`apply_postprocessing: false` to disable the corresponding feature. When
-postprocessing is disabled, `min_component_sizes` and `closing_radius` do not
-affect predictions. Postprocessing is applied only to predictions; the ground
-truth is never modified.
+For multiple GPUs, pass `--gpus` to training; this example starts a separate four-GPU run:
 
-`loader_workers` is configured per Accelerate process. For example, four GPU
-processes with `loader_workers: 2` create eight DataLoader workers in total.
-## Learning-rate scheduling and resume
+~~~bash
+uv run --python 3.10 python -m snn_nnunet.cli full-cv \
+  --dataset-id 501 --run-dir "$nnUNet_results/brats24_4gpu" --gpus 4
+~~~
 
-Training schedulers advance once per epoch, regardless of the number of GPUs.
-`reduce_plateau` monitors training loss with PyTorch's defaults: ten tolerated
-epochs without improvement and a factor of 0.1 at each reduction.
+Each fold uses native nnU-Net distributed training, while `full-cv` runs the folds one after another.
 
-On resume, `resume_scheduler: false` resets scheduler history while preserving
-the checkpoint's optimizer state and learning rate. To explicitly restart at a
-different learning rate, also set `resume_lr: 0.0001`. Set `resume_lr: null` to
-keep the checkpoint learning rate, restore the scheduler with
-`resume_scheduler: true`, or start a new run with `resume_from: null`.
-An explicit `resume_lr` applies on every restart until it is cleared.
+## Validate and predict
 
-## Evaluation throughput
+After training, native full-volume validation uses the final checkpoint by default; `--best` selects `checkpoint_best.pth`:
 
-`eval_batch_subjects` controls the number of validation subjects per GPU,
-independently of `batch_size_subjects` used for training. The example config
-uses 2; older configs that omit it keep 1. Try 4 if GPU and host memory permit.
-The same setting applies to the optional training-set evaluation loader.
+~~~bash
+uv run --python 3.10 python -m snn_nnunet.cli validate \
+  --dataset-id 501 --fold 0 --run-dir "$SNN_RUN"
 
-`eval_batch_slices` remains the sequential slice window length, not a parallel
-image batch. Neuron states reset at the start of each subject batch and remain
-independent between subjects. Evaluation accumulates integer intersection and
-voxel counts on the device, then computes each subject's ET/TC/WT Dice with the
-existing threshold and epsilon. Only the small Dice table is copied to the CPU.
-The reported score remains the mean of subject Dice, including incomplete
-batches; Accelerate removes distributed padding duplicates before averaging.
+uv run --python 3.10 python -m snn_nnunet.cli validate \
+  --dataset-id 501 --fold 0 --run-dir "$SNN_RUN" --best
+~~~
 
-These settings are read at startup; an already running process keeps its loaded
-code and configuration. Measure evaluation time and memory on the target GPUs
-before assuming a speedup from a larger batch.
+The training log's native pseudo-Dice is computed on sampled validation patches. For fold-level Dice reporting, use the true full-volume native validation output.
 
-### 4. Start the training
+Prediction input is a folder of raw nnU-Net channels named like `case_0000.nii.gz` through `case_0003.nii.gz`. For example, use the prepared dataset's `imagesTs` if it contains unlabeled cases. One-fold prediction:
 
-Run a single-process experiment from the repository root with:
+~~~bash
+uv run --python 3.10 python -m snn_nnunet.cli predict \
+  --dataset-id 501 --run-dir "$SNN_RUN" \
+  --input "$nnUNet_raw/Dataset501_BraTS24GLI/imagesTs" \
+  --output /path/to/predictions_fold0 --folds 0
+~~~
 
-```bash
-uv run accelerate launch --num_processes 1 \
-  snn_fptt.py --config experiments_snn_fptt.yaml
-```
+Once all five folds have checkpoints, omit `--folds` to use the native five-fold prediction ensemble. `--checkpoint best` selects best instead of final checkpoints:
 
-For multi-GPU training, set the number of processes to the number of GPUs and
-add `--multi_gpu`, for example:
+~~~bash
+uv run --python 3.10 python -m snn_nnunet.cli predict \
+  --dataset-id 501 --run-dir "$SNN_RUN" \
+  --input "$nnUNet_raw/Dataset501_BraTS24GLI/imagesTs" \
+  --output /path/to/predictions_5fold
+~~~
 
-```bash
-uv run accelerate launch --multi_gpu --num_processes 4 \
-  snn_fptt.py --config experiments_snn_fptt.yaml
-```
+Optional postprocessing uses nnU-Net's selected connected-component rules. To request it, start a full five-fold run with `--select-best` so native configuration and postprocessing selection runs after training, then predict from that run with `--postprocess`:
 
-The supplied `snn_fptt.job` provides the equivalent SLURM workflow. Its first
-argument may be used to select a YAML file other than the default:
+~~~bash
+export SNN_POST_RUN="$nnUNet_results/brats24_with_selection"
+uv run --python 3.10 python -m snn_nnunet.cli full-cv \
+  --dataset-id 501 --run-dir "$SNN_POST_RUN" --select-best
 
-```bash
-sbatch snn_fptt.job /path/to/experiment.yaml
-```
+uv run --python 3.10 python -m snn_nnunet.cli predict \
+  --dataset-id 501 --run-dir "$SNN_POST_RUN" \
+  --input "$nnUNet_raw/Dataset501_BraTS24GLI/imagesTs" \
+  --output /path/to/predictions_5fold_selected --postprocess
+~~~
+
+Postprocessed results appear in `/path/to/predictions_5fold_selected_postprocessed`. The selection needs completed cross-validation outputs and applies no project-specific thresholds or morphology.
+
+## Sequential trainer behavior
+
+The adapter accepts native `[B, 4, X, Y, Z]` patches and returns `[B, 3, X, Y, Z]` region logits. `--temporal-axis` chooses X, Y, or Z in **preprocessed nnU-Net coordinates**, which need not match original NIfTI orientation. Slices are traversed in order. Neuron state continues across windows within one patch and resets for the next independent patch or inference tile. Native augmentation and inference mirroring exclude the temporal axis: axes 0, 1, and 2 allow `(1, 2)`, `(0, 2)`, and `(0, 1)` respectively.
+
+The trainer uses native region Dice/BCE loss. For each `k`-slice window, it takes one optimizer update and detaches neuron state: truncated backpropagation through time (TBPTT). FPTT adds its regularizer and updates auxiliary running parameters once per window; `--no-fptt` retains TBPTT without FPTT operations. A temporal length of 128 at `k=16` gives 8 updates per minibatch. At 250 minibatches per epoch this is **2,000 optimizer updates per epoch across 32,000 temporal positions per batch element** (128 × 250), or 600,000 updates over the configured 300 epochs. Batch size 4 therefore processes 128,000 individual slice instances per epoch. These are job-level update counts, not multiplied by GPU count; they describe the schedule, not measured production throughput.
+
+## Troubleshooting
+
+- If native nnU-Net reports missing paths, export `nnUNet_raw`, `nnUNet_preprocessed`, and `nnUNet_results` in the current shell. Native commands also need `nnUNet_extTrainer` to find the custom trainer.
+- If conversion rejects a ZIP or a case, extract the archive and check for exactly one file of each modality per subject. An existing raw destination with different contents is deliberately rejected.
+- If resume reports incompatible plans or results, use the original run directory, dataset ID, model, temporal axis, `k`, and FPTT mode. Repeat all nondefault flags with `--continue`.
+- The nnU-Net 2.8.1 native Python training API expects the dataset argument as a **string**. This CLI converts it; direct API calls should use `str(dataset_id)` (for example, `"501"`).
+- Native prediction needs checkpoints for each requested fold. Its five-fold default needs all five; use `--folds 0` for a completed single fold.
+
+## Legacy workflow
+
+The earlier 2D slice-cache experiment remains available through `data/preprocess_brats24.py`, `experiments_snn_fptt.yaml`, and `snn_fptt.py`. It uses separate preprocessing and Accelerate commands.
