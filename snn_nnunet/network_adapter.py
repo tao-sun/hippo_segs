@@ -8,7 +8,7 @@ from typing import Any, Mapping
 import torch
 from torch import Tensor, nn
 
-from model import build_model
+from model import ConvBlock, build_model
 
 
 _MODEL_KWARGS = (
@@ -17,8 +17,8 @@ _MODEL_KWARGS = (
     "residual_connections",
     "dwconv2d_spiking",
     "patch_embedding_spiking",
-    "vss_output_spiking",
     "input_skip",
+    "output_spiking",
 )
 _FIELDS = (
     "model_name",
@@ -100,6 +100,8 @@ class SNNConfig:
             value = data[name]
             if type(value) not in (int, float) or not math.isfinite(value):
                 raise ValueError(f"{name} must be a finite number")
+        if data["use_fptt"] and data["fptt_alpha"] <= 0:
+            raise ValueError("fptt_alpha must be positive when use_fptt is true")
         if type(data["num_input_channels"]) is not int or data["num_input_channels"] != 4:
             raise ValueError("num_input_channels must be 4")
         if type(data["num_output_channels"]) is not int or data["num_output_channels"] != 3:
@@ -123,11 +125,31 @@ class SNNConfig:
 
 
 def build_core(config: SNNConfig) -> nn.Module:
-    return build_model(
+    core = build_model(
         config.model_name,
         out_channels=config.num_output_channels,
         **config.model_kwargs,
     )
+    if not config.use_fptt:
+        _freeze_disconnected_parameters(core)
+    return core
+
+
+def _freeze_disconnected_parameters(core: nn.Module) -> None:
+    """Keep unused core weights in checkpoints but omit them from plain DDP."""
+    for module in core.modules():
+        if not isinstance(module, ConvBlock):
+            continue
+        if module.spikMamba or not module.normalization:
+            for parameter in module.norm.parameters():
+                parameter.requires_grad_(False)
+        if module.spikMamba:
+            for parameter in module.spike_neurons.parameters():
+                parameter.requires_grad_(False)
+            encoder = module.spik_mamba
+            if not encoder.output_spiking:
+                for parameter in encoder.post_plif.parameters():
+                    parameter.requires_grad_(False)
 
 
 def slice_temporal_window(x: Tensor, start: int, end: int, axis: int) -> Tensor:
