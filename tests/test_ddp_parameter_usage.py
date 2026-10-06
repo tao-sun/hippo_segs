@@ -5,10 +5,13 @@ import torch
 from torch import distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 
+from model import build_model as current_build_model
+import snn_nnunet.network_adapter as adapter_module
 from snn_nnunet.network_adapter import SNNConfig, build_core
 
 
-def _config(*, model_name="orig", use_fptt=False, output_spiking=True):
+def _config(*, model_name="orig", use_fptt=False, output_spiking=True,
+            output_key="output_spiking"):
     return SNNConfig.from_plans({"snn_config": {
         "model_name": model_name,
         "model_kwargs": {
@@ -18,7 +21,7 @@ def _config(*, model_name="orig", use_fptt=False, output_spiking=True):
             "dwconv2d_spiking": True,
             "patch_embedding_spiking": False,
             "input_skip": False,
-            "output_spiking": output_spiking,
+            output_key: output_spiking,
         },
         "temporal_axis": 0,
         "k": 1,
@@ -30,6 +33,66 @@ def _config(*, model_name="orig", use_fptt=False, output_spiking=True):
         "num_input_channels": 4,
         "num_output_channels": 3,
     }})
+
+
+@pytest.mark.parametrize("output_key", ["output_spiking", "vss_output_spiking"])
+def test_plans_accept_exactly_one_output_spiking_name(output_key):
+    config = _config(output_key=output_key, output_spiking=False)
+
+    assert config.to_dict()["model_kwargs"][output_key] is False
+    core = build_core(config)
+    assert core.output_spiking is False
+    assert core.conv_block1.spik_mamba.output_spiking is False
+
+
+@pytest.mark.parametrize("case", ["missing", "duplicate", "unknown"])
+def test_plans_reject_missing_duplicate_or_unknown_output_settings(case):
+    data = _config().to_dict()
+    kwargs = data["model_kwargs"]
+    if case == "missing":
+        del kwargs["output_spiking"]
+    elif case == "duplicate":
+        kwargs["vss_output_spiking"] = True
+    else:
+        kwargs["unknown_flag"] = True
+
+    with pytest.raises(ValueError, match="model_kwargs"):
+        SNNConfig.from_plans({"snn_config": data})
+
+
+@pytest.mark.parametrize("output_key", ["output_spiking", "vss_output_spiking"])
+def test_build_core_maps_output_name_for_clean_factory_and_freezes_legacy_post_plif(
+    monkeypatch, output_key
+):
+    def clean_factory(model_name, *, out_channels, patch_size, linear_projection,
+                      residual_connections, dwconv2d_spiking, patch_embedding_spiking,
+                      vss_output_spiking, input_skip):
+        core = current_build_model(
+            model_name, out_channels=out_channels, patch_size=patch_size,
+            linear_projection=linear_projection,
+            residual_connections=residual_connections,
+            dwconv2d_spiking=dwconv2d_spiking,
+            patch_embedding_spiking=patch_embedding_spiking,
+            output_spiking=vss_output_spiking, input_skip=input_skip,
+        )
+        for name in ("conv_block1", "conv_block2", "conv_block3"):
+            encoder = getattr(core, name).spik_mamba
+            encoder.vss_output_spiking = encoder.output_spiking
+            del encoder.output_spiking
+            if not encoder.vss_output_spiking:
+                encoder.post_plif = torch.nn.Linear(1, 1)
+        return core
+
+    monkeypatch.setattr(adapter_module, "build_model", clean_factory)
+    config = _config(output_key=output_key, output_spiking=False)
+    core = build_core(config)
+    parameters = dict(core.named_parameters())
+
+    assert not parameters["conv_block1.spik_mamba.post_plif.weight"].requires_grad
+    assert parameters["conv_block1.spik_mamba.post_norm.weight"].requires_grad
+    assert set(core.state_dict()) == set(build_core(
+        _config(output_key=output_key, output_spiking=False, use_fptt=True)
+    ).state_dict())
 
 
 @pytest.mark.parametrize("alpha", [0, -0.1])

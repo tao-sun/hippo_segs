@@ -1,6 +1,7 @@
 """Construct the existing SNN core from settings stored in nnU-Net plans."""
 
 from dataclasses import dataclass
+import inspect
 import math
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -18,8 +19,8 @@ _MODEL_KWARGS = (
     "dwconv2d_spiking",
     "patch_embedding_spiking",
     "input_skip",
-    "output_spiking",
 )
+_OUTPUT_SPIKING_KEYS = ("output_spiking", "vss_output_spiking")
 _FIELDS = (
     "model_name",
     "model_kwargs",
@@ -78,11 +79,14 @@ class SNNConfig:
         kwargs = data["model_kwargs"]
         if not isinstance(kwargs, Mapping):
             raise ValueError("model_kwargs must be a mapping")
-        _require_keys(kwargs, _MODEL_KWARGS, "model_kwargs")
+        output_keys = tuple(name for name in _OUTPUT_SPIKING_KEYS if name in kwargs)
+        _require_keys(kwargs, _MODEL_KWARGS + output_keys, "model_kwargs")
+        if len(output_keys) != 1:
+            raise ValueError("model_kwargs must contain exactly one output_spiking or vss_output_spiking")
         patch_size = kwargs["patch_size"]
         if type(patch_size) is not int or patch_size <= 0:
             raise ValueError("patch_size must be a positive integer")
-        for name in _MODEL_KWARGS[1:]:
+        for name in _MODEL_KWARGS[1:] + output_keys:
             if type(kwargs[name]) is not bool:
                 raise ValueError(f"{name} must be a boolean")
         if kwargs["input_skip"] and data["model_name"] != "orig":
@@ -125,10 +129,18 @@ class SNNConfig:
 
 
 def build_core(config: SNNConfig) -> nn.Module:
+    kwargs = dict(config.model_kwargs)
+    output_key = next(name for name in _OUTPUT_SPIKING_KEYS if name in kwargs)
+    accepted_kwargs = inspect.signature(build_model).parameters
+    if output_key not in accepted_kwargs:
+        target_key = next(name for name in _OUTPUT_SPIKING_KEYS if name != output_key)
+        if target_key not in accepted_kwargs:
+            raise TypeError("build_model has no output spiking parameter")
+        kwargs[target_key] = kwargs.pop(output_key)
     core = build_model(
         config.model_name,
         out_channels=config.num_output_channels,
-        **config.model_kwargs,
+        **kwargs,
     )
     if not config.use_fptt:
         _freeze_disconnected_parameters(core)
@@ -147,7 +159,11 @@ def _freeze_disconnected_parameters(core: nn.Module) -> None:
             for parameter in module.spike_neurons.parameters():
                 parameter.requires_grad_(False)
             encoder = module.spik_mamba
-            if not encoder.output_spiking:
+            output_spiking = (
+                encoder.output_spiking
+                if hasattr(encoder, "output_spiking") else encoder.vss_output_spiking
+            )
+            if not output_spiking:
                 for parameter in encoder.post_plif.parameters():
                     parameter.requires_grad_(False)
 
