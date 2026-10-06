@@ -1,5 +1,7 @@
 """Parameter usage contracts for the real plans-driven SNN core."""
 
+import inspect
+
 import pytest
 import torch
 from torch import distributed as dist
@@ -8,6 +10,10 @@ from torch.nn.parallel import DistributedDataParallel
 from model import build_model as current_build_model
 import snn_nnunet.network_adapter as adapter_module
 from snn_nnunet.network_adapter import SNNConfig, build_core
+
+
+def _output_spiking(module):
+    return getattr(module, "output_spiking", getattr(module, "vss_output_spiking", None))
 
 
 def _config(*, model_name="orig", use_fptt=False, output_spiking=True,
@@ -41,8 +47,8 @@ def test_plans_accept_exactly_one_output_spiking_name(output_key):
 
     assert config.to_dict()["model_kwargs"][output_key] is False
     core = build_core(config)
-    assert core.output_spiking is False
-    assert core.conv_block1.spik_mamba.output_spiking is False
+    assert _output_spiking(core) is False
+    assert _output_spiking(core.conv_block1.spik_mamba) is False
 
 
 @pytest.mark.parametrize("case", ["missing", "duplicate", "unknown"])
@@ -61,26 +67,24 @@ def test_plans_reject_missing_duplicate_or_unknown_output_settings(case):
 
 
 @pytest.mark.parametrize("output_key", ["output_spiking", "vss_output_spiking"])
-def test_build_core_maps_output_name_for_clean_factory_and_freezes_legacy_post_plif(
+def test_build_core_maps_output_name_for_clean_factory_and_freezes_post_plif(
     monkeypatch, output_key
 ):
     def clean_factory(model_name, *, out_channels, patch_size, linear_projection,
                       residual_connections, dwconv2d_spiking, patch_embedding_spiking,
                       vss_output_spiking, input_skip):
+        output_name = next(
+            name for name in ("output_spiking", "vss_output_spiking")
+            if name in inspect.signature(current_build_model).parameters
+        )
         core = current_build_model(
             model_name, out_channels=out_channels, patch_size=patch_size,
             linear_projection=linear_projection,
             residual_connections=residual_connections,
             dwconv2d_spiking=dwconv2d_spiking,
             patch_embedding_spiking=patch_embedding_spiking,
-            output_spiking=vss_output_spiking, input_skip=input_skip,
+            input_skip=input_skip, **{output_name: vss_output_spiking},
         )
-        for name in ("conv_block1", "conv_block2", "conv_block3"):
-            encoder = getattr(core, name).spik_mamba
-            encoder.vss_output_spiking = encoder.output_spiking
-            del encoder.output_spiking
-            if not encoder.vss_output_spiking:
-                encoder.post_plif = torch.nn.Linear(1, 1)
         return core
 
     monkeypatch.setattr(adapter_module, "build_model", clean_factory)
@@ -88,11 +92,15 @@ def test_build_core_maps_output_name_for_clean_factory_and_freezes_legacy_post_p
     core = build_core(config)
     parameters = dict(core.named_parameters())
 
-    assert not parameters["conv_block1.spik_mamba.post_plif.weight"].requires_grad
+    encoder = core.conv_block1.spik_mamba
+    assert _output_spiking(encoder) is False
+    assert all(not parameter.requires_grad for parameter in encoder.post_plif.parameters())
     assert parameters["conv_block1.spik_mamba.post_norm.weight"].requires_grad
-    assert set(core.state_dict()) == set(build_core(
+    fptt_core = build_core(
         _config(output_key=output_key, output_spiking=False, use_fptt=True)
-    ).state_dict())
+    )
+    assert set(core.state_dict()) == set(fptt_core.state_dict())
+    core.load_state_dict(fptt_core.state_dict(), strict=True)
 
 
 @pytest.mark.parametrize("alpha", [0, -0.1])
@@ -139,12 +147,12 @@ def test_fptt_retains_disconnected_parameters_for_regularizer():
 
 
 def test_non_fptt_output_spiking_off_has_no_trainable_encoder_post_plif():
-    parameters = dict(build_core(_config(output_spiking=False)).named_parameters())
+    core = build_core(_config(output_spiking=False))
+    parameters = dict(core.named_parameters())
 
-    assert not any(
-        parameter.requires_grad
-        for name, parameter in parameters.items()
-        if name.startswith("conv_block1.spik_mamba.post_plif.")
+    assert all(
+        not parameter.requires_grad
+        for parameter in core.conv_block1.spik_mamba.post_plif.parameters()
     )
     assert parameters["conv_block1.spik_mamba.post_norm.weight"].requires_grad
 
