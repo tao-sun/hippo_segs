@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+from datetime import datetime
 from typing import Sequence
 
 
@@ -64,6 +65,13 @@ def _add_native_training_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--save-probabilities", action="store_true")
 
 
+def _add_run_dir(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--run-dir", type=Path,
+        help="isolated nnU-Net results directory; required with --continue, validate, and predict",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Create the five-command CLI with explicit, validated user inputs."""
 
@@ -82,12 +90,14 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--fold", type=_fold, required=True)
     _add_training_config(train)
     _add_native_training_flags(train)
+    _add_run_dir(train)
     train.add_argument("--continue", dest="continue_training", action="store_true")
 
     validate = commands.add_parser("validate", help="run native full-volume validation")
     _add_dataset_id(validate)
     validate.add_argument("--fold", type=_fold, required=True)
     _add_native_training_flags(validate)
+    _add_run_dir(validate)
     validate.add_argument("--best", action="store_true", help="validate checkpoint_best.pth")
 
     predict = commands.add_parser("predict", help="predict with native sliding-window inference")
@@ -97,6 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
     predict.add_argument("--folds", type=_fold, nargs="+", default=FIVE_FOLDS)
     predict.add_argument("--checkpoint", choices=("final", "best", "checkpoint_final.pth",
                                                    "checkpoint_best.pth"), default="checkpoint_final.pth")
+    _add_run_dir(predict)
     predict.add_argument("--postprocess", action="store_true",
                          help="select native CV postprocessing and write OUTPUT_postprocessed")
 
@@ -104,6 +115,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_dataset_id(full_cv)
     _add_training_config(full_cv)
     _add_native_training_flags(full_cv)
+    _add_run_dir(full_cv)
     full_cv.add_argument("--continue", dest="continue_training", action="store_true")
     full_cv.add_argument("--select-best", action="store_true",
                          help="run native best-configuration and postprocessing selection after CV")
@@ -124,6 +136,43 @@ def _require_native_paths() -> None:
         raise RuntimeError("Required nnU-Net path variables are unset: " + ", ".join(missing))
 
 
+def _configure_run_directory(args: argparse.Namespace) -> None:
+    if args.command == "prepare":
+        return
+
+    requested = getattr(args, "run_dir", None)
+    continuing = getattr(args, "continue_training", False)
+    if continuing and requested is None:
+        raise ValueError("--continue requires --run-dir pointing to the existing run")
+    if requested is None and args.command in {"validate", "predict"}:
+        raise ValueError(f"{args.command} requires --run-dir pointing to an existing run")
+
+    if requested is None:
+        root = Path(os.environ["nnUNet_results"]).expanduser().resolve()
+        stamp = datetime.now().strftime("run_%Y%m%d_%H%M%S")
+        run_dir = root / stamp
+        suffix = 1
+        while run_dir.exists():
+            run_dir = root / f"{stamp}_{suffix}"
+            suffix += 1
+    else:
+        run_dir = Path(requested).expanduser().resolve()
+        if continuing or args.command in {"validate", "predict"}:
+            if not run_dir.is_dir():
+                raise ValueError(f"Run directory does not exist: {run_dir}")
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    if not continuing and args.command in {"train", "full-cv"}:
+        existing_results = list(run_dir.glob("Dataset*/"))
+        if existing_results:
+            raise ValueError(
+                f"Run directory is not empty: {run_dir}; use --continue to reuse it"
+            )
+    args.run_dir = run_dir
+    os.environ["nnUNet_results"] = str(run_dir)
+    print(f"Run directory: {run_dir}")
+
+
 def _dataset_name(dataset_id: int) -> str:
     from nnunetv2.utilities.dataset_name_id_conversion import convert_id_to_dataset_name
 
@@ -132,6 +181,27 @@ def _dataset_name(dataset_id: int) -> str:
 
 def _plans_path(dataset_id: int) -> Path:
     return Path(os.environ["nnUNet_preprocessed"]) / _dataset_name(dataset_id) / f"{PLANS}.json"
+
+
+def _run_config_path(args: argparse.Namespace) -> Path:
+    return Path(args.run_dir) / "run_config.json"
+
+
+def _restore_run_plans(args: argparse.Namespace) -> None:
+    source = _run_config_path(args)
+    if not source.is_file():
+        raise ValueError(f"Run configuration is missing: {source}")
+    with source.open(encoding="utf-8") as stream:
+        payload = json.load(stream)
+    plans = payload.get("plans")
+    if not isinstance(plans, dict) or "snn_config" not in plans:
+        raise ValueError(f"Run configuration has no valid plans snapshot: {source}")
+    destination = _plans_path(args.dataset_id)
+    temporary = destination.with_suffix(".json.run.tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(plans, stream, indent=2)
+        stream.write("\n")
+    os.replace(temporary, destination)
 
 
 def _results_folder(dataset_id: int) -> Path:
@@ -161,8 +231,39 @@ def _check_saved_results(dataset_id: int) -> None:
 def _persist_training_config(args: argparse.Namespace) -> None:
     from snn_nnunet.prepare_plans import update_snn_config
 
+    if args.continue_training:
+        _restore_run_plans(args)
     plans_path = _plans_path(args.dataset_id)
     update_snn_config(plans_path, _requested_config(args, plans_path), _results_folder(args.dataset_id))
+
+
+def _save_run_config(args: argparse.Namespace) -> None:
+    if not hasattr(args, "run_dir") or args.run_dir is None:
+        return
+    plans_path = _plans_path(args.dataset_id)
+    with plans_path.open(encoding="utf-8") as stream:
+        plans = json.load(stream)
+    payload = {
+        "command": args.command,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "run_dir": str(args.run_dir),
+        "dataset_id": args.dataset_id,
+        "trainer": TRAINER,
+        "plans_identifier": PLANS,
+        "configuration": CONFIGURATION,
+        "arguments": {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in vars(args).items()
+        },
+        "snn_config": plans["snn_config"],
+        "plans": plans,
+    }
+    destination = args.run_dir / "run_config.json"
+    temporary = destination.with_suffix(".json.tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(payload, stream, indent=2)
+        stream.write("\n")
+    os.replace(temporary, destination)
 
 
 def _run_training(args: argparse.Namespace, fold: int, *, validation: bool) -> None:
@@ -207,6 +308,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     configure_runtime()
     _require_native_paths()
+    _configure_run_directory(args)
 
     if args.command == "prepare":
         from snn_nnunet.dataset_conversion import convert_or_register_dataset
@@ -217,12 +319,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         run_native_prepare(args.dataset_id, args.fingerprint_processes, args.preprocess_processes)
     elif args.command == "train":
         _persist_training_config(args)
+        _save_run_config(args)
         _run_training(args, args.fold, validation=False)
     elif args.command == "validate":
+        _restore_run_plans(args)
         _check_saved_results(args.dataset_id)
         _run_training(args, args.fold, validation=True)
     elif args.command == "full-cv":
         _persist_training_config(args)
+        _save_run_config(args)
         for fold in FIVE_FOLDS:
             _run_training(args, fold, validation=False)
         if args.select_best:

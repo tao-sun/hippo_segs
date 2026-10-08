@@ -1,6 +1,6 @@
 name: brats24_sagittal_fold1_VSS_fptt
-data_root: /gpfs/scratch1/shared/apiaghiardelli/BRATS2024
-cache_root: /gpfs/scratch1/shared/apiaghiardelli/BRATS2024_subject_cache_zscore
+data_root: /home/aurora/data/BRATS2024_preprocessed
+cache_root: /home/aurora/data/BRATS2024_subject_cache_zscore_trainonly
 cache_required: true
 label_format: brats24
 val_fold: 1
@@ -12,6 +12,7 @@ linear_projection: true
 residual_connections: true
 dwconv2d_spiking: true
 patch_embedding_spiking: true
+vss_output_spiking: true  # final PLIF after every VSS encoder block
 input_skip: false  # orig only: input 4->8 projection + full-resolution 3x3 fusion
 # training
 # Set this to an existing run directory to resume from checkpoint_last.pt.
@@ -22,7 +23,7 @@ scheduler: reduce_plateau  # cosine or reduce_plateau
 # Independent ablations: minmax/false reproduces the old input and sampling.
 preprocessing_normalization: zscore  # zscore requires a new float32 cache
 preserve_float32: true             # true with zscore
-lesion_volume_sampling: true
+lesion_volume_sampling: false
 lesion_sampling_classes: [ET, TC]
 lesion_sampling_gamma: 0.5
 lesion_sampling_max_weight: 4.0
@@ -56,7 +57,7 @@ prob_threshold: 0.5
 # Applied only to thresholded prediction volumes; ground truth is untouched.
 apply_postprocessing: true
 # ET, TC, WT minimum connected-component sizes in voxels.
-min_component_sizes: [50, 50, 50]
+min_component_sizes: [161, 166, 50]
 closing_radius: 1
-subjects_per_fold:   # null/commented = use all subjects; otherwise first n per train/val fold
+subjects_per_fold: 20 # null/commented = use all subjects; otherwise first n per train/val fold
 # overfit_subjects: 5

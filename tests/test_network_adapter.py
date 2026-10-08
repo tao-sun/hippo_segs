@@ -23,7 +23,7 @@ APPROVED_CONFIG = {
         "residual_connections": True,
         "dwconv2d_spiking": True,
         "patch_embedding_spiking": True,
-        "vss_output_spiking": True,
+        "output_spiking": True,
         "input_skip": False,
     },
     "temporal_axis": 0,
@@ -61,7 +61,7 @@ def test_shared_factory_passes_all_orig_architecture_settings():
         residual_connections=False,
         dwconv2d_spiking=False,
         patch_embedding_spiking=True,
-        vss_output_spiking=False,
+        output_spiking=False,
         input_skip=True,
     )
     assert model.patch_size == 4
@@ -69,7 +69,7 @@ def test_shared_factory_passes_all_orig_architecture_settings():
     assert model.residual_connections is False
     assert model.dwconv2d_spiking is False
     assert model.patch_embedding_spiking is True
-    assert model.vss_output_spiking is False
+    assert model.output_spiking is False
     assert model.input_skip is True
 
 
@@ -77,20 +77,20 @@ def test_legacy_factory_retains_shared_factory_defaults():
     model = build_legacy_model("orig")
     assert model.patch_size == 4
     assert model.patch_embedding_spiking is False
-    assert model.vss_output_spiking is True
+    assert model.output_spiking is True
     assert model.input_skip is False
 
 
 def test_direct_orig_constructor_keeps_positional_input_skip_slot():
     model = SNNBraTS(3, None, 16, "auto", 4, True, True, True, False, True)
     assert model.input_skip is True
-    assert model.vss_output_spiking is True
+    assert model.output_spiking is True
 
 
 def test_legacy_factory_keeps_positional_input_skip_slot():
     model = build_legacy_model("orig", 3, 4, True, True, True, False, True)
     assert model.input_skip is True
-    assert model.vss_output_spiking is True
+    assert model.output_spiking is True
 
 
 @pytest.mark.parametrize("factory", [build_model, build_legacy_model])

@@ -74,7 +74,7 @@ def collect_training_lesion_records(dataset):
     Cache/source mtime and size plus label convention invalidate old counts.
     Subsets are traversed before any GT is accessed, including overfit mode.
     """
-    from snn_fptt import BratsVolumeDataset, ViewSubset, brats_to_multilabel, subject_cache_path, load_subject_cache_file
+    from snn_fptt import brats_to_multilabel, subject_cache_path, load_subject_cache_file
     import nibabel as nib
 
     def patient(ds, index):
@@ -82,9 +82,16 @@ def collect_training_lesion_records(dataset):
             child = int(np.searchsorted(ds.cumulative_sizes, index, side='right'))
             offset = 0 if child == 0 else ds.cumulative_sizes[child-1]
             return patient(ds.datasets[child], index-offset)
-        if isinstance(ds, (Subset, ViewSubset)):
+        if isinstance(ds, Subset) or (
+            hasattr(ds, 'dataset') and hasattr(ds, 'indices')
+            and not hasattr(ds, 'subjects')
+        ):
             return patient(ds.dataset, ds.indices[index])
-        if not isinstance(ds, BratsVolumeDataset):
+        required = (
+            'subjects', 'cache_root', 'view', 'fold', 'cache_required',
+            'label_format', 'preprocessing_normalization',
+        )
+        if not all(hasattr(ds, attribute) for attribute in required):
             raise TypeError('Expected a BraTS patient dataset')
         subject = ds.subjects[index]
         cache_path = subject_cache_path(ds.cache_root, ds.view, ds.fold, subject.name) if ds.cache_root is not None else None

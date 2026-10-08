@@ -169,6 +169,19 @@ def validate_checkpoint_input_skip(checkpoint: Dict, input_skip: bool) -> None:
         )
 
 
+def validate_checkpoint_vss_output_spiking(
+    checkpoint: Dict, vss_output_spiking: bool
+) -> None:
+    saved = checkpoint.get("config", {}).get("vss_output_spiking", True)
+    if not isinstance(saved, bool):
+        raise ValueError("Checkpoint vss_output_spiking must be a boolean")
+    if saved != vss_output_spiking:
+        raise ValueError(
+            "Checkpoint vss_output_spiking="
+            f"{saved} differs from requested vss_output_spiking="
+            f"{vss_output_spiking}; start a new run when changing VSS behavior."
+        )
+
 def create_training_scheduler(optimizer, name: str):
     if name == "cosine":
         return torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -304,6 +317,9 @@ def load_training_checkpoint(accelerator: Accelerator,
 
     base_model = accelerator.unwrap_model(model)
     validate_checkpoint_input_skip(checkpoint, getattr(base_model, "input_skip", False))
+    validate_checkpoint_vss_output_spiking(
+        checkpoint, getattr(base_model, "vss_output_spiking", True)
+    )
     base_model.load_state_dict(checkpoint["model"])
     optimizer.load_state_dict(checkpoint["optimizer"])
     if resume_scheduler:
@@ -1229,6 +1245,11 @@ def load_experiment_from_yaml(config_path: str) -> Dict:
     if not isinstance(raw["patch_embedding_spiking"], bool):
         raise ValueError("patch_embedding_spiking must be a boolean")
 
+    vss_output_spiking = raw.get("vss_output_spiking", True)
+    if not isinstance(vss_output_spiking, bool):
+        raise ValueError("vss_output_spiking must be a boolean")
+    raw["vss_output_spiking"] = vss_output_spiking
+
     input_skip = raw.get("input_skip", False)
     if not isinstance(input_skip, bool):
         raise ValueError("input_skip must be a boolean")
@@ -1380,7 +1401,7 @@ def build_model(model_name, out_channels=3, patch_size=4,
         residual_connections=residual_connections,
         dwconv2d_spiking=dwconv2d_spiking,
         patch_embedding_spiking=patch_embedding_spiking,
-        vss_output_spiking=vss_output_spiking,
+            output_spiking=vss_output_spiking,
         input_skip=input_skip,
     )
 
@@ -1389,6 +1410,7 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
     accelerator = Accelerator()
     use_fptt = exp_cfg.get("use_fptt", True)
     input_skip = exp_cfg.get("input_skip", False)
+    vss_output_spiking = exp_cfg.get("vss_output_spiking", True)
     exp_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", exp_cfg["name"])
     resume_from = exp_cfg.get("resume_from")
     resume_scheduler = exp_cfg.get("resume_scheduler", True)
@@ -1417,6 +1439,9 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
         )
         validate_checkpoint_training_mode(resume_checkpoint, use_fptt)
         validate_checkpoint_input_skip(resume_checkpoint, input_skip)
+        validate_checkpoint_vss_output_spiking(
+            resume_checkpoint, vss_output_spiking
+        )
         if resume_scheduler:
             validate_checkpoint_scheduler(resume_checkpoint, scheduler_name)
         resume_checkpoint_config = dict(resume_checkpoint.get("config", {}))
@@ -1515,6 +1540,7 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
         "residual_connections": residual_connections,
         "dwconv2d_spiking": dwconv2d_spiking,
         "patch_embedding_spiking": patch_embedding_spiking,
+        "vss_output_spiking": vss_output_spiking,
         "input_skip": input_skip,
         "epochs": epochs,
         "batch_size_subjects": batch_size_subjects,
@@ -1711,6 +1737,7 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
         residual_connections=residual_connections,
         dwconv2d_spiking=dwconv2d_spiking,
         patch_embedding_spiking=patch_embedding_spiking,
+        vss_output_spiking=vss_output_spiking,
         input_skip=input_skip,
     )
 
@@ -1885,16 +1912,16 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
 
             train_dice_metrics = None
             if epoch % eval_every == 0:
-                # train_dice_metrics = evaluate_3d_snn(
-                #     model, train_eval_loader, accelerator,
-                #     prob_threshold=prob_threshold, k=eval_batch_slices, spkmon=None,
-                # )
-                # print(f"  train dice: "
-                #     f"ET={train_dice_metrics['dice_ET']:.4f}  "
-                #     f"TC={train_dice_metrics['dice_TC']:.4f}  "
-                #     f"WT={train_dice_metrics['dice_WT']:.4f}  "
-                #     f"mean={train_dice_metrics['dice_mean']:.4f}  "
-                #     f"(N={train_dice_metrics['n_subjects']})")
+                train_dice_metrics = evaluate_3d_snn(
+                    model, train_eval_loader, accelerator,
+                    prob_threshold=prob_threshold, k=eval_batch_slices, spkmon=None,
+                )
+                print(f"  train dice: "
+                    f"ET={train_dice_metrics['dice_ET']:.4f}  "
+                    f"TC={train_dice_metrics['dice_TC']:.4f}  "
+                    f"WT={train_dice_metrics['dice_WT']:.4f}  "
+                    f"mean={train_dice_metrics['dice_mean']:.4f}  "
+                    f"(N={train_dice_metrics['n_subjects']})")
 
                 metrics = evaluate_3d_snn(model,
                                         val_loader,

@@ -68,16 +68,16 @@ class _SpikMambaEncoderAdapter(nn.Module):
         residual_connections: bool = True,
         dwconv2d_spiking: bool = True,
         patch_embedding_spiking: bool = False,
-        vss_output_spiking: bool = True,
+        output_spiking: bool = True,
     ) -> None:
         super().__init__()
-        if not isinstance(vss_output_spiking, bool):
-            raise TypeError("vss_output_spiking must be a boolean")
+        if not isinstance(output_spiking, bool):
+            raise TypeError("output_spiking must be a boolean")
         self.in_channels = int(in_channels)
         self.out_channels = int(out_channels)
         self.channels = self.out_channels
         self.patch_size = int(patch_size)
-        self.vss_output_spiking = vss_output_spiking
+        self.output_spiking = output_spiking
         self.patch_embed = Spiking2DPatchEmbedding(
             in_channels=self.in_channels,
             embed_dim=self.out_channels,
@@ -98,10 +98,13 @@ class _SpikMambaEncoderAdapter(nn.Module):
             dwconv2d_spiking=dwconv2d_spiking,
         )
         self.post_norm = nn.GroupNorm(1, self.out_channels)
-        self.post_plif = PLIFNode(
-            init_tau=init_tau,
-            surrogate_function=surrogate.ATan(),
-            detach_reset=True,
+        self.post_plif = (
+            PLIFNode(
+                init_tau=init_tau,
+                surrogate_function=surrogate.ATan(),
+                detach_reset=True,
+            )
+            if output_spiking else nn.Identity()
         )
 
     def forward(self, x: torch.Tensor, time_step: int) -> torch.Tensor:
@@ -125,7 +128,7 @@ class _SpikMambaEncoderAdapter(nn.Module):
         )
 
         x = self.post_norm(x)
-        if self.vss_output_spiking:
+        if self.output_spiking:
             x, _ = self.post_plif(x, time_step)
         return x
 
@@ -141,7 +144,7 @@ class ConvBlock(nn.Module):
                  residual_connections=True,
                  dwconv2d_spiking=True,
                  patch_embedding_spiking=False,
-                 vss_output_spiking=True):
+                 output_spiking=True):
         super().__init__()
         self.dropout = float(dropout)
         self.normalization = normalization
@@ -161,7 +164,7 @@ class ConvBlock(nn.Module):
                 residual_connections=residual_connections,
                 dwconv2d_spiking=dwconv2d_spiking,
                 patch_embedding_spiking=patch_embedding_spiking,
-                vss_output_spiking=vss_output_spiking,
+                output_spiking=output_spiking,
             )
         else:
             self.conv = nn.Conv2d(
@@ -174,11 +177,13 @@ class ConvBlock(nn.Module):
             )
 
         self.norm = nn.GroupNorm(1, out_channels)
-        self.spike_neurons = PLIFNode(
-            init_tau=init_tau,
-            surrogate_function=surrogate.ATan(),
-            detach_reset=True,
-            no_spiking=(not spiking)
+        self.spike_neurons = (
+            PLIFNode(
+                init_tau=init_tau,
+                surrogate_function=surrogate.ATan(),
+                detach_reset=True,
+            )
+            if spiking and output_spiking else nn.Identity()
         )
 
     def forward(self, x, time_step: int):
@@ -193,10 +198,10 @@ class ConvBlock(nn.Module):
         if self.normalization:
             out = self.norm(out)
 
-        if self.spiking:
+        if isinstance(self.spike_neurons, PLIFNode):
             out, _ = self.spike_neurons(out, time_step)
         else:
-            out = self.spike_neurons(out, time_step)
+            out = self.spike_neurons(out)
         if self.dropout > 0:
             out = F.dropout(out, p=self.dropout, training=self.training)
         return out
@@ -204,7 +209,7 @@ class ConvBlock(nn.Module):
 
 class DeconvBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=2, stride=2,
-                 dropout=0.3, init_tau=2.0):
+                 dropout=0.3, init_tau=2.0, output_spiking=True):
         super().__init__()
         self.dropout = float(dropout)
 
@@ -212,16 +217,22 @@ class DeconvBlock(nn.Module):
                                          kernel_size=kernel_size, stride=stride, bias=False)
         # self.norm = nn.BatchNorm2d(out_channels)
         self.norm = nn.GroupNorm(1, out_channels)
-        self.spike_neurons = PLIFNode(
-            init_tau=init_tau,
-            surrogate_function=surrogate.ATan(),
-            detach_reset=True
+        self.spike_neurons = (
+            PLIFNode(
+                init_tau=init_tau,
+                surrogate_function=surrogate.ATan(),
+                detach_reset=True,
+            )
+            if output_spiking else nn.Identity()
         )
 
     def forward(self, x, time_step: int):
         out = self.deconv(x)
         out = self.norm(out)
-        out, _ = self.spike_neurons(out, time_step)
+        if isinstance(self.spike_neurons, PLIFNode):
+            out, _ = self.spike_neurons(out, time_step)
+        else:
+            out = self.spike_neurons(out)
         if self.dropout > 0:
             out = F.dropout(out, p=self.dropout, training=self.training)
         return out
@@ -244,7 +255,7 @@ class SNNBraTS(nn.Module):
                  dwconv2d_spiking: bool = True,
                  patch_embedding_spiking: bool = False,
                  input_skip: bool = False,
-                 vss_output_spiking: bool = True):
+                 output_spiking: bool = True):
         super().__init__()
         if isinstance(patch_size, bool) or not isinstance(patch_size, int) or patch_size <= 0:
             raise ValueError("patch_size must be a positive integer")
@@ -256,8 +267,8 @@ class SNNBraTS(nn.Module):
             raise TypeError("dwconv2d_spiking must be a boolean")
         if not isinstance(patch_embedding_spiking, bool):
             raise TypeError("patch_embedding_spiking must be a boolean")
-        if not isinstance(vss_output_spiking, bool):
-            raise TypeError("vss_output_spiking must be a boolean")
+        if not isinstance(output_spiking, bool):
+            raise TypeError("output_spiking must be a boolean")
         if not isinstance(input_skip, bool):
             raise TypeError("input_skip must be a boolean")
         self.input_skip = input_skip
@@ -266,7 +277,7 @@ class SNNBraTS(nn.Module):
         self.residual_connections = residual_connections
         self.dwconv2d_spiking = dwconv2d_spiking
         self.patch_embedding_spiking = patch_embedding_spiking
-        self.vss_output_spiking = vss_output_spiking
+        self.output_spiking = output_spiking
         self.encoder_scale = self.patch_size ** 3
         # Encoder
         spik_mamba_kwargs = {
@@ -279,7 +290,7 @@ class SNNBraTS(nn.Module):
             "residual_connections": self.residual_connections,
             "dwconv2d_spiking": self.dwconv2d_spiking,
             "patch_embedding_spiking": self.patch_embedding_spiking,
-            "vss_output_spiking": self.vss_output_spiking,
+            "output_spiking": output_spiking,
         }
         self.conv_block1 = ConvBlock(
             4,
@@ -304,25 +315,25 @@ class SNNBraTS(nn.Module):
         )
 
         # Decoder
-        self.deconv_block1 = DeconvBlock(128, 128, self.patch_size, self.patch_size, dropout=0.1)
+        self.deconv_block1 = DeconvBlock(128, 128, self.patch_size, self.patch_size, dropout=0.1, output_spiking=output_spiking)
         self.deconv1_conv = ConvBlock(
-            128, 128, padding=1, dropout=0.1
+            128, 128, padding=1, dropout=0.1, output_spiking=output_spiking
         )
         self.concat1_conv = ConvBlock(
-            128 + 64, 128, padding=1, dropout=0.1
+            128 + 64, 128, padding=1, dropout=0.1, output_spiking=output_spiking
         )
 
-        self.deconv_block2 = DeconvBlock(128, 128, self.patch_size, self.patch_size, dropout=0.1)
+        self.deconv_block2 = DeconvBlock(128, 128, self.patch_size, self.patch_size, dropout=0.1, output_spiking=output_spiking)
         self.deconv2_conv = ConvBlock(
-            128, 128, padding=1, dropout=0.1
+            128, 128, padding=1, dropout=0.1, output_spiking=output_spiking
         )
         self.concat2_conv = ConvBlock(
-            128 + 32, 128, padding=1, dropout=0.1
+            128 + 32, 128, padding=1, dropout=0.1, output_spiking=output_spiking
         )
 
-        self.deconv_block3 = DeconvBlock(128, 128, self.patch_size, self.patch_size, dropout=0.1)
+        self.deconv_block3 = DeconvBlock(128, 128, self.patch_size, self.patch_size, dropout=0.1, output_spiking=output_spiking)
         self.deconv3_conv = ConvBlock(
-            128, 128, padding=1, dropout=0.1
+            128, 128, padding=1, dropout=0.1, output_spiking=output_spiking
         )
 
         # Classifier head (non-spiking); classes {0,1,2,3}, with 3 = BraTS 4
@@ -552,8 +563,8 @@ def build_model(model_name: str, out_channels: int = 3, patch_size: int = 4,
                 residual_connections: bool = True,
                 dwconv2d_spiking: bool = True,
                 patch_embedding_spiking: bool = False,
-                vss_output_spiking: bool = True,
-                input_skip: bool = False) -> nn.Module:
+                input_skip: bool = False,
+                output_spiking: bool = True) -> nn.Module:
     if input_skip and model_name != "orig":
         raise ValueError("input_skip=true is supported only for model: orig")
     if model_name == "orig":
@@ -564,8 +575,8 @@ def build_model(model_name: str, out_channels: int = 3, patch_size: int = 4,
             residual_connections=residual_connections,
             dwconv2d_spiking=dwconv2d_spiking,
             patch_embedding_spiking=patch_embedding_spiking,
-            vss_output_spiking=vss_output_spiking,
             input_skip=input_skip,
+            output_spiking=output_spiking,
         )
     if model_name == "shallow":
         return SNNBraTSUNetShallow(out_channels=out_channels)

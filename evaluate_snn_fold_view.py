@@ -181,6 +181,7 @@ def read_model_spec(payload: Mapping[str, Any]) -> Tuple[Mapping[str, Any], Dict
         "residual_connections": model_config["residual_connections"],
         "dwconv2d_spiking": model_config["dwconv2d_spiking"],
         "patch_embedding_spiking": model_config["patch_embedding_spiking"],
+        "vss_output_spiking": model_config.get("vss_output_spiking", True),
         "input_skip": model_config.get("input_skip", False),
     }
     return payload["model"], kwargs

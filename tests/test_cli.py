@@ -76,11 +76,17 @@ def test_prepare_registers_dataset_and_runs_verified_native_preparation(tmp_path
 
 def test_train_persists_complete_config_and_passes_native_flags(tmp_path, monkeypatch):
     plans_path = _workspace(tmp_path, monkeypatch)
+    run_dir = tmp_path / "nnUNet_results" / "resume_run"
+    run_dir.mkdir()
+    saved_plans = json.loads(plans_path.read_text())
+    saved_plans["snn_config"].update(model_name="medium", temporal_axis=1, k=8, use_fptt=False)
+    (run_dir / "run_config.json").write_text(json.dumps({"plans": saved_plans}))
     training = importlib.import_module("nnunetv2.run.run_training")
     calls = []
     monkeypatch.setattr(training, "run_training", lambda *a, **kw: calls.append((a, kw)))
     assert cli.main(["train", "--dataset-id", "11", "--fold", "2", "--model", "medium",
-                     "--temporal-axis", "1", "--k", "8", "--no-fptt", "--gpus", "2", "--continue"]) == 0
+                     "--temporal-axis", "1", "--k", "8", "--no-fptt", "--gpus", "2", "--continue",
+                     "--run-dir", str(run_dir)]) == 0
     assert calls == [((), {"dataset_name_or_id": "11", "configuration": "3d_fullres", "fold": 2,
                           "trainer_class_name": "nnUNetTrainerSNNFPTT", "plans_identifier": "SNNPlans",
                           "num_gpus": 2, "continue_training": True, "only_run_validation": False,
@@ -92,24 +98,31 @@ def test_train_persists_complete_config_and_passes_native_flags(tmp_path, monkey
 
 def test_incompatible_results_rejected_before_native_launch(tmp_path, monkeypatch):
     plans_path = _workspace(tmp_path, monkeypatch)
-    result = tmp_path / "nnUNet_results" / "Dataset011_BraTS" / "nnUNetTrainerSNNFPTT__SNNPlans__3d_fullres"
+    run_dir = tmp_path / "nnUNet_results" / "existing_run"
+    result = run_dir / "Dataset011_BraTS" / "nnUNetTrainerSNNFPTT__SNNPlans__3d_fullres"
     result.mkdir(parents=True)
     (result / "plans.json").write_text(plans_path.read_text())
     training = importlib.import_module("nnunetv2.run.run_training")
     calls = []
     monkeypatch.setattr(training, "run_training", lambda *a, **kw: calls.append((a, kw)))
     with pytest.raises(ValueError, match="incompatible"):
-        cli.main(["train", "--dataset-id", "11", "--fold", "0", "--k", "8"])
+        cli.main(["train", "--dataset-id", "11", "--fold", "0", "--k", "8",
+              "--run-dir", str(run_dir)])
     assert calls == []
     assert json.loads(plans_path.read_text())["snn_config"]["k"] == 16
 
 
 def test_validate_uses_saved_config_and_native_best_flag(tmp_path, monkeypatch):
     _workspace(tmp_path, monkeypatch)
+    run_dir = tmp_path / "nnUNet_results" / "validation_run"
+    run_dir.mkdir()
+    plans_path = tmp_path / "nnUNet_preprocessed" / "Dataset011_BraTS" / "SNNPlans.json"
+    (run_dir / "run_config.json").write_text(json.dumps({"plans": json.loads(plans_path.read_text())}))
     training = importlib.import_module("nnunetv2.run.run_training")
     calls = []
     monkeypatch.setattr(training, "run_training", lambda *a, **kw: calls.append(kw))
-    assert cli.main(["validate", "--dataset-id", "11", "--fold", "3", "--best", "--save-probabilities"]) == 0
+    assert cli.main(["validate", "--dataset-id", "11", "--fold", "3", "--best", "--save-probabilities",
+                     "--run-dir", str(run_dir)]) == 0
     assert calls == [{"dataset_name_or_id": "11", "configuration": "3d_fullres", "fold": 3,
                       "trainer_class_name": "nnUNetTrainerSNNFPTT", "plans_identifier": "SNNPlans",
                       "num_gpus": 1, "continue_training": False, "only_run_validation": True,
@@ -191,6 +204,8 @@ def test_training_rejects_invalid_existing_plans_config_before_native_launch(tmp
 
 def test_predict_uses_exact_native_predictor_and_normalizes_checkpoint(tmp_path, monkeypatch):
     _workspace(tmp_path, monkeypatch)
+    run_dir = tmp_path / "nnUNet_results" / "predict_run"
+    run_dir.mkdir()
     native = importlib.import_module("nnunetv2.inference.predict_from_raw_data")
     seen = []
     class Predictor:
@@ -202,10 +217,11 @@ def test_predict_uses_exact_native_predictor_and_normalizes_checkpoint(tmp_path,
             seen.append(("files", args, kwargs))
     monkeypatch.setattr(native, "nnUNetPredictor", Predictor)
     assert cli.main(["predict", "--dataset-id", "11", "--input", "images", "--output", "pred",
-                     "--folds", "0", "2", "4", "--checkpoint", "best"]) == 0
+                     "--folds", "0", "2", "4", "--checkpoint", "best",
+                     "--run-dir", str(run_dir)]) == 0
     assert seen == [
         ("init", {"tile_step_size": 0.5, "use_gaussian": True, "use_mirroring": True}),
-        ("model", (str(tmp_path / "nnUNet_results" / "Dataset011_BraTS" /
+        ("model", (str(run_dir / "Dataset011_BraTS" /
                         "nnUNetTrainerSNNFPTT__SNNPlans__3d_fullres"),),
          {"use_folds": (0, 2, 4), "checkpoint_name": "checkpoint_best.pth"}),
         ("files", ("images", "pred"), {}),
@@ -248,6 +264,8 @@ def test_full_cv_can_run_native_best_configuration_selection(tmp_path, monkeypat
 
 def test_predict_postprocessing_uses_native_selection_and_application(tmp_path, monkeypatch):
     _workspace(tmp_path, monkeypatch)
+    run_dir = tmp_path / "nnUNet_results" / "postprocess_run"
+    run_dir.mkdir()
     native = importlib.import_module("nnunetv2.inference.predict_from_raw_data")
     selection = importlib.import_module("nnunetv2.evaluation.find_best_configuration")
     processing = importlib.import_module("nnunetv2.postprocessing.remove_connected_components")
@@ -268,5 +286,5 @@ def test_predict_postprocessing_uses_native_selection_and_application(tmp_path, 
     monkeypatch.setattr(files, "load_pickle", lambda path: (['native_fn'], [{"native": True}]))
     monkeypatch.setattr(processing, "apply_postprocessing_to_folder", lambda *a, **kw: events.append((a, kw)))
     assert cli.main(["predict", "--dataset-id", "11", "--input", "images", "--output", "pred",
-                     "--postprocess"]) == 0
+                     "--postprocess", "--run-dir", str(run_dir)]) == 0
     assert events == ["predict", (("pred", "pred_postprocessed", ['native_fn'], [{"native": True}]), {})]

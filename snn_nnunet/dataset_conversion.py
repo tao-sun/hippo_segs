@@ -114,8 +114,11 @@ def is_nnunet_raw_dataset(root: Path) -> bool:
 def _load_segmentation(source: Path) -> tuple[nib.Nifti1Image, np.ndarray]:
     image = nib.load(str(source))
     labels = np.asanyarray(image.dataobj)
-    if labels.ndim != 3 or not np.issubdtype(labels.dtype, np.integer):
-        raise ValueError(f"Expected a 3D integer segmentation: {source}")
+    if labels.ndim != 3 or not np.issubdtype(labels.dtype, np.number):
+        raise ValueError(f"Expected a 3D numeric segmentation: {source}")
+    if not np.isfinite(labels).all() or not np.equal(labels, np.rint(labels)).all():
+        raise ValueError(f"Expected integer-valued segmentation voxels: {source}")
+    labels = np.rint(labels).astype(np.int16, copy=False)
     unexpected = np.setdiff1d(np.unique(labels), [0, 1, 2, 3, 4])
     if unexpected.size:
         raise ValueError(f"Unexpected BraTS24 labels in {source}: {unexpected.tolist()}")

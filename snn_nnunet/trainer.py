@@ -5,14 +5,13 @@ import os
 import tempfile
 
 import torch
-from torch import autocast
 from torch import nn
 from torch import distributed as dist
 from torch._dynamo import OptimizedModule
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
-from nnunetv2.utilities.helpers import dummy_context
+from nnunetv2.training.loss.dice import get_tp_fp_fn_tn
 from nnunetv2.utilities.plans_handling.plans_handler import ConfigurationManager, PlansManager
 
 from snn_nnunet import fptt, network_adapter
@@ -44,6 +43,8 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
         device: torch.device = torch.device("cuda"),
     ):
         super().__init__(plans, configuration, fold, dataset_json, device)
+        # The base trainer enables CUDA AMP by default. Keep SNN training in FP32.
+        self.grad_scaler = None
         self.snn_config = SNNConfig.from_plans(self.plans_manager.plans)
         self.num_epochs = 300
         self.num_iterations_per_epoch = 250
@@ -196,30 +197,26 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
             data_window = slice_temporal_window(data, t0, end, axis)
             target_window = slice_temporal_window(target, t0, end, axis)
             self.optimizer.zero_grad(set_to_none=True)
-            with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-                logits = self.network(data_window, t0=t0, chunk_size=window_length)
-                task_loss = self.loss(logits, target_window)
-                regularization = torch.zeros_like(task_loss)
-                if config.use_fptt:
-                    regularization = fptt.regularizer_loss(
-                        adapter, regularization, config.fptt_alpha,
-                        config.fptt_rho, config.fptt_lambda,
-                    )
-                total_loss = task_loss + regularization
+            logits = self.network(data_window, t0=t0, chunk_size=window_length)
+            task_loss = self.loss(logits, target_window)
+            regularization = torch.zeros_like(task_loss)
+            if config.use_fptt:
+                regularization = fptt.regularizer_loss(
+                    adapter, regularization, config.fptt_alpha,
+                    config.fptt_rho, config.fptt_lambda,
+                )
+            total_loss = task_loss + regularization
+            if not torch.isfinite(total_loss).all().item():
+                raise FloatingPointError(
+                    f"Non-finite training loss at epoch {self.current_epoch}, window {t0}:{end}"
+                )
 
-            if self.grad_scaler is not None:
-                self.grad_scaler.scale(total_loss).backward()
-                self.grad_scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-                scale_before = self.grad_scaler.get_scale()
-                self.grad_scaler.step(self.optimizer)
-                self.grad_scaler.update()
-                did_step = self.grad_scaler.get_scale() >= scale_before
-            else:
-                total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-                self.optimizer.step()
-                did_step = True
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                self.network.parameters(), 12, error_if_nonfinite=True
+            )
+            self.optimizer.step()
+            did_step = True
 
             if config.use_fptt and did_step:
                 fptt.update_running_params(adapter, config.fptt_alpha, config.fptt_beta)
@@ -239,6 +236,54 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
             "optimizer_updates": updates,
             "k": config.k,
             "fptt_mode": config.use_fptt,
+        }
+
+    def validation_step(self, batch: dict) -> dict:
+        """Compute the native online metrics in FP32, without nnU-Net's AMP wrapper."""
+        data = batch["data"].to(self.device, non_blocking=True)
+        target = batch["target"]
+        if isinstance(target, list):
+            target = [item.to(self.device, non_blocking=True) for item in target]
+        else:
+            target = target.to(self.device, non_blocking=True)
+
+        output = self.network(data)
+        loss = self.loss(output, target)
+        if self.enable_deep_supervision:
+            output = output[0]
+            target = target[0]
+
+        axes = [0] + list(range(2, output.ndim))
+        if self.label_manager.has_regions:
+            predicted = (torch.sigmoid(output) > 0.5).long()
+        else:
+            output_seg = output.argmax(1)[:, None]
+            predicted = torch.zeros_like(output)
+            predicted.scatter_(1, output_seg, 1)
+
+        if self.label_manager.has_ignore_label:
+            if self.label_manager.has_regions:
+                mask = ~target[:, -1:] if target.dtype == torch.bool else 1 - target[:, -1:]
+                target = target[:, :-1]
+            else:
+                mask = (target != self.label_manager.ignore_label).float()
+                target[target == self.label_manager.ignore_label] = 0
+        else:
+            mask = None
+
+        tp, fp, fn, _ = get_tp_fp_fn_tn(predicted, target, axes=axes, mask=mask)
+        tp_hard = tp.detach().cpu().numpy()
+        fp_hard = fp.detach().cpu().numpy()
+        fn_hard = fn.detach().cpu().numpy()
+        if not self.label_manager.has_regions:
+            tp_hard = tp_hard[1:]
+            fp_hard = fp_hard[1:]
+            fn_hard = fn_hard[1:]
+        return {
+            "loss": loss.detach().cpu().numpy(),
+            "tp_hard": tp_hard,
+            "fp_hard": fp_hard,
+            "fn_hard": fn_hard,
         }
 
     def on_train_epoch_end(self, train_outputs: list[dict]):

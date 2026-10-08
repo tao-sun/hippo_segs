@@ -17,7 +17,7 @@ CONFIG = {
         "residual_connections": True,
         "dwconv2d_spiking": True,
         "patch_embedding_spiking": True,
-        "vss_output_spiking": True,
+        "output_spiking": True,
         "input_skip": False,
     },
     "temporal_axis": 0,
