@@ -1,0 +1,12 @@
+# Change family to snn and choose a new run_dir to train the SNN instead.
+family: unet3d
+dataset_id: 1
+fold: 0
+gpus: 1
+run_dir: /home/aurora/nnUNet_runs/unet3d_fold0_baseline
+
+snn:
+  variant: orig
+  temporal_axis: 0
+  k: 16
+  use_fptt: false

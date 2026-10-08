@@ -38,6 +38,25 @@ Preparation runs native nnU-Net fingerprinting, planning, and preprocessing with
 
 ## Train and resume
 
+To select between the stock 3D U-Net and the SNN without changing either
+trainer, edit `brats24_fold0_model.yaml`. Set `family` to `unet3d` or
+`snn`, and give each experiment a fresh `run_dir`. The launcher reads the
+appropriate plans (`nnUNetPlans` or `SNNPlans`) and keeps checkpoints in that
+run directory. The optional `snn` section is used only when `family: snn`.
+Run it from the repository root after exporting the existing data paths:
+
+~~~bash
+export nnUNet_raw=/home/aurora/nnUNet_raw
+export nnUNet_preprocessed=/home/aurora/nnUNet_preprocessed
+uv run --python 3.10 python -m snn_nnunet.run_model \
+  --config brats24_fold0_model.yaml
+~~~
+
+The launcher refuses a nonempty `run_dir` and saves a copy of the YAML as
+`experiment.yaml` inside the new run. Use a different run directory when
+switching model family. For `unet3d` it calls nnU-Net's standard `nnUNetTrainer`
+with `3d_fullres`; for `snn` it calls this repository's existing training CLI.
+
 Use a distinct `nnUNet_results` root for each experiment. Keep its path: resume, validation, and prediction must point to that same root. The native result folders and checkpoints live beneath it. `full-cv` trains folds 0 through 4 sequentially with the same configuration:
 
 ~~~bash
