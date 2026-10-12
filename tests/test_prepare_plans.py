@@ -61,7 +61,7 @@ def test_derive_changes_only_approved_fields_and_does_not_mutate_stock(stock_pla
     expected = deepcopy(original)
     expected["plans_name"] = "SNNPlans"
     expected["configurations"]["3d_fullres"]["patch_size"] = [128, 128, 128]
-    expected["configurations"]["3d_fullres"]["batch_size"] = 4
+    expected["configurations"]["3d_fullres"]["batch_size"] = 2
     expected["snn_config"] = CONFIG
     assert derived == expected
     assert stock_plans == original

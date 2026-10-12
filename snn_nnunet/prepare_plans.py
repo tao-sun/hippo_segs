@@ -56,7 +56,7 @@ def derive_snn_plans(stock: Mapping[str, Any], snn_config: Mapping[str, Any]) ->
     result = deepcopy(dict(stock))
     result["plans_name"] = PLANS_IDENTIFIER
     result["configurations"]["3d_fullres"]["patch_size"] = [128, 128, 128]
-    result["configurations"]["3d_fullres"]["batch_size"] = 4
+    result["configurations"]["3d_fullres"]["batch_size"] = 2
     result["snn_config"] = _validated_config(snn_config)
     return result
 

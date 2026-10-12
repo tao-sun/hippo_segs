@@ -8,9 +8,11 @@ import subprocess
 import sys
 
 import pytest
+import yaml
 
 from snn_nnunet import prepare_plans
 from snn_nnunet import cli
+from snn_nnunet import run_model
 
 
 def _workspace(tmp_path, monkeypatch):
@@ -288,3 +290,87 @@ def test_predict_postprocessing_uses_native_selection_and_application(tmp_path, 
     assert cli.main(["predict", "--dataset-id", "11", "--input", "images", "--output", "pred",
                      "--postprocess", "--run-dir", str(run_dir)]) == 0
     assert events == ["predict", (("pred", "pred_postprocessed", ['native_fn'], [{"native": True}]), {})]
+
+
+def _write_model_config(path, run_dir, family="unet2d"):
+    path.write_text(yaml.safe_dump({
+        "family": family,
+        "dataset_id": 1,
+        "fold": 0,
+        "gpus": 1,
+        "run_dir": str(run_dir),
+    }))
+    return path
+
+
+def _write_native_plans(dataset_folder):
+    dataset_folder.mkdir(parents=True)
+    (dataset_folder / "nnUNetPlans.json").write_text(json.dumps({
+        "configurations": {
+            "2d": {"data_identifier": "nnUNetPlans_2d"},
+            "3d_fullres": {"data_identifier": "nnUNetPlans_3d_fullres"},
+        }
+    }))
+
+
+def test_model_config_accepts_unet2d_and_rejects_unknown_family(tmp_path):
+    config_path = _write_model_config(tmp_path / "experiment.yaml", tmp_path / "results")
+    assert run_model._config(config_path)["family"] == "unet2d"
+
+    _write_model_config(config_path, tmp_path / "results", family="resnet")
+    with pytest.raises(ValueError, match="unet2d, unet3d, or snn"):
+        run_model._config(config_path)
+
+
+@pytest.mark.parametrize(
+    ("family", "configuration", "data_identifier"),
+    [
+        ("unet2d", "2d", "nnUNetPlans_2d"),
+        ("unet3d", "3d_fullres", "nnUNetPlans_3d_fullres"),
+    ],
+)
+def test_model_launcher_uses_selected_native_configuration(
+    tmp_path, monkeypatch, family, configuration, data_identifier
+):
+    preprocessed = tmp_path / "preprocessed"
+    dataset_folder = preprocessed / "Dataset001_BraTS24GLI"
+    _write_native_plans(dataset_folder)
+    (dataset_folder / data_identifier).mkdir()
+    run_dir = tmp_path / "results"
+    config_path = _write_model_config(
+        tmp_path / "experiment.yaml", run_dir, family=family
+    )
+    calls = []
+
+    monkeypatch.setenv("nnUNet_raw", str(tmp_path / "raw"))
+    monkeypatch.setenv("nnUNet_preprocessed", str(preprocessed))
+    monkeypatch.setattr(
+        "nnunetv2.run.run_training.run_training",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    run_model.run(config_path)
+
+    assert calls == [{
+        "dataset_name_or_id": "1",
+        "configuration": configuration,
+        "fold": 0,
+        "trainer_class_name": "nnUNetTrainer",
+        "plans_identifier": "nnUNetPlans",
+        "num_gpus": 1,
+    }]
+    assert yaml.safe_load((run_dir / "experiment.yaml").read_text())["family"] == family
+
+
+def test_model_launcher_requires_preprocessed_2d_data(tmp_path, monkeypatch):
+    preprocessed = tmp_path / "preprocessed"
+    _write_native_plans(preprocessed / "Dataset001_BraTS24GLI")
+    run_dir = tmp_path / "results"
+    config_path = _write_model_config(tmp_path / "experiment.yaml", run_dir)
+    monkeypatch.setenv("nnUNet_raw", str(tmp_path / "raw"))
+    monkeypatch.setenv("nnUNet_preprocessed", str(preprocessed))
+
+    with pytest.raises(ValueError, match="Missing preprocessed data for configuration '2d'"):
+        run_model.run(config_path)
+
+    assert not run_dir.exists()

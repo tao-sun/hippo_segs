@@ -38,24 +38,55 @@ Preparation runs native nnU-Net fingerprinting, planning, and preprocessing with
 
 ## Train and resume
 
-To select between the stock 3D U-Net and the SNN without changing either
-trainer, edit `brats24_fold0_model.yaml`. Set `family` to `unet3d` or
-`snn`, and give each experiment a fresh `run_dir`. The launcher reads the
-appropriate plans (`nnUNetPlans` or `SNNPlans`) and keeps checkpoints in that
-run directory. The optional `snn` section is used only when `family: snn`.
-Run it from the repository root after exporting the existing data paths:
+To select the model without changing its trainer, edit
+`brats24_fold0_model.yaml`. The supported families are `unet2d`, `unet3d`,
+and `snn`; give each experiment a fresh `run_dir`. The launcher reads the
+appropriate plans (`nnUNetPlans` or `SNNPlans`), verifies that the selected
+configuration was preprocessed, and keeps checkpoints in that run directory.
+The optional `snn` section is used only when `family: snn`. Run it from the
+repository root after exporting the existing data paths:
 
 ~~~bash
-export nnUNet_raw=/home/aurora/nnUNet_raw
-export nnUNet_preprocessed=/home/aurora/nnUNet_preprocessed
+export nnUNet_raw=/gpfs/scratch1/shared/apiaghiardelli/nnUNet_raw
+export nnUNet_preprocessed=/gpfs/scratch1/shared/apiaghiardelli/nnUNet_preprocessed
 uv run --python 3.10 python -m snn_nnunet.run_model \
   --config brats24_fold0_model.yaml
 ~~~
 
 The launcher refuses a nonempty `run_dir` and saves a copy of the YAML as
 `experiment.yaml` inside the new run. Use a different run directory when
-switching model family. For `unet3d` it calls nnU-Net's standard `nnUNetTrainer`
-with `3d_fullres`; for `snn` it calls this repository's existing training CLI.
+switching model family. `unet2d` and `unet3d` call nnU-Net's standard
+`nnUNetTrainer` with configuration `2d` and `3d_fullres`, respectively. `snn`
+calls this repository's existing training CLI with `3d_fullres`.
+
+On the cluster, submit the generic GPU launcher. It requests one H100 by
+default; the command-line partition overrides that default when an A100 is
+preferred:
+
+~~~bash
+sbatch train_brats24_fold0.sbatch
+sbatch --partition=gpu_h100 train_brats24_fold0.sbatch
+sbatch --partition=gpu_a100 train_brats24_fold0.sbatch
+~~~
+
+The script reads the model family and GPU count from
+`brats24_fold0_model.yaml`. Its `#SBATCH --gpus=1` must match the YAML `gpus`
+value. To use another experiment file, submit with:
+
+~~~bash
+sbatch --export=ALL,CONFIG_PATH=/absolute/path/to/config.yaml \
+  train_brats24_fold0.sbatch
+~~~
+
+If the 2D preprocessed directory is absent, create it before submitting the
+training job:
+
+~~~bash
+srun --partition=gpu_h100 --ntasks=1 --cpus-per-task=16 --mem=64G \
+  --time=1-00:00:00 \
+  .venv/bin/nnUNetv2_preprocess -d 1 -plans_name nnUNetPlans -c 2d \
+  -np 16 --no_pbar
+~~~
 
 Use a distinct `nnUNet_results` root for each experiment. Keep its path: resume, validation, and prediction must point to that same root. The native result folders and checkpoints live beneath it. `full-cv` trains folds 0 through 4 sequentially with the same configuration:
 

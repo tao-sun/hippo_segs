@@ -1,14 +1,21 @@
-"""Start an isolated SNN or stock 3D nnU-Net training run from YAML."""
+"""Start an isolated SNN or stock nnU-Net training run from YAML."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 import shutil
 from typing import Any
 
 import yaml
+
+
+NATIVE_CONFIGURATIONS = {
+    "unet2d": "2d",
+    "unet3d": "3d_fullres",
+}
 
 
 def _integer(config: dict[str, Any], name: str, minimum: int, maximum: int) -> int:
@@ -23,8 +30,8 @@ def _config(path: Path) -> dict[str, Any]:
         config = yaml.safe_load(stream)
     if not isinstance(config, dict):
         raise ValueError("The experiment file must contain a YAML mapping")
-    if config.get("family") not in {"snn", "unet3d"}:
-        raise ValueError("family must be 'snn' or 'unet3d'")
+    if config.get("family") not in {"unet2d", "unet3d", "snn"}:
+        raise ValueError("family must be unet2d, unet3d, or snn")
     _integer(config, "dataset_id", 0, 999)
     _integer(config, "fold", 0, 4)
     _integer(config, "gpus", 1, 64)
@@ -52,6 +59,32 @@ def _dataset_folder(preprocessed: Path, dataset_id: int) -> Path:
     return matches[0]
 
 
+def _require_preprocessed_configuration(
+    dataset_folder: Path, plans: str, configuration: str
+) -> None:
+    plans_path = dataset_folder / f"{plans}.json"
+    if not plans_path.is_file():
+        raise ValueError(f"Missing plans: {plans_path}")
+    with plans_path.open(encoding="utf-8") as stream:
+        plans_data = json.load(stream)
+    configuration_data = plans_data.get("configurations", {}).get(configuration)
+    if not isinstance(configuration_data, dict):
+        raise ValueError(
+            f"Configuration '{configuration}' is missing from plans: {plans_path}"
+        )
+    data_identifier = configuration_data.get("data_identifier")
+    if not isinstance(data_identifier, str) or not data_identifier:
+        raise ValueError(
+            f"Configuration '{configuration}' has no data_identifier in {plans_path}"
+        )
+    data_folder = dataset_folder / data_identifier
+    if not data_folder.is_dir():
+        raise ValueError(
+            f"Missing preprocessed data for configuration '{configuration}': "
+            f"{data_folder}. Run nnUNetv2_preprocess with -c {configuration}."
+        )
+
+
 def run(config_path: Path) -> None:
     config_path = config_path.expanduser().resolve()
     config = _config(config_path)
@@ -67,15 +100,19 @@ def run(config_path: Path) -> None:
     preprocessed = Path(os.environ["nnUNet_preprocessed"]).expanduser().resolve()
     dataset_folder = _dataset_folder(preprocessed, dataset_id)
     plans = "SNNPlans" if family == "snn" else "nnUNetPlans"
-    if not (dataset_folder / f"{plans}.json").is_file():
-        raise ValueError(f"Missing plans: {dataset_folder / (plans + '.json')}")
+    configuration = "3d_fullres" if family == "snn" else NATIVE_CONFIGURATIONS[family]
+    _require_preprocessed_configuration(dataset_folder, plans, configuration)
     if run_dir.exists() and any(run_dir.iterdir()):
         raise ValueError(f"Run directory already contains files: {run_dir}. Choose a new run_dir.")
 
     run_dir.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(config_path, run_dir / "experiment.yaml")
     os.environ["nnUNet_results"] = str(run_dir)
-    print(f"Model family: {family}; dataset: {dataset_id}; fold: {fold}; GPUs: {gpus}", flush=True)
+    print(
+        f"Model family: {family}; configuration: {configuration}; "
+        f"dataset: {dataset_id}; fold: {fold}; GPUs: {gpus}",
+        flush=True,
+    )
     print(f"Run directory: {run_dir}", flush=True)
 
     if family == "snn":
@@ -92,15 +129,28 @@ def run(config_path: Path) -> None:
         ])
     else:
         from nnunetv2.run.run_training import run_training
+        from nnunetv2.utilities.file_path_utilities import get_output_folder
+        from snn_nnunet.empty_dice_evaluation import finalize_fold_summary
 
         run_training(
             dataset_name_or_id=str(dataset_id),
-            configuration="3d_fullres",
+            configuration=configuration,
             fold=fold,
             trainer_class_name="nnUNetTrainer",
             plans_identifier="nnUNetPlans",
             num_gpus=gpus,
         )
+        model_folder = Path(get_output_folder(
+            dataset_id, "nnUNetTrainer", "nnUNetPlans", configuration
+        ))
+        summary_path = model_folder / f"fold_{fold}" / "validation" / "summary.json"
+        if summary_path.is_file():
+            metrics = finalize_fold_summary(model_folder, fold)
+            print(
+                "Mean Validation Dice (empty-empty=1): "
+                f"{metrics['foreground_mean']['Dice']}",
+                flush=True,
+            )
 
 
 def main() -> None:

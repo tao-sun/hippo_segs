@@ -104,7 +104,7 @@ def _run_native_lifecycle(root: Path) -> None:
 
     production_plans = json.loads(plans_path.read_text())
     assert production_plans["configurations"]["3d_fullres"]["patch_size"] == [128, 128, 128]
-    assert production_plans["configurations"]["3d_fullres"]["batch_size"] == 4
+    assert production_plans["configurations"]["3d_fullres"]["batch_size"] == 2
     smoke_plans = json.loads(plans_path.read_text())
     smoke_plans["plans_name"] = "SmokeSNNPlans"
     smoke_plans["configurations"]["3d_fullres"]["patch_size"] = [8, 8, 8]

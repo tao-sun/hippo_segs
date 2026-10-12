@@ -1,12 +1,12 @@
-# Change family to snn and choose a new run_dir to train the SNN instead.
-family: unet3d
+# Supported families: unet2d, unet3d, snn. Use a fresh run_dir for every run.
+family: snn
 dataset_id: 1
 fold: 0
 gpus: 1
-run_dir: /home/aurora/nnUNet_runs/unet3d_fold0_baseline
+run_dir: /gpfs/scratch1/shared/apiaghiardelli/SNNMamba_k128_bs2
 
 snn:
   variant: orig
   temporal_axis: 0
-  k: 16
+  k: 128
   use_fptt: false

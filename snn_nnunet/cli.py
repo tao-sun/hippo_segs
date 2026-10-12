@@ -268,12 +268,22 @@ def _save_run_config(args: argparse.Namespace) -> None:
 
 def _run_training(args: argparse.Namespace, fold: int, *, validation: bool) -> None:
     from nnunetv2.run.run_training import run_training
+    from snn_nnunet.empty_dice_evaluation import finalize_fold_summary
 
     run_training(dataset_name_or_id=str(args.dataset_id), configuration=CONFIGURATION, fold=fold,
                  trainer_class_name=TRAINER, plans_identifier=PLANS, num_gpus=args.gpus,
                  continue_training=False if validation else args.continue_training,
                  only_run_validation=validation, val_with_best=args.best if validation else False,
                  export_validation_probabilities=args.save_probabilities)
+    model_folder = _results_folder(args.dataset_id)
+    summary_path = model_folder / f"fold_{fold}" / "validation" / "summary.json"
+    if summary_path.is_file():
+        metrics = finalize_fold_summary(model_folder, fold)
+        print(
+            "Mean Validation Dice (empty-empty=1): "
+            f"{metrics['foreground_mean']['Dice']}",
+            flush=True,
+        )
 
 
 def _select_best(dataset_id: int) -> dict:

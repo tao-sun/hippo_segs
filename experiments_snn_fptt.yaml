@@ -1,6 +1,6 @@
 name: brats24_sagittal_fold1_VSS_fptt
-data_root: /home/aurora/data/BRATS2024_preprocessed
-cache_root: /home/aurora/data/BRATS2024_subject_cache_zscore_trainonly
+data_root: /gpfs/scratch1/shared/apiaghiardelli/data/BRATS2024_preprocessed
+cache_root: /gpfs/scratch1/shared/apiaghiardelli/data/BRATS2024_subject_cache_zscore_trainonly
 cache_required: true
 label_format: brats24
 val_fold: 1

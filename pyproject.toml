@@ -43,7 +43,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["snn_nnunet"]
-py-modules = ["model", "spike_neurons", "spikmamba", "surrogate", "accelerating", "spike_neuron", "spike_activations"]
+py-modules = ["model", "spike_neurons", "spikmamba", "surrogate", "accelerating", "spike_neuron", "spike_activations", "postprocessing"]
 
 [tool.pytest.ini_options]
 markers = ["integration: runs the native nnU-Net synthetic lifecycle"]
