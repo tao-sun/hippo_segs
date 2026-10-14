@@ -183,6 +183,10 @@ def read_model_spec(payload: Mapping[str, Any]) -> Tuple[Mapping[str, Any], Dict
         "patch_embedding_spiking": model_config["patch_embedding_spiking"],
         "vss_output_spiking": model_config.get("vss_output_spiking", True),
         "input_skip": model_config.get("input_skip", False),
+        "temporal_mamba": model_config.get(
+            "temporal_mamba",
+            {"enabled": False, "kernel_size": 3, "d_state": 16, "dt_rank": "auto", "debug_shapes": False},
+        ),
     }
     return payload["model"], kwargs
 

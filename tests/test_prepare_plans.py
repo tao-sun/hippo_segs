@@ -17,7 +17,7 @@ CONFIG = {
         "residual_connections": True,
         "dwconv2d_spiking": True,
         "patch_embedding_spiking": True,
-        "output_spiking": True,
+        "vss_output_spiking": True,
         "input_skip": False,
     },
     "temporal_axis": 0,
@@ -88,7 +88,7 @@ def test_create_snn_plans_uses_stock_identifier_and_atomic_replace(tmp_path, mon
     destination = prepare_plans.create_snn_plans(11, "StockCustom", CONFIG)
     assert destination == dataset_dir / "SNNPlans.json"
     assert json.loads(destination.read_text())["plans_name"] == "SNNPlans"
-    assert list(dataset_dir.iterdir()) == [dataset_dir / "StockCustom.json", destination]
+    assert sorted(dataset_dir.iterdir()) == sorted([dataset_dir / "StockCustom.json", destination])
 
 
 def test_native_prepare_delegates_verified_stock_flow_and_checks_shared_folder(
@@ -150,6 +150,25 @@ def test_update_snn_config_rejects_incompatible_result_before_overwrite(tmp_path
     with pytest.raises(ValueError, match="incompatible"):
         prepare_plans.update_snn_config(plans_path, changed, results)
     assert json.loads(plans_path.read_text())["snn_config"] == CONFIG
+
+
+def test_existing_results_without_temporal_mamba_match_default_disabled(tmp_path, stock_plans):
+    plans_path = tmp_path / "SNNPlans.json"
+    plans = prepare_plans.derive_snn_plans(stock_plans, CONFIG)
+    plans_path.write_text(json.dumps(plans))
+    results = tmp_path / "results"
+    results.mkdir()
+    legacy = deepcopy(plans)
+    (results / "plans.json").write_text(json.dumps(legacy))
+
+    configured = deepcopy(CONFIG)
+    configured["model_kwargs"]["temporal_mamba"] = {
+        "enabled": False, "kernel_size": 3, "d_state": 16,
+        "dt_rank": "auto", "debug_shapes": False,
+        "norm_spiking": True, "dwconv1D_spiking": True,
+    }
+    prepare_plans.update_snn_config(plans_path, configured, results)
+    assert json.loads(plans_path.read_text())["snn_config"] == configured
 
 
 def test_update_snn_config_rejects_result_with_different_spatial_plans(tmp_path, stock_plans):

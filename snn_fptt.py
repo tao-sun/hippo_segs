@@ -169,6 +169,19 @@ def validate_checkpoint_input_skip(checkpoint: Dict, input_skip: bool) -> None:
         )
 
 
+def validate_checkpoint_temporal_mamba(checkpoint: Dict, temporal_mamba: Dict) -> None:
+    saved = checkpoint.get("config", {}).get("temporal_mamba", {"enabled": False})
+    defaults = {"enabled": False, "kernel_size": 3, "d_state": 16, "dt_rank": "auto", "debug_shapes": False}
+    defaults.update(saved or {})
+    requested = dict(defaults)
+    requested.update(temporal_mamba or {})
+    if defaults != requested:
+        raise ValueError(
+            "Checkpoint temporal_mamba configuration differs from requested settings; "
+            "start a new run when changing Temporal Mamba architecture."
+        )
+
+
 def validate_checkpoint_vss_output_spiking(
     checkpoint: Dict, vss_output_spiking: bool
 ) -> None:
@@ -1250,6 +1263,31 @@ def load_experiment_from_yaml(config_path: str) -> Dict:
         raise ValueError("vss_output_spiking must be a boolean")
     raw["vss_output_spiking"] = vss_output_spiking
 
+    temporal_mamba = raw.get("temporal_mamba", {})
+    if not isinstance(temporal_mamba, dict):
+        raise ValueError("temporal_mamba must be a mapping")
+    temporal_defaults = {
+        "enabled": False, "kernel_size": 3, "d_state": 16, "dt_rank": "auto",
+        "debug_shapes": False
+    }
+    if set(temporal_mamba) - set(temporal_defaults):
+        raise ValueError("Unknown temporal_mamba option")
+    temporal_defaults.update(temporal_mamba)
+    if not isinstance(temporal_defaults["enabled"], bool):
+        raise ValueError("temporal_mamba.enabled must be a boolean")
+    for key in ("kernel_size", "d_state"):
+        value = temporal_defaults[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"temporal_mamba.{key} must be a positive integer")
+    if not isinstance(temporal_defaults["debug_shapes"], bool):
+        raise ValueError("temporal_mamba.debug_shapes must be a boolean")
+    dt_rank = temporal_defaults["dt_rank"]
+    if dt_rank != "auto" and (isinstance(dt_rank, bool) or not isinstance(dt_rank, int) or dt_rank <= 0):
+        raise ValueError("temporal_mamba.dt_rank must be 'auto' or a positive integer")
+    raw["temporal_mamba"] = temporal_defaults
+    if temporal_defaults["enabled"] and raw["model"] != "orig":
+        raise ValueError("temporal_mamba.enabled=true is supported only for model: orig")
+
     input_skip = raw.get("input_skip", False)
     if not isinstance(input_skip, bool):
         raise ValueError("input_skip must be a boolean")
@@ -1392,7 +1430,8 @@ def build_model(model_name, out_channels=3, patch_size=4,
                 dwconv2d_spiking=True,
                 patch_embedding_spiking=False,
                 input_skip=False,
-                vss_output_spiking=True):
+                vss_output_spiking=True,
+                temporal_mamba=None):
     return build_shared_model(
         model_name=model_name,
         out_channels=out_channels,
@@ -1403,6 +1442,7 @@ def build_model(model_name, out_channels=3, patch_size=4,
         patch_embedding_spiking=patch_embedding_spiking,
             output_spiking=vss_output_spiking,
         input_skip=input_skip,
+        temporal_mamba=temporal_mamba,
     )
 
 
@@ -1411,6 +1451,10 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
     use_fptt = exp_cfg.get("use_fptt", True)
     input_skip = exp_cfg.get("input_skip", False)
     vss_output_spiking = exp_cfg.get("vss_output_spiking", True)
+    temporal_mamba = exp_cfg.get("temporal_mamba", {
+        "enabled": False, "kernel_size": 3, "d_state": 16, "dt_rank": "auto",
+        "debug_shapes": False
+    })
     exp_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", exp_cfg["name"])
     resume_from = exp_cfg.get("resume_from")
     resume_scheduler = exp_cfg.get("resume_scheduler", True)
@@ -1442,6 +1486,7 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
         validate_checkpoint_vss_output_spiking(
             resume_checkpoint, vss_output_spiking
         )
+        validate_checkpoint_temporal_mamba(resume_checkpoint, temporal_mamba)
         if resume_scheduler:
             validate_checkpoint_scheduler(resume_checkpoint, scheduler_name)
         resume_checkpoint_config = dict(resume_checkpoint.get("config", {}))
@@ -1542,6 +1587,7 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
         "patch_embedding_spiking": patch_embedding_spiking,
         "vss_output_spiking": vss_output_spiking,
         "input_skip": input_skip,
+        "temporal_mamba": temporal_mamba,
         "epochs": epochs,
         "batch_size_subjects": batch_size_subjects,
         "lr": lr,
@@ -1739,6 +1785,7 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
         patch_embedding_spiking=patch_embedding_spiking,
         vss_output_spiking=vss_output_spiking,
         input_skip=input_skip,
+        temporal_mamba=temporal_mamba,
     )
 
     if accelerator.is_main_process:

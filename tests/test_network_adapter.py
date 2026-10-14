@@ -23,7 +23,7 @@ APPROVED_CONFIG = {
         "residual_connections": True,
         "dwconv2d_spiking": True,
         "patch_embedding_spiking": True,
-        "output_spiking": True,
+        "vss_output_spiking": True,
         "input_skip": False,
     },
     "temporal_axis": 0,
@@ -208,3 +208,49 @@ def test_adapter_rejects_input_with_wrong_channel_count():
 
     with pytest.raises(ValueError, match="channels"):
         adapter(torch.ones(1, 3, 2, 3, 4))
+
+
+def test_temporal_mamba_config_reaches_nnunet_core():
+    data = {**APPROVED_CONFIG, "model_kwargs": {
+        **APPROVED_CONFIG["model_kwargs"],
+        "temporal_mamba": {
+            "enabled": True, "kernel_size": 5, "d_state": 8,
+            "dt_rank": 4, "debug_shapes": False, "plif_enabled": True,
+        },
+    }}
+
+    config = SNNConfig.from_plans({"snn_config": data})
+    core = build_core(config)
+
+    assert config.model_kwargs["temporal_mamba"]["enabled"] is True
+    assert core.temporal_mamba_enabled is True
+    assert core.conv_block1.spik_mamba.spik_mamba.temporal_mamba.kernel_size == 5
+
+
+def test_plif_switches_from_plans_reach_spatial_and_temporal_modules():
+    data = {**APPROVED_CONFIG, "model_kwargs": {
+        **APPROVED_CONFIG["model_kwargs"],
+        "patch_embedding_spiking": False,
+        "dwconv2d_spiking": False,
+        "spatial_output_spiking": False,
+        "vss_output_spiking": False,
+        "temporal_mamba": {
+            "enabled": True, "kernel_size": 3, "d_state": 16,
+            "dt_rank": "auto", "debug_shapes": False, "plif_enabled": False,
+        },
+    }}
+
+    core = build_core(SNNConfig.from_plans({"snn_config": data}))
+
+    assert core.patch_embedding_spiking is False
+    assert core.dwconv2d_spiking is False
+    assert core.spatial_output_spiking is False
+    assert core.output_spiking is False
+    spatial = core.conv_block1.spik_mamba.spik_mamba.mamba_layer
+    assert spatial.patch_sl is None
+    assert spatial.dwconv2d_sl is None
+    assert spatial.ss2d_output_plif is None
+    assert isinstance(core.conv_block1.spik_mamba.post_plif, torch.nn.Identity)
+    temporal = core.conv_block1.spik_mamba.spik_mamba.temporal_mamba
+    assert temporal.norm_plif is None
+    assert temporal.conv_plif is None

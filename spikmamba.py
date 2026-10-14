@@ -2,7 +2,7 @@
 
 import math
 
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -22,6 +22,7 @@ __all__ = [
     "Spiking2DPatchEmbedding",
     "SpikeMambaLayer",
     "SpikMambaBlock",
+    "TemporalSpikMamba",
 ]
 
 
@@ -126,6 +127,7 @@ class SpikeMambaLayer(nn.Module):
         linear_projection: bool = True,
         patch_embedding_spiking: bool = False,
         dwconv2d_spiking: bool = True,
+        spatial_output_spiking: bool = False,
     ) -> None:
         super().__init__()
         self.dim = _positive_int("dim", dim)
@@ -138,9 +140,12 @@ class SpikeMambaLayer(nn.Module):
             raise TypeError("patch_embedding_spiking must be a boolean")
         if not isinstance(dwconv2d_spiking, bool):
             raise TypeError("dwconv2d_spiking must be a boolean")
+        if not isinstance(spatial_output_spiking, bool):
+            raise TypeError("spatial_output_spiking must be a boolean")
         self.linear_projection = linear_projection
         self.patch_embedding_spiking = patch_embedding_spiking
         self.dwconv2d_spiking = dwconv2d_spiking
+        self.spatial_output_spiking = spatial_output_spiking
         self.num_directions = 4
         self.d_inner = self.expand * self.dim if linear_projection else self.dim
         self.dt_rank = (
@@ -184,6 +189,11 @@ class SpikeMambaLayer(nn.Module):
         self.dwconv2d_sl = (
             _make_plif(init_tau, device=device, dtype=dtype)
             if self.dwconv2d_spiking
+            else None
+        )
+        self.ss2d_output_plif = (
+            _make_plif(init_tau, device=device, dtype=dtype)
+            if self.spatial_output_spiking
             else None
         )
         x_proj_layers = [
@@ -268,6 +278,9 @@ class SpikeMambaLayer(nn.Module):
         tokens: torch.Tensor,
         time_step: int,
         spatial_shape: Tuple[int, int],
+        return_inner: bool = False,
+        sequence_shape: Tuple[int, int] = None,
+        debug_shapes: bool = False,
     ) -> torch.Tensor:
         if tokens.ndim != 3:
             raise ValueError(
@@ -291,11 +304,24 @@ class SpikeMambaLayer(nn.Module):
             ) from _MAMBA_IMPORT_ERROR
 
         p_global = self.linear_m(tokens)
-        if self.patch_embedding_spiking:
-            p_global, _ = self.patch_sl(p_global, time_step)
-
-
+        if debug_shapes:
+            print(f"after input projection: {tuple(p_global.shape)}")
         batch = tokens.shape[0]
+        if sequence_shape is not None:
+            sequence_batch, steps = sequence_shape
+            if sequence_batch * steps != batch:
+                raise ValueError("sequence_shape does not match flattened slice batch")
+        else:
+            sequence_batch, steps = batch, 1
+        if self.patch_embedding_spiking:
+            if sequence_shape is None:
+                p_global, _ = self.patch_sl(p_global, time_step)
+            else:
+                # [B*T,N,C] -> [B,T,N,C], PLIF evolves over T without folding T into its batch.
+                sequence = p_global.reshape(sequence_batch, steps, *p_global.shape[1:])
+                values = [self.patch_sl(sequence[:, t], time_step + t)[0] for t in range(steps)]
+                p_global = torch.stack(values, dim=1).reshape_as(p_global)
+
         spatial_features = (
             p_global.transpose(1, 2)
             .contiguous()
@@ -303,9 +329,20 @@ class SpikeMambaLayer(nn.Module):
         )
         spatial_features = self.dwconv2d(spatial_features)
         if self.dwconv2d_spiking:
-            spatial_features, _ = self.dwconv2d_sl(
-                spatial_features, time_step
-            )
+            if sequence_shape is None:
+                spatial_features, _ = self.dwconv2d_sl(
+                    spatial_features, time_step
+                )
+            else:
+                # [B*T,C,Hp,Wp] -> [B,T,C,Hp,Wp] for sequential membrane updates.
+                sequence = spatial_features.reshape(
+                    sequence_batch, steps, self.d_inner, height, width
+                )
+                values = [
+                    self.dwconv2d_sl(sequence[:, t], time_step + t)[0]
+                    for t in range(steps)
+                ]
+                spatial_features = torch.stack(values, dim=1).reshape_as(spatial_features)
         p_global = (
             spatial_features.flatten(2)
             .transpose(1, 2)
@@ -408,11 +445,174 @@ class SpikeMambaLayer(nn.Module):
         y = 0.25 * (
             row_forward + row_backward + col_forward + col_backward
         )
+        if self.ss2d_output_plif is not None:
+            if sequence_shape is None:
+                y, _ = self.ss2d_output_plif(y, time_step)
+            else:
+                # [B*T,N,C] -> [B,T,N,C] so this PLIF advances in slice order.
+                sequence = y.reshape(sequence_batch, steps, *y.shape[1:])
+                values = [
+                    self.ss2d_output_plif(sequence[:, t], time_step + t)[0]
+                    for t in range(steps)
+                ]
+                y = torch.stack(values, dim=1).reshape_as(y)
+        if return_inner:
+            return y
         if self.linear_projection:
             y = y.to(self.out_proj.weight.dtype)
         else:
             y = y.to(tokens.dtype)
         return self.out_proj(y)
+
+
+class TemporalSpikMamba(nn.Module):
+    """Depthwise spiking mixer and one selective scan along MRI depth T."""
+
+    def __init__(
+        self,
+        dim: int,
+        d_state: int = 16,
+        dt_rank: Union[int, str] = "auto",
+        kernel_size: int = 3,
+        init_tau: float = 2.0,
+        selective_scan=None,
+        dt_min: float = 0.001,
+        dt_max: float = 0.1,
+        dt_init: str = "random",
+        dt_scale: float = 1.0,
+        dt_init_floor: float = 1e-4,
+        debug_shapes: bool = False,
+        norm_spiking: bool = True,
+        dwconv1D_spiking: bool = True,
+        plif_enabled: Optional[bool] = None,
+    ) -> None:
+        super().__init__()
+        self.dim = _positive_int("dim", dim)
+        self.d_state = _positive_int("d_state", d_state)
+        self.kernel_size = _positive_int("kernel_size", kernel_size)
+        if not isinstance(debug_shapes, bool):
+            raise TypeError("debug_shapes must be a boolean")
+        if plif_enabled is not None:
+            if not isinstance(plif_enabled, bool):
+                raise TypeError("plif_enabled must be a boolean")
+            # Backward compatibility: the old switch controlled both PLIFs.
+            norm_spiking = dwconv1D_spiking = plif_enabled
+        if not isinstance(norm_spiking, bool):
+            raise TypeError("norm_spiking must be a boolean")
+        if not isinstance(dwconv1D_spiking, bool):
+            raise TypeError("dwconv1D_spiking must be a boolean")
+        self.debug_shapes = debug_shapes
+        self.norm_spiking = norm_spiking
+        self.dwconv1D_spiking = dwconv1D_spiking
+        self.dt_rank = math.ceil(self.dim / 16) if dt_rank == "auto" else _positive_int("dt_rank", dt_rank)
+        if not all(math.isfinite(v) for v in (dt_min, dt_max, dt_scale, dt_init_floor)):
+            raise ValueError("Delta configuration values must be finite")
+        if dt_min <= 0 or dt_max < dt_min or dt_init_floor <= 0 or dt_init_floor > dt_max:
+            raise ValueError("require 0 < dt_min <= dt_max and 0 < dt_init_floor <= dt_max")
+        if dt_init not in {"constant", "random"}:
+            raise NotImplementedError(f"unsupported dt_init={dt_init!r}")
+
+        self.norm = nn.GroupNorm(1, self.dim)
+        self.norm_plif = _make_plif(init_tau) if self.norm_spiking else None
+        self.dwconv1d = nn.Conv1d(
+            self.dim, self.dim, self.kernel_size, groups=self.dim,
+            padding=0, bias=True,
+        )
+        self.conv_plif = _make_plif(init_tau) if self.dwconv1D_spiking else None
+        self.x_proj = nn.Linear(self.dim, self.dt_rank + 2 * self.d_state, bias=False)
+        self.dt_proj_weight = nn.Parameter(torch.empty(self.dim, self.dt_rank))
+        std = self.dt_rank ** -0.5 * dt_scale
+        if dt_init == "constant":
+            nn.init.constant_(self.dt_proj_weight, std)
+        else:
+            nn.init.uniform_(self.dt_proj_weight, -std, std)
+        dt = torch.exp(
+            torch.rand(self.dim) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
+        ).clamp(min=dt_init_floor)
+        self.dt_proj_bias = nn.Parameter(dt + torch.log(-torch.expm1(-dt)))
+        self.dt_proj_bias._no_reinit = True
+        base = torch.arange(1, self.d_state + 1, dtype=torch.float32)
+        self.A_log = nn.Parameter(torch.log(base).view(1, -1).repeat(self.dim, 1))
+        self.A_log._no_weight_decay = True
+        self.D = nn.Parameter(torch.ones(self.dim, dtype=torch.float32))
+        self.D._no_weight_decay = True
+        self.selective_scan = selective_scan if selective_scan is not None else selective_scan_fn
+
+    @staticmethod
+    def _step_plif(node: PLIFNode, x: torch.Tensor, time_step: int) -> torch.Tensor:
+        """Advance membrane state one temporal slice at a time."""
+        outputs = []
+        for t in range(x.shape[1]):
+            # [B*N,T,C] -> [B*N,C] for one slice; T stays outside PLIF's batch.
+            value, _ = node(x[:, t, :], time_step + t)
+            outputs.append(value)
+        return torch.stack(outputs, dim=1)
+
+    def forward(self, x: torch.Tensor, time_step: int = 0) -> torch.Tensor:
+        if x.ndim != 4 or x.shape[-1] != self.dim:
+            raise ValueError(f"expected [B,T,N,{self.dim}], got {tuple(x.shape)}")
+        if self.selective_scan is None:
+            raise ImportError("mamba_ssm or an injected selective_scan is required") from _MAMBA_IMPORT_ERROR
+        batch, steps, tokens, channels = x.shape
+        if steps <= 0:
+            raise ValueError("temporal sequence must contain at least one slice")
+        f_spatial = x
+        # [B,T,N,C] -> [B,N,T,C], keeping samples and token sequences separate.
+        temporal = x.permute(0, 2, 1, 3).contiguous()
+        # [B,N,T,C] -> [B*N,T,C]; the SSM sequence axis is explicitly T.
+        temporal = temporal.reshape(batch * tokens, steps, channels)
+        if self.debug_shapes:
+            print(f"after temporal reshape [B*N,T,C]: {tuple(temporal.shape)}")
+        # GroupNorm expects channels at dim 1: [B*N,T,C] -> [B*N,C,T].
+        temporal = self.norm(temporal.transpose(1, 2).contiguous())
+        # [B*N,C,T] -> [B*N,T,C]; PLIF advances once for each T position.
+        temporal = temporal.transpose(1, 2).contiguous()
+        if self.norm_plif is not None:
+            temporal = self._step_plif(self.norm_plif, temporal, time_step)
+        # [B*N,C,T] receives asymmetric end padding so any kernel size preserves T.
+        conv_input = temporal.transpose(1, 2).contiguous()
+        pad_left = (self.kernel_size - 1) // 2
+        pad_right = self.kernel_size - 1 - pad_left
+        conv_input = F.pad(conv_input, (pad_left, pad_right))
+        temporal_conv = self.dwconv1d(conv_input)
+        if self.debug_shapes:
+            print(f"after temporal DWConv1D [B*N,C,T]: {tuple(temporal_conv.shape)}")
+        temporal = temporal_conv.transpose(1, 2).contiguous()
+        if self.conv_plif is not None:
+            temporal = self._step_plif(self.conv_plif, temporal, time_step)
+        if temporal.shape[1] != steps:
+            raise RuntimeError("temporal depthwise convolution changed sequence length")
+
+        projected = self.x_proj(temporal)
+        delta_low, state_b, state_c = torch.split(
+            projected, [self.dt_rank, self.d_state, self.d_state], dim=-1
+        )
+        delta = F.linear(delta_low, self.dt_proj_weight).transpose(1, 2).contiguous()
+        scan_input = temporal.transpose(1, 2).contiguous()  # [B*N,C,T], scan axis T.
+        if self.debug_shapes:
+            print(f"before temporal selective SSM [B*N,C,T]: {tuple(scan_input.shape)}")
+        y = self.selective_scan(
+            scan_input,
+            delta,
+            -torch.exp(self.A_log.float()),
+            state_b.transpose(1, 2).contiguous(),
+            state_c.transpose(1, 2).contiguous(),
+            self.D.float(),
+            z=None,
+            delta_bias=self.dt_proj_bias.float(),
+            delta_softplus=True,
+            return_last_state=False,
+        )
+        if self.debug_shapes:
+            print(f"after temporal selective SSM [B*N,C,T]: {tuple(y.shape)}")
+        # [B*N,C,T] -> [B*N,T,C] -> [B,T,N,C].
+        f_temporal = y.transpose(1, 2).contiguous().reshape(batch, tokens, steps, channels)
+        f_temporal = f_temporal.permute(0, 2, 1, 3).contiguous()
+        assert f_temporal.shape == f_spatial.shape
+        fused = f_spatial + f_temporal
+        if self.debug_shapes:
+            print(f"after spatial-temporal residual [B,T,N,C]: {tuple(fused.shape)}")
+        return fused
 
 
 class SpikMambaBlock(nn.Module):
@@ -422,6 +622,7 @@ class SpikMambaBlock(nn.Module):
         self,
         dim: int,
         residual_connections: bool = True,
+        temporal_mamba=None,
         **mamba_kwargs,
     ) -> None:
         super().__init__()
@@ -433,6 +634,37 @@ class SpikMambaBlock(nn.Module):
             dim=self.dim,
             **mamba_kwargs,
         )
+        temporal_config = temporal_mamba or {"enabled": False}
+        if not isinstance(temporal_config, dict):
+            raise TypeError("temporal_mamba must be a mapping")
+        if not isinstance(temporal_config.get("enabled", False), bool):
+            raise TypeError("temporal_mamba.enabled must be a boolean")
+        if not isinstance(temporal_config.get("debug_shapes", False), bool):
+            raise TypeError("temporal_mamba.debug_shapes must be a boolean")
+        legacy_plif = temporal_config.get("plif_enabled")
+        if legacy_plif is not None and not isinstance(legacy_plif, bool):
+            raise TypeError("temporal_mamba.plif_enabled must be a boolean")
+        norm_spiking = temporal_config.get("norm_spiking", legacy_plif if legacy_plif is not None else True)
+        dwconv1D_spiking = temporal_config.get("dwconv1D_spiking", legacy_plif if legacy_plif is not None else True)
+        if not isinstance(norm_spiking, bool):
+            raise TypeError("temporal_mamba.norm_spiking must be a boolean")
+        if not isinstance(dwconv1D_spiking, bool):
+            raise TypeError("temporal_mamba.dwconv1D_spiking must be a boolean")
+        if temporal_config.get("enabled", False):
+            self.temporal_mamba = TemporalSpikMamba(
+                dim=self.mamba_layer.d_inner,
+                d_state=temporal_config.get("d_state", self.mamba_layer.d_state),
+                dt_rank=temporal_config.get("dt_rank", self.mamba_layer.dt_rank),
+                kernel_size=temporal_config.get("kernel_size", 3),
+                init_tau=mamba_kwargs.get("init_tau", 2.0),
+                selective_scan=self.mamba_layer.selective_scan,
+                debug_shapes=temporal_config.get("debug_shapes", False),
+                norm_spiking=norm_spiking,
+                dwconv1D_spiking=dwconv1D_spiking,
+            )
+        else:
+            self.temporal_mamba = None
+        self.debug_shapes = bool(temporal_config.get("debug_shapes", False))
 
     def forward(
         self,
@@ -455,3 +687,41 @@ class SpikMambaBlock(nn.Module):
         if self.residual_connections:
             return tokens + mamba_features
         return mamba_features
+
+    def forward_sequence(
+        self,
+        tokens: torch.Tensor,
+        time_step: int,
+        spatial_shape: Tuple[int, int],
+    ) -> torch.Tensor:
+        """Process [B,T,N,D] with per-slice SS2D and optional temporal SSM."""
+        if tokens.ndim != 4 or tokens.shape[-1] != self.dim:
+            raise ValueError(f"expected [B,T,N,{self.dim}] tokens, got {tuple(tokens.shape)}")
+        batch, steps, token_count, dim = tokens.shape
+        # [B,T,N,D] -> [B*T,N,D]; SS2D sequence axis remains N per slice.
+        flat_tokens = tokens.reshape(batch * steps, token_count, dim)
+        flat_inner = self.mamba_layer(
+            flat_tokens, time_step, spatial_shape, return_inner=True,
+            sequence_shape=(batch, steps), debug_shapes=self.debug_shapes,
+        )
+        # [B*T,N,D_inner] -> [B,T,N,D_inner] before temporal modeling.
+        f_spatial = flat_inner.reshape(batch, steps, token_count, -1)
+        if self.debug_shapes:
+            print(f"after Spatial SS2D fusion [B,T,N,C]: {tuple(f_spatial.shape)}")
+        if self.temporal_mamba is not None:
+            if self.debug_shapes:
+                print(f"before Temporal Mamba [B,T,N,C]: {tuple(f_spatial.shape)}")
+            f_spatiotemporal = self.temporal_mamba(f_spatial, time_step=time_step)
+        else:
+            f_spatiotemporal = f_spatial
+        # [B,T,N,D_inner] -> [B,T,N,D] through the existing output projection.
+        if self.mamba_layer.linear_projection:
+            f_spatiotemporal = f_spatiotemporal.to(self.mamba_layer.out_proj.weight.dtype)
+        else:
+            f_spatiotemporal = f_spatiotemporal.to(tokens.dtype)
+        output = self.mamba_layer.out_proj(f_spatiotemporal)
+        if self.debug_shapes:
+            print(f"after output projection [B,T,N,D]: {tuple(output.shape)}")
+        if self.residual_connections:
+            output = tokens + output
+        return output

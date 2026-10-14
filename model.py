@@ -69,6 +69,8 @@ class _SpikMambaEncoderAdapter(nn.Module):
         dwconv2d_spiking: bool = True,
         patch_embedding_spiking: bool = False,
         output_spiking: bool = True,
+        temporal_mamba=None,
+        spatial_output_spiking: bool = False,
     ) -> None:
         super().__init__()
         if not isinstance(output_spiking, bool):
@@ -94,8 +96,10 @@ class _SpikMambaEncoderAdapter(nn.Module):
             max_time_steps=max_time_steps,
             linear_projection=linear_projection,
             patch_embedding_spiking=patch_embedding_spiking,
+            spatial_output_spiking=spatial_output_spiking,
             residual_connections=residual_connections,
             dwconv2d_spiking=dwconv2d_spiking,
+            temporal_mamba=temporal_mamba,
         )
         self.post_norm = nn.GroupNorm(1, self.out_channels)
         self.post_plif = (
@@ -132,6 +136,47 @@ class _SpikMambaEncoderAdapter(nn.Module):
             x, _ = self.post_plif(x, time_step)
         return x
 
+    def forward_sequence(self, x: torch.Tensor, time_step: int) -> torch.Tensor:
+        """Encode a complete [B,T,C,H,W] window for temporal Mamba."""
+        if x.ndim != 5 or x.shape[2] != self.in_channels:
+            raise ValueError(f"expected [B,T,{self.in_channels},H,W], got {tuple(x.shape)}")
+        batch, steps, channels, height, width = x.shape
+        if steps <= 0:
+            raise ValueError("sequence window must contain at least one slice")
+        if time_step < 0 or time_step + steps > self.patch_embed.max_time_steps:
+            raise ValueError("sequence time range is outside the configured range")
+        # [B,T,C,H,W] -> [B*T,C,H,W] for per-slice patch embedding.
+        flat = x.reshape(batch * steps, channels, height, width)
+        embedded = self.patch_embed(flat, time_step)
+        if self.spik_mamba.debug_shapes:
+            print(f"after patch embedding [B*T,D,Hp,Wp]: {tuple(embedded.shape)}")
+        _, embedded_channels, grid_h, grid_w = embedded.shape
+        # [B*T,C,Hp,Wp] -> [B,T,N,D], with N=Hp*Wp.
+        tokens = embedded.flatten(2).transpose(1, 2).contiguous()
+        tokens = tokens.reshape(batch, steps, grid_h * grid_w, embedded_channels)
+        tokens = self.spik_mamba.forward_sequence(
+            tokens, time_step, spatial_shape=(grid_h, grid_w)
+        )
+        # [B,T,N,D] -> [B*T,D,Hp,Wp] for existing output normalization.
+        features = tokens.reshape(batch * steps, grid_h * grid_w, embedded_channels)
+        features = features.transpose(1, 2).contiguous().reshape(
+            batch * steps, embedded_channels, grid_h, grid_w
+        )
+        features = self.post_norm(features)
+        if self.output_spiking:
+            # Keep each MRI slice's PLIF update ordered and state-independent by sample.
+            # [B*T,D,Hp,Wp] -> [B,T,D,Hp,Wp] before ordered PLIF updates.
+            sequence = features.reshape(batch, steps, embedded_channels, grid_h, grid_w)
+            outputs = []
+            for t in range(steps):
+                value, _ = self.post_plif(sequence[:, t], time_step + t)
+                outputs.append(value)
+            features = torch.stack(outputs, dim=1).reshape(
+                batch * steps, embedded_channels, grid_h, grid_w
+            )
+        # [B*T,D,Hp,Wp] -> [B,T,D,Hp,Wp].
+        return features.reshape(batch, steps, embedded_channels, grid_h, grid_w)
+
 
 class ConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels,
@@ -144,7 +189,9 @@ class ConvBlock(nn.Module):
                  residual_connections=True,
                  dwconv2d_spiking=True,
                  patch_embedding_spiking=False,
-                 output_spiking=True):
+                 output_spiking=True,
+                 temporal_mamba=None,
+                 spatial_output_spiking=False):
         super().__init__()
         self.dropout = float(dropout)
         self.normalization = normalization
@@ -164,7 +211,9 @@ class ConvBlock(nn.Module):
                 residual_connections=residual_connections,
                 dwconv2d_spiking=dwconv2d_spiking,
                 patch_embedding_spiking=patch_embedding_spiking,
+                spatial_output_spiking=spatial_output_spiking,
                 output_spiking=output_spiking,
+                temporal_mamba=temporal_mamba,
             )
         else:
             self.conv = nn.Conv2d(
@@ -185,6 +234,14 @@ class ConvBlock(nn.Module):
             )
             if spiking and output_spiking else nn.Identity()
         )
+
+    def forward_sequence(self, x: torch.Tensor, time_step: int) -> torch.Tensor:
+        if not self.spikMamba:
+            raise ValueError("sequence forward is supported only for SpikMamba encoder blocks")
+        out = self.spik_mamba.forward_sequence(x, time_step)
+        if self.dropout > 0:
+            out = F.dropout(out, p=self.dropout, training=self.training)
+        return out
 
     def forward(self, x, time_step: int):
         if self.spikMamba:
@@ -255,7 +312,9 @@ class SNNBraTS(nn.Module):
                  dwconv2d_spiking: bool = True,
                  patch_embedding_spiking: bool = False,
                  input_skip: bool = False,
-                 output_spiking: bool = True):
+                 output_spiking: bool = True,
+                 temporal_mamba=None,
+                 spatial_output_spiking: bool = False):
         super().__init__()
         if isinstance(patch_size, bool) or not isinstance(patch_size, int) or patch_size <= 0:
             raise ValueError("patch_size must be a positive integer")
@@ -269,6 +328,8 @@ class SNNBraTS(nn.Module):
             raise TypeError("patch_embedding_spiking must be a boolean")
         if not isinstance(output_spiking, bool):
             raise TypeError("output_spiking must be a boolean")
+        if not isinstance(spatial_output_spiking, bool):
+            raise TypeError("spatial_output_spiking must be a boolean")
         if not isinstance(input_skip, bool):
             raise TypeError("input_skip must be a boolean")
         self.input_skip = input_skip
@@ -278,6 +339,14 @@ class SNNBraTS(nn.Module):
         self.dwconv2d_spiking = dwconv2d_spiking
         self.patch_embedding_spiking = patch_embedding_spiking
         self.output_spiking = output_spiking
+        self.spatial_output_spiking = spatial_output_spiking
+        if temporal_mamba is not None and not isinstance(temporal_mamba, dict):
+            raise TypeError("temporal_mamba must be a mapping")
+        self.temporal_mamba_config = dict(temporal_mamba or {"enabled": False})
+        temporal_enabled = self.temporal_mamba_config.get("enabled", False)
+        if not isinstance(temporal_enabled, bool):
+            raise TypeError("temporal_mamba.enabled must be a boolean")
+        self.temporal_mamba_enabled = temporal_enabled
         self.encoder_scale = self.patch_size ** 3
         # Encoder
         spik_mamba_kwargs = {
@@ -290,7 +359,9 @@ class SNNBraTS(nn.Module):
             "residual_connections": self.residual_connections,
             "dwconv2d_spiking": self.dwconv2d_spiking,
             "patch_embedding_spiking": self.patch_embedding_spiking,
+            "spatial_output_spiking": self.spatial_output_spiking,
             "output_spiking": output_spiking,
+            "temporal_mamba": self.temporal_mamba_config,
         }
         self.conv_block1 = ConvBlock(
             4,
@@ -356,6 +427,40 @@ class SNNBraTS(nn.Module):
         pad_h = (-H) % self.encoder_scale
         pad_w = (-W) % self.encoder_scale
         logits = []
+
+        if self.temporal_mamba_enabled:
+            # Pad the complete MRI window before each stage sees its T slices.
+            x_volume = x_win.reshape(B * k, C, H, W)
+            if pad_h or pad_w:
+                x_volume = F.pad(x_volume, (0, pad_w, 0, pad_h))
+            Hp, Wp = x_volume.shape[-2:]
+            x_volume = x_volume.reshape(B, k, C, Hp, Wp)
+            input_features = self.input_proj(x_volume.reshape(B * k, C, Hp, Wp)) if self.input_skip else None
+            skip1 = self.conv_block1.forward_sequence(x_volume, t0)
+            skip2 = self.conv_block2.forward_sequence(skip1, t0)
+            encoded = self.conv_block3.forward_sequence(skip2, t0)
+
+            # Decoder remains ordered per slice; encoder skips retain [B,T,C,H,W].
+            for i in range(k):
+                time_step = t0 + i
+                x = encoded[:, i]
+                skip2_i = skip2[:, i]
+                skip1_i = skip1[:, i]
+                x = self.deconv_block1(x, time_step)
+                x = self.deconv1_conv(x, time_step)
+                x = torch.cat([skip2_i, x], dim=1)
+                x = self.concat1_conv(x, time_step)
+                x = self.deconv_block2(x, time_step)
+                x = self.deconv2_conv(x, time_step)
+                x = torch.cat([skip1_i, x], dim=1)
+                x = self.concat2_conv(x, time_step)
+                x = self.deconv_block3(x, time_step)
+                x = self.deconv3_conv(x, time_step)
+                if self.input_skip:
+                    x = self.input_fuse(torch.cat([x, input_features.reshape(B, k, 8, Hp, Wp)[:, i]], dim=1))
+                x = self.class_conv(x, time_step)
+                logits.append(x[..., :H, :W])
+            return torch.stack(logits, dim=2)
 
         for i in range(k):
             time_step = t0 + i  # absolute time across the sequence 0..D-1
@@ -564,9 +669,13 @@ def build_model(model_name: str, out_channels: int = 3, patch_size: int = 4,
                 dwconv2d_spiking: bool = True,
                 patch_embedding_spiking: bool = False,
                 input_skip: bool = False,
-                output_spiking: bool = True) -> nn.Module:
+                output_spiking: bool = True,
+                temporal_mamba=None,
+                spatial_output_spiking: bool = False) -> nn.Module:
     if input_skip and model_name != "orig":
         raise ValueError("input_skip=true is supported only for model: orig")
+    if temporal_mamba and temporal_mamba.get("enabled", False) and model_name != "orig":
+        raise ValueError("temporal_mamba.enabled=true is supported only for model: orig")
     if model_name == "orig":
         return SNNBraTS(
             out_channels=out_channels,
@@ -577,6 +686,8 @@ def build_model(model_name: str, out_channels: int = 3, patch_size: int = 4,
             patch_embedding_spiking=patch_embedding_spiking,
             input_skip=input_skip,
             output_spiking=output_spiking,
+            temporal_mamba=temporal_mamba,
+            spatial_output_spiking=spatial_output_spiking,
         )
     if model_name == "shallow":
         return SNNBraTSUNetShallow(out_channels=out_channels)

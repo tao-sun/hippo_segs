@@ -47,6 +47,56 @@ def _config(path: Path) -> dict[str, Any]:
         _integer(snn, "k", 1, 4096)
         if type(snn.get("use_fptt")) is not bool:
             raise ValueError("snn.use_fptt must be true or false")
+        vss_output_spiking = snn.get("vss_output_spiking", True)
+        if type(vss_output_spiking) is not bool:
+            raise ValueError("snn.vss_output_spiking must be true or false")
+        snn["vss_output_spiking"] = vss_output_spiking
+        spatial = snn.get("spatial_mamba", {})
+        if not isinstance(spatial, dict):
+            raise ValueError("snn.spatial_mamba must be a YAML mapping")
+        spatial_defaults = {
+            "patch_embedding_spiking": True,
+            "dwconv2d_spiking": True,
+            "output_spiking": False,
+        }
+        if spatial.keys() - spatial_defaults.keys():
+            raise ValueError("snn.spatial_mamba has unknown options")
+        spatial_defaults.update(spatial)
+        for key, value in spatial_defaults.items():
+            if type(value) is not bool:
+                raise ValueError(f"snn.spatial_mamba.{key} must be true or false")
+        snn["spatial_mamba"] = spatial_defaults
+        temporal = snn.get("temporal_mamba", {})
+        if not isinstance(temporal, dict):
+            raise ValueError("snn.temporal_mamba must be a YAML mapping")
+        defaults = {
+            "enabled": False, "kernel_size": 3, "d_state": 16,
+            "dt_rank": "auto", "debug_shapes": False,
+            "norm_spiking": True, "dwconv1D_spiking": True,
+        }
+        if temporal.keys() - (defaults.keys() | {"plif_enabled"}):
+            raise ValueError("snn.temporal_mamba has unknown options")
+        legacy_plif = temporal.pop("plif_enabled", None)
+        if legacy_plif is not None:
+            if type(legacy_plif) is not bool:
+                raise ValueError("snn.temporal_mamba.plif_enabled must be true or false")
+            defaults["norm_spiking"] = legacy_plif
+            defaults["dwconv1D_spiking"] = legacy_plif
+        defaults.update(temporal)
+        if type(defaults["enabled"]) is not bool:
+            raise ValueError("snn.temporal_mamba.enabled must be true or false")
+        for key in ("debug_shapes", "norm_spiking", "dwconv1D_spiking"):
+            if type(defaults[key]) is not bool:
+                raise ValueError(f"snn.temporal_mamba.{key} must be true or false")
+        for key in ("kernel_size", "d_state"):
+            if type(defaults[key]) is not int or defaults[key] <= 0:
+                raise ValueError(f"snn.temporal_mamba.{key} must be a positive integer")
+        rank = defaults["dt_rank"]
+        if rank != "auto" and (type(rank) is not int or rank <= 0):
+            raise ValueError("snn.temporal_mamba.dt_rank must be 'auto' or a positive integer")
+        if defaults["enabled"] and snn["variant"] != "orig":
+            raise ValueError("snn.temporal_mamba.enabled=true requires snn.variant: orig")
+        snn["temporal_mamba"] = defaults
     return config
 
 
@@ -126,6 +176,24 @@ def run(config_path: Path) -> None:
             "--temporal-axis", str(snn["temporal_axis"]),
             "--k", str(snn["k"]),
             "--fptt" if snn["use_fptt"] else "--no-fptt",
+            "--vss-output-spiking" if snn["vss_output_spiking"]
+            else "--no-vss-output-spiking",
+            "--temporal-mamba" if snn["temporal_mamba"]["enabled"] else "--no-temporal-mamba",
+            "--temporal-mamba-kernel-size", str(snn["temporal_mamba"]["kernel_size"]),
+            "--temporal-mamba-d-state", str(snn["temporal_mamba"]["d_state"]),
+            "--temporal-mamba-dt-rank", str(snn["temporal_mamba"]["dt_rank"]),
+            "--temporal-mamba-norm-spiking" if snn["temporal_mamba"]["norm_spiking"]
+            else "--no-temporal-mamba-norm-spiking",
+            "--temporal-mamba-dwconv1d-spiking" if snn["temporal_mamba"]["dwconv1D_spiking"]
+            else "--no-temporal-mamba-dwconv1d-spiking",
+            "--temporal-mamba-debug-shapes" if snn["temporal_mamba"]["debug_shapes"]
+            else "--no-temporal-mamba-debug-shapes",
+            "--spatial-patch-embedding-spiking" if snn["spatial_mamba"]["patch_embedding_spiking"]
+            else "--no-spatial-patch-embedding-spiking",
+            "--spatial-dwconv2d-spiking" if snn["spatial_mamba"]["dwconv2d_spiking"]
+            else "--no-spatial-dwconv2d-spiking",
+            "--spatial-output-spiking" if snn["spatial_mamba"]["output_spiking"]
+            else "--no-spatial-output-spiking",
         ])
     else:
         from nnunetv2.run.run_training import run_training

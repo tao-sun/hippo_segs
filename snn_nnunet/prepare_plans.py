@@ -30,7 +30,7 @@ DEFAULT_SNN_CONFIG: dict[str, Any] = {
         "dwconv2d_spiking": True,
         "patch_embedding_spiking": True,
         "input_skip": False,
-        "output_spiking": True,
+        "vss_output_spiking": True,
     },
     "temporal_axis": 0,
     "k": 16,
@@ -46,6 +46,20 @@ DEFAULT_SNN_CONFIG: dict[str, Any] = {
 
 def _validated_config(snn_config: Mapping[str, Any]) -> dict[str, Any]:
     return SNNConfig.from_plans({"snn_config": snn_config}).to_dict()
+
+
+def _compatibility_config(plans: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize the disabled optional branch when comparing legacy plans."""
+
+    result = deepcopy(dict(plans))
+    result["snn_config"] = _validated_config(result["snn_config"])
+    result["snn_config"]["model_kwargs"].setdefault("spatial_output_spiking", False)
+    result["snn_config"]["model_kwargs"].setdefault("temporal_mamba", {
+        "enabled": False, "kernel_size": 3, "d_state": 16,
+        "dt_rank": "auto", "debug_shapes": False,
+        "norm_spiking": True, "dwconv1D_spiking": True,
+    })
+    return result
 
 
 def derive_snn_plans(stock: Mapping[str, Any], snn_config: Mapping[str, Any]) -> dict:
@@ -131,12 +145,12 @@ def validate_results_compatibility(
     folder = Path(results_folder)
     existing_plans = folder / "plans.json"
     requested = deepcopy(dict(requested_plans))
-    requested["snn_config"] = _validated_config(requested["snn_config"])
+    requested = _compatibility_config(requested)
     if existing_plans.is_file():
         with existing_plans.open(encoding="utf-8") as stream:
             existing = json.load(stream)
         try:
-            existing["snn_config"] = _validated_config(existing["snn_config"])
+            existing = _compatibility_config(existing)
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(f"Existing results plans are incompatible: {existing_plans}") from exc
         if existing != requested:

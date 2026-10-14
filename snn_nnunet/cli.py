@@ -27,6 +27,18 @@ def _positive_int(value: str) -> int:
     return number
 
 
+def _dt_rank(value: str) -> int | str:
+    if value == "auto":
+        return value
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be 'auto' or a positive integer") from exc
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be 'auto' or a positive integer")
+    return number
+
+
 def _fold(value: str) -> int:
     try:
         number = int(value)
@@ -58,6 +70,42 @@ def _add_training_config(parser: argparse.ArgumentParser) -> None:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--fptt", dest="use_fptt", action="store_true", default=True)
     mode.add_argument("--no-fptt", dest="use_fptt", action="store_false")
+    temporal_mode = parser.add_mutually_exclusive_group()
+    temporal_mode.add_argument("--temporal-mamba", dest="temporal_mamba_enabled", action="store_true")
+    temporal_mode.add_argument("--no-temporal-mamba", dest="temporal_mamba_enabled", action="store_false")
+    parser.set_defaults(temporal_mamba_enabled=None)
+    parser.add_argument("--temporal-mamba-kernel-size", type=_positive_int)
+    parser.add_argument("--temporal-mamba-d-state", type=_positive_int)
+    parser.add_argument("--temporal-mamba-dt-rank", type=_dt_rank)
+    debug_mode = parser.add_mutually_exclusive_group()
+    debug_mode.add_argument("--temporal-mamba-debug-shapes", dest="temporal_mamba_debug_shapes", action="store_true")
+    debug_mode.add_argument("--no-temporal-mamba-debug-shapes", dest="temporal_mamba_debug_shapes", action="store_false")
+    parser.set_defaults(temporal_mamba_debug_shapes=None)
+    temporal_plif = parser.add_mutually_exclusive_group()
+    temporal_plif.add_argument("--temporal-mamba-plif", dest="temporal_mamba_plif_enabled", action="store_true")
+    temporal_plif.add_argument("--no-temporal-mamba-plif", dest="temporal_mamba_plif_enabled", action="store_false")
+    parser.set_defaults(temporal_mamba_plif_enabled=None)
+    for flag, destination in (
+        ("temporal-mamba-norm-spiking", "temporal_mamba_norm_spiking"),
+        ("temporal-mamba-dwconv1d-spiking", "temporal_mamba_dwconv1D_spiking"),
+    ):
+        group = parser.add_mutually_exclusive_group()
+        group.add_argument(f"--{flag}", dest=destination, action="store_true")
+        group.add_argument(f"--no-{flag}", dest=destination, action="store_false")
+        parser.set_defaults(**{destination: None})
+    for flag, destination in (
+        ("spatial-patch-embedding-spiking", "spatial_patch_embedding_spiking"),
+        ("spatial-dwconv2d-spiking", "spatial_dwconv2d_spiking"),
+        ("spatial-output-spiking", "spatial_output_spiking"),
+    ):
+        group = parser.add_mutually_exclusive_group()
+        group.add_argument(f"--{flag}", dest=destination, action="store_true")
+        group.add_argument(f"--no-{flag}", dest=destination, action="store_false")
+        parser.set_defaults(**{destination: None})
+    final_plif = parser.add_mutually_exclusive_group()
+    final_plif.add_argument("--vss-output-spiking", dest="vss_output_spiking", action="store_true")
+    final_plif.add_argument("--no-vss-output-spiking", dest="vss_output_spiking", action="store_false")
+    parser.set_defaults(vss_output_spiking=None)
 
 
 def _add_native_training_flags(parser: argparse.ArgumentParser) -> None:
@@ -217,6 +265,50 @@ def _requested_config(args: argparse.Namespace, plans_path: Path) -> dict:
         config = SNNConfig.from_plans(json.load(stream)).to_dict()
     config.update(model_name=args.model, temporal_axis=args.temporal_axis,
                   k=args.k, use_fptt=args.use_fptt)
+    temporal_names = {
+        "enabled": "temporal_mamba_enabled",
+        "kernel_size": "temporal_mamba_kernel_size",
+        "d_state": "temporal_mamba_d_state",
+        "dt_rank": "temporal_mamba_dt_rank",
+        "debug_shapes": "temporal_mamba_debug_shapes",
+        "norm_spiking": "temporal_mamba_norm_spiking",
+        "dwconv1D_spiking": "temporal_mamba_dwconv1D_spiking",
+    }
+    legacy_plif = getattr(args, "temporal_mamba_plif_enabled", None)
+    supplied_temporal = any(
+        getattr(args, argument, None) is not None
+        for argument in temporal_names.values()
+    ) or legacy_plif is not None
+    if supplied_temporal:
+        temporal = dict(config["model_kwargs"].get("temporal_mamba", {
+            "enabled": False, "kernel_size": 3, "d_state": 16,
+            "dt_rank": "auto", "debug_shapes": False,
+            "norm_spiking": True, "dwconv1D_spiking": True,
+        }))
+        if legacy_plif is not None:
+            temporal["norm_spiking"] = legacy_plif
+            temporal["dwconv1D_spiking"] = legacy_plif
+        for key, argument in temporal_names.items():
+            value = getattr(args, argument, None)
+            if value is not None:
+                temporal[key] = value
+        config["model_kwargs"]["temporal_mamba"] = temporal
+    final_spiking = getattr(args, "vss_output_spiking", None)
+    if final_spiking is not None:
+        output_key = next(
+            key for key in ("output_spiking", "vss_output_spiking")
+            if key in config["model_kwargs"]
+        )
+        config["model_kwargs"][output_key] = final_spiking
+    spatial_names = {
+        "patch_embedding_spiking": "spatial_patch_embedding_spiking",
+        "dwconv2d_spiking": "spatial_dwconv2d_spiking",
+        "spatial_output_spiking": "spatial_output_spiking",
+    }
+    for name, argument in spatial_names.items():
+        value = getattr(args, argument, None)
+        if value is not None:
+            config["model_kwargs"][name] = value
     return config
 
 
@@ -275,6 +367,9 @@ def _run_training(args: argparse.Namespace, fold: int, *, validation: bool) -> N
                  continue_training=False if validation else args.continue_training,
                  only_run_validation=validation, val_with_best=args.best if validation else False,
                  export_validation_probabilities=args.save_probabilities)
+    if not validation:
+        _run_custom_full_validation(args, fold)
+
     model_folder = _results_folder(args.dataset_id)
     summary_path = model_folder / f"fold_{fold}" / "validation" / "summary.json"
     if summary_path.is_file():
@@ -284,6 +379,28 @@ def _run_training(args: argparse.Namespace, fold: int, *, validation: bool) -> N
             f"{metrics['foreground_mean']['Dice']}",
             flush=True,
         )
+
+
+def _run_custom_full_validation(args: argparse.Namespace, fold: int) -> None:
+    """Run the custom 96-cubed validation after a fold finishes training."""
+
+    from snn_nnunet.custom_full_validation import main as run_custom_validation
+
+    output_dir = (
+        _results_folder(args.dataset_id)
+        / f"fold_{fold}"
+        / "validation_96patch_postprocessed"
+    )
+    run_custom_validation([
+        "--dataset-id", str(args.dataset_id),
+        "--fold", str(fold),
+        "--results-root", str(args.run_dir),
+        "--output-dir", str(output_dir),
+        "--configuration", CONFIGURATION,
+        "--trainer", TRAINER,
+        "--plans", PLANS,
+        "--checkpoint-name", "checkpoint_best.pth",
+    ])
 
 
 def _select_best(dataset_id: int) -> dict:

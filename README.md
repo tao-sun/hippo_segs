@@ -139,7 +139,9 @@ Each fold uses native nnU-Net distributed training, while `full-cv` runs the fol
 
 ## Validate and predict
 
-After training, native full-volume validation uses the final checkpoint by default; `--best` selects `checkpoint_best.pth`:
+After each fold finishes training through `train` or `full-cv`, the CLI automatically runs the custom full-volume validation using `checkpoint_best.pth`. It uses a `96×96×96` inference patch, 50% tile overlap, probability threshold `0.5`, and the BraTS postprocessing configured in `custom_full_validation.py`. Results are written to `fold_<n>/validation_96patch_postprocessed` under the run's nnU-Net results folder.
+
+You can also run nnU-Net's native full-volume validation manually; it uses the final checkpoint by default, while `--best` selects `checkpoint_best.pth`:
 
 ~~~bash
 export nnUNet_results="$SNN_RUN"

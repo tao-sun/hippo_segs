@@ -45,7 +45,8 @@ def _config(*, model_name="orig", use_fptt=False, output_spiking=True,
 def test_plans_accept_exactly_one_output_spiking_name(output_key):
     config = _config(output_key=output_key, output_spiking=False)
 
-    assert config.to_dict()["model_kwargs"][output_key] is False
+    assert config.to_dict()["model_kwargs"]["vss_output_spiking"] is False
+    assert "output_spiking" not in config.to_dict()["model_kwargs"]
     core = build_core(config)
     assert _output_spiking(core) is False
     assert _output_spiking(core.conv_block1.spik_mamba) is False
@@ -56,9 +57,9 @@ def test_plans_reject_missing_duplicate_or_unknown_output_settings(case):
     data = _config().to_dict()
     kwargs = data["model_kwargs"]
     if case == "missing":
-        del kwargs["output_spiking"]
+        del kwargs["vss_output_spiking"]
     elif case == "duplicate":
-        kwargs["vss_output_spiking"] = True
+        kwargs["output_spiking"] = True
     else:
         kwargs["unknown_flag"] = True
 
@@ -72,7 +73,8 @@ def test_build_core_maps_output_name_for_clean_factory_and_freezes_post_plif(
 ):
     def clean_factory(model_name, *, out_channels, patch_size, linear_projection,
                       residual_connections, dwconv2d_spiking, patch_embedding_spiking,
-                      vss_output_spiking, input_skip):
+                      vss_output_spiking, input_skip, temporal_mamba=None,
+                      spatial_output_spiking=False):
         output_name = next(
             name for name in ("output_spiking", "vss_output_spiking")
             if name in inspect.signature(current_build_model).parameters
@@ -83,6 +85,8 @@ def test_build_core_maps_output_name_for_clean_factory_and_freezes_post_plif(
             residual_connections=residual_connections,
             dwconv2d_spiking=dwconv2d_spiking,
             patch_embedding_spiking=patch_embedding_spiking,
+            temporal_mamba=temporal_mamba,
+            spatial_output_spiking=spatial_output_spiking,
             input_skip=input_skip, **{output_name: vss_output_spiking},
         )
         return core

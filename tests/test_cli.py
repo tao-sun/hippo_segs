@@ -374,3 +374,122 @@ def test_model_launcher_requires_preprocessed_2d_data(tmp_path, monkeypatch):
         run_model.run(config_path)
 
     assert not run_dir.exists()
+
+
+def test_cli_accepts_temporal_mamba_options_and_persists_them(tmp_path, monkeypatch):
+    plans_path = _workspace(tmp_path, monkeypatch)
+    native = importlib.import_module("nnunetv2.run.run_training")
+    monkeypatch.setattr(native, "run_training", lambda **kwargs: None)
+
+    assert cli.main([
+        "train", "--dataset-id", "11", "--fold", "0", "--temporal-mamba",
+        "--temporal-mamba-kernel-size", "5", "--temporal-mamba-d-state", "8",
+        "--temporal-mamba-dt-rank", "4", "--temporal-mamba-debug-shapes",
+    ]) == 0
+
+    model_kwargs = json.loads(plans_path.read_text())["snn_config"]["model_kwargs"]
+    assert model_kwargs["temporal_mamba"] == {
+        "enabled": True, "kernel_size": 5, "d_state": 8,
+        "dt_rank": 4, "debug_shapes": True,
+        "norm_spiking": True, "dwconv1D_spiking": True,
+    }
+
+
+def test_cli_persists_spatial_and_temporal_plif_switches(tmp_path, monkeypatch):
+    plans_path = _workspace(tmp_path, monkeypatch)
+    native = importlib.import_module("nnunetv2.run.run_training")
+    monkeypatch.setattr(native, "run_training", lambda **kwargs: None)
+
+    assert cli.main([
+        "train", "--dataset-id", "11", "--fold", "0",
+        "--no-spatial-patch-embedding-spiking", "--no-spatial-dwconv2d-spiking",
+        "--no-spatial-output-spiking", "--no-vss-output-spiking",
+        "--temporal-mamba", "--no-temporal-mamba-plif",
+    ]) == 0
+
+    model_kwargs = json.loads(plans_path.read_text())["snn_config"]["model_kwargs"]
+    assert model_kwargs["patch_embedding_spiking"] is False
+    assert model_kwargs["dwconv2d_spiking"] is False
+    assert model_kwargs["spatial_output_spiking"] is False
+    assert model_kwargs["vss_output_spiking"] is False
+    assert "output_spiking" not in model_kwargs
+    assert model_kwargs["temporal_mamba"]["norm_spiking"] is False
+    assert model_kwargs["temporal_mamba"]["dwconv1D_spiking"] is False
+
+
+def test_cli_persists_independent_temporal_plif_switches(tmp_path, monkeypatch):
+    plans_path = _workspace(tmp_path, monkeypatch)
+    native = importlib.import_module("nnunetv2.run.run_training")
+    monkeypatch.setattr(native, "run_training", lambda **kwargs: None)
+
+    assert cli.main([
+        "train", "--dataset-id", "11", "--fold", "0", "--temporal-mamba",
+        "--no-temporal-mamba-norm-spiking", "--temporal-mamba-dwconv1d-spiking",
+    ]) == 0
+
+    temporal = json.loads(plans_path.read_text())["snn_config"]["model_kwargs"]["temporal_mamba"]
+    assert temporal["norm_spiking"] is False
+    assert temporal["dwconv1D_spiking"] is True
+
+
+def test_model_config_reads_temporal_mamba_from_brats_config():
+    config = run_model._config(Path(__file__).resolve().parents[1] / "brats24_fold0_model.yaml")
+    assert config["snn"]["temporal_mamba"] == {
+        "enabled": True, "kernel_size": 3, "d_state": 16,
+        "dt_rank": "auto", "debug_shapes": False,
+        "norm_spiking": False, "dwconv1D_spiking": False,
+    }
+    assert config["snn"]["vss_output_spiking"] is False
+    assert config["snn"]["spatial_mamba"] == {
+        "patch_embedding_spiking": False,
+        "dwconv2d_spiking": False,
+        "output_spiking": False,
+    }
+
+
+def test_model_launcher_forwards_plif_switches_from_yaml(tmp_path, monkeypatch):
+    preprocessed = tmp_path / "preprocessed"
+    dataset_folder = preprocessed / "Dataset001_BraTS24GLI"
+    dataset_folder.mkdir(parents=True)
+    (dataset_folder / "SNNPlans.json").write_text(json.dumps({
+        "configurations": {"3d_fullres": {"data_identifier": "snn_data"}},
+    }))
+    (dataset_folder / "snn_data").mkdir()
+    run_dir = tmp_path / "results"
+    config_path = tmp_path / "experiment.yaml"
+    config_path.write_text(yaml.safe_dump({
+        "family": "snn", "dataset_id": 1, "fold": 0, "gpus": 1,
+        "run_dir": str(run_dir),
+        "snn": {
+            "variant": "orig", "temporal_axis": 0, "k": 128, "use_fptt": False,
+            "vss_output_spiking": False,
+            "spatial_mamba": {
+                "patch_embedding_spiking": False,
+                "dwconv2d_spiking": True,
+                "output_spiking": False,
+            },
+            "temporal_mamba": {
+                "enabled": True, "kernel_size": 3, "d_state": 16,
+                "dt_rank": "auto", "debug_shapes": False, "plif_enabled": False,
+            },
+        },
+    }))
+    calls = []
+    monkeypatch.setenv("nnUNet_raw", str(tmp_path / "raw"))
+    monkeypatch.setenv("nnUNet_preprocessed", str(preprocessed))
+    monkeypatch.setattr(cli, "main", lambda args: calls.append(args))
+
+    run_model.run(config_path)
+
+    assert calls == [[
+        "train", "--dataset-id", "1", "--fold", "0", "--run-dir", str(run_dir),
+        "--gpus", "1", "--model", "orig", "--temporal-axis", "0", "--k", "128",
+        "--no-fptt", "--no-vss-output-spiking", "--temporal-mamba",
+        "--temporal-mamba-kernel-size", "3",
+        "--temporal-mamba-d-state", "16", "--temporal-mamba-dt-rank", "auto",
+        "--no-temporal-mamba-norm-spiking", "--no-temporal-mamba-dwconv1d-spiking",
+        "--no-temporal-mamba-debug-shapes",
+        "--no-spatial-patch-embedding-spiking",
+        "--spatial-dwconv2d-spiking",
+        "--no-spatial-output-spiking",
+    ]]

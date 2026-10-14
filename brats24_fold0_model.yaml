@@ -3,10 +3,22 @@ family: snn
 dataset_id: 1
 fold: 0
 gpus: 1
-run_dir: /gpfs/scratch1/shared/apiaghiardelli/SNNMamba_k128_bs2
+run_dir: /gpfs/scratch1/shared/apiaghiardelli/SNNMamba_k128_temporal_spiking
 
 snn:
   variant: orig
   temporal_axis: 0
   k: 128
   use_fptt: false
+  vss_output_spiking: true  # final PLIF after spatial + temporal Mamba output
+  spatial_mamba:
+    patch_embedding_spiking: true 
+    dwconv2d_spiking: true
+  temporal_mamba:
+    enabled: true
+    kernel_size: 3
+    d_state: 16
+    dt_rank: auto
+    debug_shapes: false
+    norm_spiking: true  # PLIF after temporal normalization
+    dwconv1D_spiking: true  # PLIF after temporal depthwise Conv1D

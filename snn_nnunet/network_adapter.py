@@ -48,6 +48,46 @@ def _require_keys(value: Mapping[str, Any], names: tuple[str, ...], label: str) 
         raise ValueError(f"{label}: {'; '.join(details)}")
 
 
+_TEMPORAL_MAMBA_DEFAULTS = {
+    "enabled": False,
+    "kernel_size": 3,
+    "d_state": 16,
+    "dt_rank": "auto",
+    "debug_shapes": False,
+    "norm_spiking": True,
+    "dwconv1D_spiking": True,
+}
+
+
+def _validate_temporal_mamba(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError("temporal_mamba must be a mapping")
+    allowed = _TEMPORAL_MAMBA_DEFAULTS.keys() | {"plif_enabled"}
+    if value.keys() - allowed:
+        raise ValueError("temporal_mamba contains unexpected options")
+    result = dict(_TEMPORAL_MAMBA_DEFAULTS)
+    legacy_plif = value.get("plif_enabled")
+    if legacy_plif is not None:
+        if type(legacy_plif) is not bool:
+            raise ValueError("temporal_mamba.plif_enabled must be a boolean")
+        result["norm_spiking"] = legacy_plif
+        result["dwconv1D_spiking"] = legacy_plif
+    result.update(value)
+    result.pop("plif_enabled", None)
+    if type(result["enabled"]) is not bool:
+        raise ValueError("temporal_mamba.enabled must be a boolean")
+    for name in ("debug_shapes", "norm_spiking", "dwconv1D_spiking"):
+        if type(result[name]) is not bool:
+            raise ValueError(f"temporal_mamba.{name} must be a boolean")
+    for name in ("kernel_size", "d_state"):
+        if type(result[name]) is not int or result[name] <= 0:
+            raise ValueError(f"temporal_mamba.{name} must be a positive integer")
+    dt_rank = result["dt_rank"]
+    if dt_rank != "auto" and (type(dt_rank) is not int or dt_rank <= 0):
+        raise ValueError("temporal_mamba.dt_rank must be 'auto' or a positive integer")
+    return result
+
+
 @dataclass(frozen=True)
 class SNNConfig:
     model_name: str
@@ -80,13 +120,34 @@ class SNNConfig:
         if not isinstance(kwargs, Mapping):
             raise ValueError("model_kwargs must be a mapping")
         output_keys = tuple(name for name in _OUTPUT_SPIKING_KEYS if name in kwargs)
-        _require_keys(kwargs, _MODEL_KWARGS + output_keys, "model_kwargs")
+        output_key = output_keys[0] if len(output_keys) == 1 else "vss_output_spiking"
+        required_kwargs = set(_MODEL_KWARGS + (output_key,))
+        allowed_kwargs = required_kwargs | {"temporal_mamba", "spatial_output_spiking"}
+        missing = required_kwargs - kwargs.keys()
+        extra = kwargs.keys() - allowed_kwargs
+        if missing or extra:
+            details = []
+            if missing:
+                details.append(f"missing {', '.join(sorted(missing))}")
+            if extra:
+                details.append(f"unexpected {', '.join(sorted(extra))}")
+            raise ValueError(f"model_kwargs: {'; '.join(details)}")
         if len(output_keys) != 1:
             raise ValueError("model_kwargs must contain exactly one output_spiking or vss_output_spiking")
+        kwargs = dict(kwargs)
+        if output_key == "output_spiking":
+            # Normalize legacy plans to the public VSS-specific schema key.
+            kwargs["vss_output_spiking"] = kwargs.pop("output_spiking")
+        if "spatial_output_spiking" in kwargs and type(kwargs["spatial_output_spiking"]) is not bool:
+            raise ValueError("spatial_output_spiking must be a boolean")
+        if "temporal_mamba" in kwargs:
+            kwargs["temporal_mamba"] = _validate_temporal_mamba(kwargs["temporal_mamba"])
+            if kwargs["temporal_mamba"]["enabled"] and data["model_name"] != "orig":
+                raise ValueError("temporal_mamba.enabled=true is supported only for model_name=orig")
         patch_size = kwargs["patch_size"]
         if type(patch_size) is not int or patch_size <= 0:
             raise ValueError("patch_size must be a positive integer")
-        for name in _MODEL_KWARGS[1:] + output_keys:
+        for name in _MODEL_KWARGS[1:] + ("vss_output_spiking",):
             if type(kwargs[name]) is not bool:
                 raise ValueError(f"{name} must be a boolean")
         if kwargs["input_skip"] and data["model_name"] != "orig":
@@ -110,7 +171,9 @@ class SNNConfig:
             raise ValueError("num_input_channels must be 4")
         if type(data["num_output_channels"]) is not int or data["num_output_channels"] != 3:
             raise ValueError("num_output_channels must be 3")
-        return cls(**data)
+        normalized = dict(data)
+        normalized["model_kwargs"] = kwargs
+        return cls(**normalized)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -130,6 +193,8 @@ class SNNConfig:
 
 def build_core(config: SNNConfig) -> nn.Module:
     kwargs = dict(config.model_kwargs)
+    kwargs.setdefault("temporal_mamba", dict(_TEMPORAL_MAMBA_DEFAULTS))
+    kwargs.setdefault("spatial_output_spiking", False)
     output_key = next(name for name in _OUTPUT_SPIKING_KEYS if name in kwargs)
     accepted_kwargs = inspect.signature(build_model).parameters
     if output_key not in accepted_kwargs:

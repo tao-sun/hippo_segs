@@ -13,6 +13,12 @@ residual_connections: true
 dwconv2d_spiking: true
 patch_embedding_spiking: true
 vss_output_spiking: true  # final PLIF after every VSS encoder block
+temporal_mamba:
+  enabled: false
+  kernel_size: 3
+  d_state: 16
+  dt_rank: auto
+  debug_shapes: false
 input_skip: false  # orig only: input 4->8 projection + full-resolution 3x3 fusion
 # training
 # Set this to an existing run directory to resume from checkpoint_last.pt.
