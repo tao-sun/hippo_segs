@@ -1,0 +1,422 @@
+Metadata-Version: 2.4
+Name: hippo-segs
+Version: 0.1.0
+Summary: Add your description here
+Author-email: auryghia <auryghia05@gmail.com>
+Requires-Python: <3.11,>=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: accelerate<2,>=1.10
+Requires-Dist: mamba-ssm
+Requires-Dist: matplotlib>=3.9.4
+Requires-Dist: nibabel>=5.3.3
+Requires-Dist: nnunetv2==2.8.1
+Requires-Dist: numpy>=2.0.2
+Requires-Dist: pillow>=11.3.0
+Requires-Dist: pyyaml>=6.0.3
+Requires-Dist: scipy>=1.11
+Requires-Dist: scikit-learn>=1.6.1
+Requires-Dist: synapseclient>=4.10.0
+Requires-Dist: torch==2.5.1
+Requires-Dist: torchinfo>=1.8.0
+Requires-Dist: torchmetrics>=1.8.2
+Requires-Dist: torchvision>=0.20.1
+Requires-Dist: tqdm>=4.70.0
+
+# hippo_segs
+
+This repository trains the existing sequential SNN/SpikMamba models with nn-U-Net v2.8.1. nnU-Net handles dataset planning and preprocessing, sampling, augmentation, region loss, cross-validation, checkpointing, full-volume validation, inference, and postprocessing. The project supplies an external trainer and a thin CLI.
+
+## Set up
+
+Use Python 3.10 and [uv](https://docs.astral.sh/uv/) from the repository root. The project pins `nnunetv2==2.8.1` and PyTorch 2.5.1; its Mamba wheel targets Python 3.10, CUDA 12, and PyTorch 2.5. Production model execution needs a compatible NVIDIA GPU environment.
+
+~~~bash
+uv sync --python 3.10
+
+export nnUNet_raw=/path/to/nnUNet_raw
+export nnUNet_preprocessed=/path/to/nnUNet_preprocessed
+export SNN_RESULTS_BASE=/path/to/nnUNet_results
+export nnUNet_results="$SNN_RESULTS_BASE"
+export nnUNet_extTrainer="$PWD/snn_nnunet"
+export nnUNet_compile=false
+~~~
+
+Set the three nnU-Net data paths to writable, persistent directories. The project CLI sets `nnUNet_extTrainer` and defaults `nnUNet_compile=false` itself. Keep these exports when invoking native nnU-Net commands directly: the installed package discovers the external `nnUNetTrainerSNNFPTT` through `nnUNet_extTrainer`. Compilation defaults to false because the SNN has mutable neuron state and custom Mamba operations.
+
+Run the following commands from the repository root in a shell with these exports. Dataset ID `501` and name `BraTS24GLI` are examples; choose an unused ID and use it consistently.
+
+## Prepare extracted BraTS24 data
+
+Extract the BraTS24 GLI archive first. `--dataset-root` must point to an extracted directory, not a ZIP file. The converter finds subject directories recursively. Each case needs one each of `*t1n*.nii.gz`, `*t1c*.nii.gz`, `*t2w*.nii.gz`, and `*t2f*.nii.gz`, plus one `*seg*.nii.gz` for a labeled training case.
+
+~~~bash
+export BRATS24_EXTRACTED=/path/to/extracted/BraTS24-GLI
+uv run --python 3.10 python -m snn_nnunet.cli prepare \
+  --dataset-root "$BRATS24_EXTRACTED" \
+  --dataset-id 501 --dataset-name BraTS24GLI
+~~~
+
+The converter writes `Dataset501_BraTS24GLI` under `nnUNet_raw`. Channels `_0000` through `_0003` are T1, T1ce, T2, and FLAIR. Only segmentation value `4` is changed to background `0`; image intensities and geometry are preserved. Unlabeled cases go to `imagesTs`. An already formatted `Dataset501_BraTS24GLI` raw directory can also be passed as `--dataset-root`.
+
+Preparation runs native nnU-Net fingerprinting, planning, and preprocessing with dataset integrity checks. It derives `SNNPlans.json` from stock plans, retaining the stock preprocessed data identifier. The SNN `3d_fullres` plan uses a **[128, 128, 128] voxel patch** and **batch size 4**. Its `model_kwargs.patch_size: 4` is the internal 2D SpikMamba patch-embedding factor, not the nnU-Net spatial patch size.
+
+## Train and resume
+
+To select the model without changing its trainer, edit
+`brats24_fold0_model.yaml`. The supported families are `unet2d`, `unet3d`,
+and `snn`; give each experiment a fresh `run_dir`. The launcher reads the
+appropriate plans (`nnUNetPlans` or `SNNPlans`), verifies that the selected
+configuration was preprocessed, and keeps checkpoints in that run directory.
+The optional `snn` section is used only when `family: snn`. Run it from the
+repository root after exporting the existing data paths:
+
+~~~bash
+export nnUNet_raw=/gpfs/scratch1/shared/apiaghiardelli/nnUNet_raw
+export nnUNet_preprocessed=/gpfs/scratch1/shared/apiaghiardelli/nnUNet_preprocessed
+uv run --python 3.10 python -m snn_nnunet.run_model \
+  --config brats24_fold0_model.yaml
+~~~
+
+The launcher refuses a nonempty `run_dir` and saves a copy of the YAML as
+`experiment.yaml` inside the new run. Use a different run directory when
+switching model family. `unet2d` and `unet3d` call nnU-Net's standard
+`nnUNetTrainer` with configuration `2d` and `3d_fullres`, respectively. `snn`
+calls this repository's existing training CLI with `3d_fullres`.
+
+Set `snn.epochs: 100` in the launcher YAML for a 100-epoch SNN experiment.
+The value must be a positive integer and controls both the training limit
+and the native polynomial learning-rate schedule. It is saved as
+`snn_config.num_epochs` in plans and checkpoint initialization arguments.
+The CLI equivalent is `--epochs 100`; omitting the flag preserves the
+value in plans. Old configs/plans without an epoch count use 300.
+The legacy experiment YAML keeps its existing top-level `epochs` key.
+
+Full-volume validation uses the same Dice convention before and after
+postprocessing: two empty masks score **1**, while empty ground truth with
+false-positive predictions scores **0**. Empty predictions against nonempty
+ground truth also score **0**. Cases with absent regions remain in the mean.
+The SNN native validator applies this convention before saving `summary.json`
+or logging the full-volume Dice. The stock U-Net launcher applies it for
+single-GPU validation; stock multi-GPU workers retain nnU-Net's native logging
+until the launcher finalizes their summary. Custom validation and saved-volume
+postprocessing print the convention and the absolute Dice gain
+(`postprocessed - raw`) for WT, TC, ET, and their mean. The convention is recorded
+in summaries as `dice_convention`; training loss and online patch pseudo-Dice
+are unchanged.
+
+For `snn.variant: orig`, choose `snn.spatial_mamba.decoder_block: standard`
+(the default) or `resdecoder`. This replaces only the first two skip-fusion
+blocks; the upsampling blocks, their refinement convolutions, and the final
+full-resolution fusion keep their existing structure. The same option is
+available as `--decoder-block standard|resdecoder` on the training CLI, or
+as top-level `decoder_block` in the legacy experiment YAML.
+
+ResDecoder applies `Conv3x3 -> GN -> spike -> Conv3x3`, adds the
+`Conv1x1(input)` projection, then applies `GN -> spike -> dropout`. Its two
+spiking neurons have independent temporal state and follow `snn.output_spiking`
+(legacy YAML: `output_spiking`); setting it to false replaces both
+with identities while retaining the GN layers. The per-layer switches
+`snn.spatial_mamba.resdecoder_spiking1` and `resdecoder_spiking2` (both true
+by default) separately disable the neuron after the first convolution/GN
+and the neuron after the residual sum/GN. The global `output_spiking: false`
+always disables both and all other decoder output neurons. These flags
+are also available as `--[no-]resdecoder-spiking1` and
+`--[no-]resdecoder-spiking2`; the master switch is `--[no-]output-spiking`.
+Old `vss_output_spiking` config/checkpoint keys and CLI spellings remain
+accepted aliases; newly saved configurations use `output_spiking`.
+Dropout remains 0.1 in
+the existing three positions per stage: after upsampling, after the
+pre-fusion refinement, and after fusion. Select a fresh `run_dir` when
+changing decoder type; the choice is saved in the experiment and plans
+for checkpoint reconstruction. Existing plans without this key use
+the standard decoder.
+
+The generic switch names are `stem_spiking`, `downsampling_spiking`,
+`resdecoder_spiking1`, and `resdecoder_spiking2`, for either neuron model.
+Old `stem_plif`, `downsampling_plif`, `resdecoder_plif1`, and
+`resdecoder_plif2` names remain accepted aliases in configs, plans and CLI
+flags. Newly saved configurations use the generic names. Specify only one
+name for each switch; supplying both aliases is rejected. The rename
+preserves the configured values and checkpoint weight names.
+
+Set `snn.spatial_mamba.neuron_model: silif` to use real-valued SiLIF neurons
+instead of the default `plif`, for `variant: orig`. Existing switches
+(`stem_spiking`, `downsampling_spiking`, `patch_embedding_spiking`,
+`dwconv2d_spiking`, `output_spiking`, the ResDecoder/FUE switches, and the
+temporal neuron switches) still control whether each neuron is active.
+Selecting SiLIF alone does not enable any disabled position. For example:
+
+~~~yaml
+snn:
+  spatial_mamba:
+    neuron_model: silif
+    dwconv2d_spiking: true
+~~~
+
+This enables SiLIF after the spatial depthwise convolutions; other
+positions follow their configured switches. The CLI flag is
+`--neuron-model silif`; legacy experiment YAML uses top-level
+`neuron_model`. The choice is saved in plans/checkpoint config and changing
+it requires a fresh run. Old configs/checkpoints default to PLIF.
+
+SiLIF follows Algorithm 1 of [Fabre et al.](https://arxiv.org/abs/2506.06374):
+five trainable parameters per channel, log-parameterized membrane and
+adaptation rates and timestep, and feedback coefficients bounded to
+`a in [0,1]` and `b in [0,2]`. Defaults follow the authors' initialization:
+rate ranges `[10,250]` and `[2.5,10]`, with initial timestep `0.004`.
+`init_tau` remains a PLIF-only setting. This implementation adapts the
+neuron to sequential MRI inference: states start at zero, parameters are
+shared across spatial positions, and the existing ATan surrogate is used.
+The membrane reset path detaches the previous spike as in the project's
+PLIF integration; the adaptation feedback remains differentiable.
+All three states are detached at TBPTT boundaries and reset at a new volume
+or tile (`time_step=0`). Runtime states are omitted from checkpoints.
+
+SiLIF tuning is available in the launcher YAML under
+`snn.spatial_mamba.silif`. Omitted entries retain the defaults:
+
+~~~yaml
+snn:
+  spatial_mamba:
+    neuron_model: silif
+    silif:
+      v_threshold: 1.0
+      dt_init: 0.004
+      rate_u_range: [10.0, 250.0]
+      rate_w_range: [2.5, 10.0]
+      a_range: [0.0, 1.0]
+      b_range: [0.0, 2.0]
+      surrogate_alpha: 2.0
+      detach_reset: true
+~~~
+
+Both rate ranges are sampled uniformly in log space; `a_range` and `b_range`
+are sampled uniformly in linear space. Equal endpoints initialize a constant.
+Rates, timestep, and feedback coefficients are learned after initialization;
+the recurrence still clamps `a` to `[0,1]` and `b` to `[0,2]`. Threshold,
+surrogate slope, and reset detachment remain fixed. The membrane reset subtracts
+one previous spike regardless of the threshold. Invalid ranges and unknown
+keys fail before training. The same settings apply to all enabled SiLIF sites,
+including optional temporal, ResDecoder, and FUE neurons. PLIF ignores them.
+
+When `neuron_model: silif`, construction prints a `SiLIF configuration`
+block with every setting and the number of active neuron modules to stdout,
+including the SLURM `.out`. These are initialization settings, not measurements
+of learned parameters. Values are saved in plans/checkpoint metadata and used
+when rebuilding validation/inference models; old SiLIF runs use the original
+defaults. Start a fresh run when changing them. The direct CLI equivalent is
+`--silif '{"v_threshold": 0.8, "rate_u_range": [15, 375]}'`.
+
+For small-lesion experiments, change one factor per run: compare threshold
+`1.0` versus `0.8`, membrane initialization `[10,250]` versus `[15,375]`
+at fixed timestep, or weaker feedback ranges `[0,0.5]` and `[0,1]`.
+Compare raw lesion detection/recall and false positives before postprocessing;
+the custom validation's default component filters remove ET components below
+161 voxels and TC components below 166 voxels. A small-lesion improvement may
+therefore be lost after filtering. These are experimental starting points,
+not demonstrated improvements or a guarantee of matching a 3D U-Net.
+
+Set `snn.spatial_mamba.dwconv2d_kernel_size` to a positive odd integer
+(default `3`, for example `5` or `7`) to choose the spatial depthwise
+kernel inside every SpikMamba block, including additional VSS blocks.
+Its stride stays 1 and padding is half the kernel size, preserving feature
+map resolution. `downsample_kernel_size` controls the separate encoder
+downsampling convolution. The CLI flag is `--dwconv2d-kernel-size`; legacy
+experiment YAML uses top-level `dwconv2d_kernel_size`. This option applies
+to `variant: orig` and is saved in plans/checkpoint config for evaluation.
+Older configs/checkpoints default to 3. Start a fresh run when changing
+kernel size because the convolution weight shapes change.
+
+Set `snn.spatial_mamba.downsample_strides` to three positive integers,
+ordered from encoder stage 1 to 3 (default `[2, 2, 2]`). For example,
+`[1, 2, 2]` maps a 256-pixel side to `256 -> 256 -> 128 -> 64`, while
+`[2, 2, 2]` gives `256 -> 128 -> 64 -> 32`. Each stride applies to both
+spatial axes. The decoder uses the reversed strides, and input padding
+uses their product, so skip connections also match for odd input sizes.
+A stride-1 stage retains its convolution and channel projection. Higher
+resolution increases activation/state memory and spatial scan work.
+The CLI option is `--downsample-strides 1 2 2`; legacy experiment YAML uses
+top-level `downsample_strides`. Custom strides require `variant: orig`
+and `hierarchical_encoder: true`. The list is saved in plans/checkpoint
+config; old configs/checkpoints default to `[2, 2, 2]`. Start a fresh run
+when changing strides. The legacy encoder retains its `patch_size` stride.
+
+Optional FUE skip branches are controlled independently by
+`snn.spatial_mamba.fue_skip1` and `fue_skip2` (both false by default).
+They apply SegMamba's `p = sigmoid(mean_channels(x))`, `u = -p*log(p)`,
+`FUE(x) = x*(2-u)` to the final VSS's normalized, pre-PLIF features in
+encoder stages 1 and 2. Each enabled skip has its own PLIF followed by
+0.1 dropout; the original encoder path continues through its existing
+PLIF and dropout. `snn.output_spiking: false` disables the new skip
+PLIFs while keeping FUE active. Skip 1 feeds `concat2_conv`; skip 2 feeds
+`concat1_conv`. Both decoder types support FUE, for `variant: orig`.
+The final full-resolution stem skip keeps its existing structure.
+CLI flags are `--[no-]fue-skip1` and `--[no-]fue-skip2`; legacy YAML uses
+the same names at top level. Flags are saved in plans/checkpoint config;
+changing them requires a fresh run. Old checkpoints default to FUE off.
+PyTorch dropout remains after PLIF and rescales surviving spikes during
+training; dropout is inactive during evaluation.
+
+On the cluster, submit the generic GPU launcher. It requests one H100 by
+default; the command-line partition overrides that default when an A100 is
+preferred:
+
+~~~bash
+sbatch train_brats24_fold0.sbatch
+sbatch --partition=gpu_h100 train_brats24_fold0.sbatch
+sbatch --partition=gpu_a100 train_brats24_fold0.sbatch
+~~~
+
+The script reads the model family and GPU count from
+`brats24_fold0_model.yaml`. Its `#SBATCH --gpus=1` must match the YAML `gpus`
+value. To use another experiment file, submit with:
+
+~~~bash
+sbatch --export=ALL,CONFIG_PATH=/absolute/path/to/config.yaml \
+  train_brats24_fold0.sbatch
+~~~
+
+If the 2D preprocessed directory is absent, create it before submitting the
+training job:
+
+~~~bash
+srun --partition=gpu_h100 --ntasks=1 --cpus-per-task=16 --mem=64G \
+  --time=1-00:00:00 \
+  .venv/bin/nnUNetv2_preprocess -d 1 -plans_name nnUNetPlans -c 2d \
+  -np 16 --no_pbar
+~~~
+
+Use a distinct `nnUNet_results` root for each experiment. Keep its path: resume, validation, and prediction must point to that same root. The native result folders and checkpoints live beneath it. `full-cv` trains folds 0 through 4 sequentially with the same configuration:
+
+~~~bash
+export SNN_RUN="$SNN_RESULTS_BASE/brats24_orig_axis0_k16_fptt"
+export nnUNet_results="$SNN_RUN"
+uv run --python 3.10 python -m snn_nnunet.cli full-cv \
+  --dataset-id 501
+~~~
+
+To train one fold, point `nnUNet_results` at a different fresh root:
+
+~~~bash
+export SNN_SINGLE_RUN="$SNN_RESULTS_BASE/brats24_fold0"
+export nnUNet_results="$SNN_SINGLE_RUN"
+uv run --python 3.10 python -m snn_nnunet.cli train \
+  --dataset-id 501 --fold 0
+~~~
+
+Defaults are model `orig`, temporal axis `0`, `k=16`, and FPTT enabled. Select another model (`orig`, `shallow`, `medium`, or `deep`), axis (`0`, `1`, or `2`), window length, or plain TBPTT with `--model`, `--temporal-axis`, `--k`, or `--no-fptt`. These choices must match for every fold in a run.
+
+Resume with `--continue` after restoring the original `nnUNet_results` root. Repeat every nondefault configuration flag: omitted flags revert to defaults and can conflict with the saved plans. For example, a run originally started with `--model shallow --temporal-axis 2 --k 8 --no-fptt` resumes as follows:
+
+~~~bash
+export nnUNet_results=/path/to/existing/shallow_axis2_k8_results
+uv run --python 3.10 python -m snn_nnunet.cli full-cv \
+  --dataset-id 501 \
+  --model shallow --temporal-axis 2 --k 8 --no-fptt --continue
+~~~
+
+For the default example run:
+
+~~~bash
+export nnUNet_results="$SNN_RUN"
+uv run --python 3.10 python -m snn_nnunet.cli full-cv \
+  --dataset-id 501 --continue
+~~~
+
+The CLI delegates checkpoint continuation to native nnU-Net. A fresh results root keeps experiments separate; reuse the same root for a continuation or for reading its checkpoints.
+
+For multiple GPUs, pass `--gpus` to training; this example starts a separate four-GPU results root:
+
+~~~bash
+export nnUNet_results="$SNN_RESULTS_BASE/brats24_4gpu"
+uv run --python 3.10 python -m snn_nnunet.cli full-cv \
+  --dataset-id 501 --gpus 4
+~~~
+
+Each fold uses native nnU-Net distributed training, while `full-cv` runs the folds one after another.
+
+## Validate and predict
+
+After each fold finishes training through `train` or `full-cv`, the CLI automatically runs the custom full-volume validation using `checkpoint_best.pth`. It uses a `128×128×128` inference patch in FP32, 50% tile overlap, probability threshold `0.5`, and the BraTS postprocessing configured in `custom_full_validation.py`. Results are written to `fold_<n>/validation_128patch_postprocessed` under the run's nnU-Net results folder.
+
+You can also run nnU-Net's native full-volume validation manually; it uses the final checkpoint by default, while `--best` selects `checkpoint_best.pth`:
+
+~~~bash
+export nnUNet_results="$SNN_RUN"
+uv run --python 3.10 python -m snn_nnunet.cli validate \
+  --dataset-id 501 --fold 0
+
+uv run --python 3.10 python -m snn_nnunet.cli validate \
+  --dataset-id 501 --fold 0 --best
+~~~
+
+The training log's native pseudo-Dice is computed on sampled validation patches. For fold-level Dice reporting, use the true full-volume native validation output.
+
+Prediction input is a folder of raw nnU-Net channels named like `case_0000.nii.gz` through `case_0003.nii.gz`. For example, use the prepared dataset's `imagesTs` if it contains unlabeled cases. One-fold prediction:
+
+~~~bash
+export nnUNet_results="$SNN_RUN"
+uv run --python 3.10 python -m snn_nnunet.cli predict \
+  --dataset-id 501 \
+  --input "$nnUNet_raw/Dataset501_BraTS24GLI/imagesTs" \
+  --output /path/to/predictions_fold0 --folds 0
+~~~
+
+Once all five folds have checkpoints, omit `--folds` to use the native five-fold prediction ensemble. `--checkpoint best` selects best instead of final checkpoints:
+
+~~~bash
+export nnUNet_results="$SNN_RUN"
+uv run --python 3.10 python -m snn_nnunet.cli predict \
+  --dataset-id 501 \
+  --input "$nnUNet_raw/Dataset501_BraTS24GLI/imagesTs" \
+  --output /path/to/predictions_5fold
+~~~
+
+Optional postprocessing uses nnU-Net's selected connected-component rules. To request it, start a full five-fold run with `--select-best` so native configuration and postprocessing selection runs after training, then predict with the same results root and `--postprocess`:
+
+~~~bash
+export SNN_POST_RUN="$SNN_RESULTS_BASE/brats24_with_selection"
+export nnUNet_results="$SNN_POST_RUN"
+uv run --python 3.10 python -m snn_nnunet.cli full-cv \
+  --dataset-id 501 --select-best
+
+uv run --python 3.10 python -m snn_nnunet.cli predict \
+  --dataset-id 501 \
+  --input "$nnUNet_raw/Dataset501_BraTS24GLI/imagesTs" \
+  --output /path/to/predictions_5fold_selected --postprocess
+~~~
+
+Postprocessed results appear in `/path/to/predictions_5fold_selected_postprocessed`. The selection needs completed cross-validation outputs and applies no project-specific thresholds or morphology.
+
+## Sequential trainer behavior
+
+The adapter accepts native `[B, 4, X, Y, Z]` patches and returns `[B, 3, X, Y, Z]` region logits. `--temporal-axis` chooses X, Y, or Z in **preprocessed nnU-Net coordinates**, which need not match original NIfTI orientation. Slices are traversed in order. Neuron state continues across windows within one patch and resets for the next independent patch or inference tile. Native augmentation and inference mirroring exclude the temporal axis: axes 0, 1, and 2 allow `(1, 2)`, `(0, 2)`, and `(0, 1)` respectively.
+
+The trainer uses native region Dice/BCE loss. For each `k`-slice window, it takes one optimizer update and detaches neuron state: truncated backpropagation through time (TBPTT). FPTT adds its regularizer and updates auxiliary running parameters once per window; `--no-fptt` retains TBPTT without FPTT operations. A temporal length of 128 at `k=16` gives 8 updates per minibatch. At 250 minibatches per epoch this is **2,000 optimizer updates per epoch across 32,000 temporal positions per batch element** (128 × 250), or 200,000 updates over 100 epochs (600,000 over the default 300 epochs). Batch size 4 therefore processes 128,000 individual slice instances per epoch. These are job-level update counts, not multiplied by GPU count; they describe the schedule, not measured production throughput.
+
+## Troubleshooting
+
+- If native nnU-Net reports missing paths, export `nnUNet_raw`, `nnUNet_preprocessed`, and `nnUNet_results` in the current shell. Native commands also need `nnUNet_extTrainer` to find the custom trainer.
+- If conversion rejects a ZIP or a case, extract the archive and check for exactly one file of each modality per subject. An existing raw destination with different contents is deliberately rejected.
+- If resume or validation reports incompatible plans or results, restore the original `nnUNet_results` root and matching dataset ID, model, temporal axis, `k`, and FPTT mode. Repeat all nondefault training flags with `--continue`. The shared preprocessed `SNNPlans.json` must also match the selected run for validation.
+- The nnU-Net 2.8.1 native Python training API expects the dataset argument as a **string**. This CLI converts it; direct API calls should use `str(dataset_id)` (for example, `"501"`).
+- Native prediction needs checkpoints for each requested fold. Its five-fold default needs all five; use `--folds 0` for a completed single fold.
+
+## Legacy workflow
+
+The earlier 2D slice-cache experiment remains available through `data/preprocess_brats24.py`, `experiments_snn_fptt.yaml`, and `snn_fptt.py`. It uses separate preprocessing and Accelerate commands.
+
+## SNN source layout
+
+The model implementation and its supporting modules live in `snn_nnunet/`:
+`model.py`, `spikmamba.py`, `spike_neurons.py`, `spike_neuron.py`,
+`spike_activations.py`, `surrogate.py`, and `accelerating.py`.
+Use package-qualified imports, for example
+`from snn_nnunet.model import build_model`.
+Training entry points remain `python -m snn_nnunet.run_model` and
+`python -m snn_nnunet.cli`.
+
+SNN inference keeps the model forward pass, Gaussian blending weights, and
+sliding-window accumulation in FP32, including native full-volume validation.
+AMP is disabled inside inference, and non-finite logits raise an error before
+thresholding. No reduced-precision or quantized model conversion is applied.

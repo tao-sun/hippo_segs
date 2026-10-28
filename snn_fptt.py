@@ -45,7 +45,8 @@ from postprocessing import (
 )
 # ==== use your spiking UNet-like model ====
 # SNNBraTS: forward(x_win[B,k,4,H,W], t0) -> (B, out_channels, k, H, W)
-from model import build_model as build_shared_model, print_model_info
+from snn_nnunet.model import build_model as build_shared_model, print_model_info, architecture_options, output_spiking_option
+from snn_nnunet.config_aliases import normalize_spiking_options
 from snn_nnunet.fptt import (
     init_running_params,
     regularizer_loss,
@@ -169,6 +170,43 @@ def validate_checkpoint_input_skip(checkpoint: Dict, input_skip: bool) -> None:
         )
 
 
+def validate_checkpoint_neuron_model(checkpoint: Dict, neuron_model: str, *, silif=None) -> None:
+    saved_architecture = architecture_options(checkpoint.get("config", {}))
+    saved = saved_architecture["neuron_model"]
+    if saved != neuron_model:
+        raise ValueError(
+            f"Checkpoint neuron_model={saved!r} differs from requested neuron_model={neuron_model!r}; "
+            "start a new run with resume_from: null when changing neurons."
+        )
+    if neuron_model == "silif" and silif is not None:
+        from snn_nnunet.silif_config import silif_options
+        if saved_architecture["silif"] != silif_options(silif):
+            raise ValueError(
+                "Checkpoint silif settings differ from the requested settings; "
+                "start a new run with resume_from: null when changing neurons."
+            )
+
+
+def validate_checkpoint_downsample_strides(checkpoint: Dict, downsample_strides) -> None:
+    saved = architecture_options(checkpoint.get("config", {}))["downsample_strides"]
+    if saved != list(downsample_strides):
+        raise ValueError(
+            f"Checkpoint downsample_strides={saved} differs from requested "
+            f"downsample_strides={list(downsample_strides)}; "
+            "start a new run with resume_from: null when changing encoder strides."
+        )
+
+
+def validate_checkpoint_dwconv2d_kernel_size(checkpoint: Dict, dwconv2d_kernel_size: int) -> None:
+    saved = architecture_options(checkpoint.get("config", {}))["dwconv2d_kernel_size"]
+    if saved != dwconv2d_kernel_size:
+        raise ValueError(
+            f"Checkpoint dwconv2d_kernel_size={saved} differs from requested "
+            f"dwconv2d_kernel_size={dwconv2d_kernel_size}; "
+            "start a new run with resume_from: null when changing kernel size."
+        )
+
+
 def validate_checkpoint_temporal_mamba(checkpoint: Dict, temporal_mamba: Dict) -> None:
     saved = checkpoint.get("config", {}).get("temporal_mamba", {"enabled": False})
     defaults = {"enabled": False, "kernel_size": 3, "d_state": 16, "dt_rank": "auto", "debug_shapes": False}
@@ -182,18 +220,45 @@ def validate_checkpoint_temporal_mamba(checkpoint: Dict, temporal_mamba: Dict) -
         )
 
 
-def validate_checkpoint_vss_output_spiking(
-    checkpoint: Dict, vss_output_spiking: bool
-) -> None:
-    saved = checkpoint.get("config", {}).get("vss_output_spiking", True)
-    if not isinstance(saved, bool):
-        raise ValueError("Checkpoint vss_output_spiking must be a boolean")
-    if saved != vss_output_spiking:
+def validate_checkpoint_output_spiking(checkpoint: Dict, output_spiking: bool) -> None:
+    saved = output_spiking_option(checkpoint.get("config", {}))
+    if saved != output_spiking:
         raise ValueError(
-            "Checkpoint vss_output_spiking="
-            f"{saved} differs from requested vss_output_spiking="
-            f"{vss_output_spiking}; start a new run when changing VSS behavior."
+            f"Checkpoint output_spiking={saved} differs from requested "
+            f"output_spiking={output_spiking}; start a new run when changing output behavior."
         )
+
+
+# Compatibility for callers using the old public validator name.
+validate_checkpoint_vss_output_spiking = validate_checkpoint_output_spiking
+
+def validate_checkpoint_decoder_block(checkpoint: Dict, decoder_block: str,
+                                      resdecoder_spiking1=True, resdecoder_spiking2=True) -> None:
+    saved = architecture_options(checkpoint.get("config", {}))
+    if saved["decoder_block"] != decoder_block:
+        raise ValueError(
+            f"Checkpoint decoder_block={saved['decoder_block']!r} differs from requested "
+            f"decoder_block={decoder_block!r}; start a new run when changing decoder."
+        )
+    if decoder_block == "resdecoder":
+        for name, value in (("resdecoder_spiking1", resdecoder_spiking1),
+                            ("resdecoder_spiking2", resdecoder_spiking2)):
+            if saved[name] != value:
+                raise ValueError(
+                    f"Checkpoint {name}={saved[name]} differs from requested {name}={value}; "
+                    "start a new run when changing decoder spiking switches."
+                )
+
+
+def validate_checkpoint_fue_skips(checkpoint: Dict, fue_skip1=False, fue_skip2=False) -> None:
+    saved = architecture_options(checkpoint.get("config", {}))
+    for name, current in (("fue_skip1", fue_skip1), ("fue_skip2", fue_skip2)):
+        if saved[name] != current:
+            raise ValueError(
+                f"Checkpoint {name}={saved[name]} differs from requested {name}={current}; "
+                "start a new run when changing FUE skips."
+            )
+
 
 def create_training_scheduler(optimizer, name: str):
     if name == "cosine":
@@ -329,9 +394,27 @@ def load_training_checkpoint(accelerator: Accelerator,
             validate_checkpoint_scheduler(checkpoint, "reduce_plateau")
 
     base_model = accelerator.unwrap_model(model)
+    validate_checkpoint_neuron_model(
+        checkpoint, getattr(base_model, "neuron_model", "plif"),
+        silif=getattr(base_model, "architecture_config", {}).get("silif", {}),
+    )
+    validate_checkpoint_downsample_strides(
+        checkpoint, getattr(base_model, "downsample_strides", (2, 2, 2))
+    )
+    validate_checkpoint_dwconv2d_kernel_size(
+        checkpoint, getattr(base_model, "dwconv2d_kernel_size", 3)
+    )
     validate_checkpoint_input_skip(checkpoint, getattr(base_model, "input_skip", False))
-    validate_checkpoint_vss_output_spiking(
-        checkpoint, getattr(base_model, "vss_output_spiking", True)
+    validate_checkpoint_output_spiking(
+        checkpoint, getattr(base_model, "output_spiking", True)
+    )
+    validate_checkpoint_decoder_block(
+        checkpoint, getattr(base_model, "decoder_block", "standard"),
+        getattr(base_model, "resdecoder_spiking1", True),
+        getattr(base_model, "resdecoder_spiking2", True),
+    )
+    validate_checkpoint_fue_skips(
+        checkpoint, getattr(base_model, "fue_skip1", False), getattr(base_model, "fue_skip2", False)
     )
     base_model.load_state_dict(checkpoint["model"])
     optimizer.load_state_dict(checkpoint["optimizer"])
@@ -1198,6 +1281,7 @@ def load_experiment_from_yaml(config_path: str) -> Dict:
 
     if not isinstance(raw, dict):
         raise ValueError("YAML config must be a mapping at the top level")
+    raw = normalize_spiking_options(raw)
 
     required_keys = {
         "name",
@@ -1258,10 +1342,10 @@ def load_experiment_from_yaml(config_path: str) -> Dict:
     if not isinstance(raw["patch_embedding_spiking"], bool):
         raise ValueError("patch_embedding_spiking must be a boolean")
 
-    vss_output_spiking = raw.get("vss_output_spiking", True)
-    if not isinstance(vss_output_spiking, bool):
-        raise ValueError("vss_output_spiking must be a boolean")
-    raw["vss_output_spiking"] = vss_output_spiking
+    raw.update(architecture_options(raw))
+
+    raw["output_spiking"] = output_spiking_option(raw)
+    raw.pop("vss_output_spiking", None)
 
     temporal_mamba = raw.get("temporal_mamba", {})
     if not isinstance(temporal_mamba, dict):
@@ -1430,8 +1514,14 @@ def build_model(model_name, out_channels=3, patch_size=4,
                 dwconv2d_spiking=True,
                 patch_embedding_spiking=False,
                 input_skip=False,
-                vss_output_spiking=True,
-                temporal_mamba=None):
+                output_spiking=None,
+                temporal_mamba=None, vss_output_spiking=None, **architecture):
+    switches = {}
+    if output_spiking is not None:
+        switches["output_spiking"] = output_spiking
+    if vss_output_spiking is not None:
+        switches["vss_output_spiking"] = vss_output_spiking
+    selected_output_spiking = output_spiking_option(switches)
     return build_shared_model(
         model_name=model_name,
         out_channels=out_channels,
@@ -1440,17 +1530,19 @@ def build_model(model_name, out_channels=3, patch_size=4,
         residual_connections=residual_connections,
         dwconv2d_spiking=dwconv2d_spiking,
         patch_embedding_spiking=patch_embedding_spiking,
-            output_spiking=vss_output_spiking,
+        output_spiking=selected_output_spiking,
         input_skip=input_skip,
         temporal_mamba=temporal_mamba,
+        **architecture,
     )
 
 
 def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
     accelerator = Accelerator()
+    architecture = architecture_options(exp_cfg)
     use_fptt = exp_cfg.get("use_fptt", True)
     input_skip = exp_cfg.get("input_skip", False)
-    vss_output_spiking = exp_cfg.get("vss_output_spiking", True)
+    output_spiking = output_spiking_option(exp_cfg)
     temporal_mamba = exp_cfg.get("temporal_mamba", {
         "enabled": False, "kernel_size": 3, "d_state": 16, "dt_rank": "auto",
         "debug_shapes": False
@@ -1482,9 +1574,23 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
             run_dir / "checkpoint_last.pt", map_location="cpu", weights_only=False
         )
         validate_checkpoint_training_mode(resume_checkpoint, use_fptt)
+        validate_checkpoint_neuron_model(
+            resume_checkpoint, architecture["neuron_model"], silif=architecture["silif"]
+        )
+        validate_checkpoint_downsample_strides(
+            resume_checkpoint, architecture["downsample_strides"]
+        )
+        validate_checkpoint_dwconv2d_kernel_size(
+            resume_checkpoint, architecture["dwconv2d_kernel_size"]
+        )
         validate_checkpoint_input_skip(resume_checkpoint, input_skip)
-        validate_checkpoint_vss_output_spiking(
-            resume_checkpoint, vss_output_spiking
+        validate_checkpoint_output_spiking(resume_checkpoint, output_spiking)
+        validate_checkpoint_decoder_block(
+            resume_checkpoint, architecture["decoder_block"],
+            architecture["resdecoder_spiking1"], architecture["resdecoder_spiking2"],
+        )
+        validate_checkpoint_fue_skips(
+            resume_checkpoint, architecture["fue_skip1"], architecture["fue_skip2"]
         )
         validate_checkpoint_temporal_mamba(resume_checkpoint, temporal_mamba)
         if resume_scheduler:
@@ -1580,12 +1686,13 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
         "val_fold": val_fold,
         "view": view,
         "model": model_name,
+        **architecture,
         "patch_size": patch_size,
         "linear_projection": linear_projection,
         "residual_connections": residual_connections,
         "dwconv2d_spiking": dwconv2d_spiking,
         "patch_embedding_spiking": patch_embedding_spiking,
-        "vss_output_spiking": vss_output_spiking,
+        "output_spiking": output_spiking,
         "input_skip": input_skip,
         "temporal_mamba": temporal_mamba,
         "epochs": epochs,
@@ -1783,9 +1890,10 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
         residual_connections=residual_connections,
         dwconv2d_spiking=dwconv2d_spiking,
         patch_embedding_spiking=patch_embedding_spiking,
-        vss_output_spiking=vss_output_spiking,
+        output_spiking=output_spiking,
         input_skip=input_skip,
         temporal_mamba=temporal_mamba,
+        **architecture,
     )
 
     if accelerator.is_main_process:

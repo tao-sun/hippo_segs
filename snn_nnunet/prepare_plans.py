@@ -23,6 +23,8 @@ from snn_nnunet.network_adapter import SNNConfig
 PLANS_IDENTIFIER = "SNNPlans"
 DEFAULT_SNN_CONFIG: dict[str, Any] = {
     "model_name": "orig",
+    "num_epochs": 300,
+    "initial_lr": 0.01,
     "model_kwargs": {
         "patch_size": 4,
         "linear_projection": True,
@@ -30,7 +32,7 @@ DEFAULT_SNN_CONFIG: dict[str, Any] = {
         "dwconv2d_spiking": True,
         "patch_embedding_spiking": True,
         "input_skip": False,
-        "vss_output_spiking": True,
+        "output_spiking": True,
     },
     "temporal_axis": 0,
     "k": 16,
@@ -54,6 +56,16 @@ def _compatibility_config(plans: Mapping[str, Any]) -> dict[str, Any]:
     result = deepcopy(dict(plans))
     result["snn_config"] = _validated_config(result["snn_config"])
     result["snn_config"]["model_kwargs"].setdefault("spatial_output_spiking", False)
+    result["snn_config"]["model_kwargs"].setdefault("neuron_model", "plif")
+    from snn_nnunet.silif_config import silif_options
+    result["snn_config"]["model_kwargs"].setdefault("silif", silif_options({}))
+    result["snn_config"]["model_kwargs"].setdefault("dwconv2d_kernel_size", 3)
+    result["snn_config"]["model_kwargs"].setdefault("downsample_strides", [2, 2, 2])
+    result["snn_config"]["model_kwargs"].setdefault("decoder_block", "standard")
+    result["snn_config"]["model_kwargs"].setdefault("resdecoder_spiking1", True)
+    result["snn_config"]["model_kwargs"].setdefault("resdecoder_spiking2", True)
+    result["snn_config"]["model_kwargs"].setdefault("fue_skip1", False)
+    result["snn_config"]["model_kwargs"].setdefault("fue_skip2", False)
     result["snn_config"]["model_kwargs"].setdefault("temporal_mamba", {
         "enabled": False, "kernel_size": 3, "d_state": 16,
         "dt_rank": "auto", "debug_shapes": False,
@@ -163,6 +175,8 @@ def update_snn_config(
     plans_path: Path,
     snn_config: Mapping[str, Any],
     results_folder: Path | None = None,
+    *,
+    training_patch_size: list[int] | tuple[int, int, int] | None = None,
 ) -> Path:
     """Validate result compatibility and atomically persist a complete SNN config."""
 
@@ -170,6 +184,11 @@ def update_snn_config(
     with plans_path.open(encoding="utf-8") as stream:
         plans = json.load(stream)
     plans["snn_config"] = _validated_config(snn_config)
+    if training_patch_size is not None:
+        if (not isinstance(training_patch_size, (list, tuple)) or len(training_patch_size) != 3
+                or any(type(value) is not int or value <= 0 for value in training_patch_size)):
+            raise ValueError("training_patch_size must contain three positive integers")
+        plans["configurations"]["3d_fullres"]["patch_size"] = list(training_patch_size)
     if results_folder is not None:
         validate_results_compatibility(results_folder, plans)
     _atomic_write_json(plans_path, plans)

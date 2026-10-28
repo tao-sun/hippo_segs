@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, ConcatDataset
 
-from model import SNNBraTS
+from snn_nnunet.model import SNNBraTS
 from data import BratsDataset
 
 LABEL_NAMES = ["ET", "TC", "WT"]

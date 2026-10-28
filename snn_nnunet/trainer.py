@@ -15,6 +15,8 @@ from nnunetv2.training.loss.dice import get_tp_fp_fn_tn
 from nnunetv2.utilities.plans_handling.plans_handler import ConfigurationManager, PlansManager
 
 from snn_nnunet import fptt, network_adapter
+from snn_nnunet.inference import native_fp32_predictor
+from snn_nnunet.empty_dice_evaluation import native_empty_dice_evaluation
 from snn_nnunet.network_adapter import SNNConfig, SNNnnUNetAdapter, slice_temporal_window
 
 
@@ -46,10 +48,12 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
         # The base trainer enables CUDA AMP by default. Keep SNN training in FP32.
         self.grad_scaler = None
         self.snn_config = SNNConfig.from_plans(self.plans_manager.plans)
-        self.num_epochs = 300
+        self.num_epochs = self.snn_config.num_epochs
         self.num_iterations_per_epoch = 250
         self.num_val_iterations_per_epoch = 50
-        self.initial_lr = 1e-2
+        self.initial_lr = self.snn_config.initial_lr
+        self.validation_every = self.snn_config.validation_every
+        self._periodic_validation = None
         self.weight_decay = 3e-5
         self.oversample_foreground_percent = 0.33
         self.enable_deep_supervision = False
@@ -73,6 +77,17 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
         # SNNnnUNetAdapter resolves network_adapter.build_core when constructed.
         # Keeping that lookup live also lets the native predictor rebuild this model.
         return network_adapter.SNNnnUNetAdapter(config)
+
+    def on_train_start(self):
+        if self.validation_every and self.is_ddp:
+            raise ValueError("Periodic full-fold validation requires single-GPU training")
+        super().on_train_start()
+        if self.validation_every and self._periodic_validation is None:
+            from snn_nnunet.resume_validation import install_periodic_validation
+
+            controller = install_periodic_validation(self, self.validation_every)
+            # Retry an interrupted validation when resuming exactly on a boundary.
+            controller.validate_current()
 
     def set_deep_supervision_enabled(self, enabled: bool):
         """The adapter has no nnU-Net decoder or deep-supervision heads."""
@@ -135,6 +150,18 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
         for name in _CHECKPOINT_CONFIG_FIELDS:
             if name not in state or state[name] != getattr(self.snn_config, name):
                 raise ValueError(f"Checkpoint {name} does not match the current SNN plans")
+        saved_kwargs = checkpoint.get("init_args", {}).get("plans", {}).get("snn_config", {}).get("model_kwargs", {})
+        if saved_kwargs.get("neuron_model", "plif") != self.snn_config.model_kwargs.get("neuron_model", "plif"):
+            raise ValueError("Checkpoint neuron_model does not match the current SNN plans; start a new run")
+        if self.snn_config.model_kwargs.get("neuron_model", "plif") == "silif":
+            from snn_nnunet.silif_config import silif_options
+            if silif_options(saved_kwargs.get("silif", {})) != silif_options(self.snn_config.model_kwargs.get("silif", {})):
+                raise ValueError("Checkpoint silif settings do not match the current SNN plans; start a new run")
+        for name in ("fue_skip1", "fue_skip2"):
+            saved = saved_kwargs.get(name, False)
+            current = self.snn_config.model_kwargs.get(name, False)
+            if type(saved) is not bool or saved != current:
+                raise ValueError(f"Checkpoint {name} does not match the current SNN plans; start a new run")
         restored_tensors = {}
         if self.snn_config.use_fptt:
             if not self.was_initialized:
@@ -237,6 +264,11 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
             "k": config.k,
             "fptt_mode": config.use_fptt,
         }
+
+    def perform_actual_validation(self, save_probabilities: bool = False):
+        """Use FP32 and consistent empty-region Dice before native metrics are logged."""
+        with native_fp32_predictor(), native_empty_dice_evaluation():
+            return super().perform_actual_validation(save_probabilities=save_probabilities)
 
     def validation_step(self, batch: dict) -> dict:
         """Compute the native online metrics in FP32, without nnU-Net's AMP wrapper."""

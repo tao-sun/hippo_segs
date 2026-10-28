@@ -14,6 +14,7 @@ from snn_nnunet.custom_full_validation import (
     dice_metrics,
     labelmap_to_regions,
     postprocess_regions,
+    print_dice_summary,
     summarize_cases,
 )
 
@@ -111,11 +112,7 @@ def postprocess_saved_volumes(
                         case["case"], stage, region, metrics["dice"],
                         metrics["gt_voxels"], metrics["pred_voxels"],
                     ))
-    print(
-        f"Mean Dice (raw): {summary['mean']['raw']['mean']:.6f}; "
-        f"postprocessed: {summary['mean']['postprocessed']['mean']:.6f}",
-        flush=True,
-    )
+    print_dice_summary(summary)
     return summary
 
 

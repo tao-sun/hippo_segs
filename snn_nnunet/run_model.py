@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -45,12 +46,33 @@ def _config(path: Path) -> dict[str, Any]:
             raise ValueError("snn.variant must be orig, shallow, medium, or deep")
         _integer(snn, "temporal_axis", 0, 2)
         _integer(snn, "k", 1, 4096)
+        snn.setdefault("lr", 0.01)
+        if type(snn["lr"]) not in (int, float) or not math.isfinite(snn["lr"]) or snn["lr"] <= 0:
+            raise ValueError("snn.lr must be a positive finite number")
+        snn["lr"] = float(snn["lr"])
+        snn.setdefault("epochs", 300)
+        if type(snn["epochs"]) is not int or snn["epochs"] <= 0:
+            raise ValueError("snn.epochs must be a positive integer")
+        training_patch = snn.get("training_patch_size")
+        if training_patch is not None and (
+                not isinstance(training_patch, list) or len(training_patch) != 3
+                or any(type(value) is not int or value <= 0 for value in training_patch)):
+            raise ValueError("snn.training_patch_size must contain three positive integers")
+        snn.setdefault("validation_every", 0)
+        if type(snn["validation_every"]) is not int or snn["validation_every"] < 0:
+            raise ValueError("snn.validation_every must be a nonnegative integer")
+        snn.setdefault("validation_patch_size", [128, 128, 128])
+        patch = snn["validation_patch_size"]
+        if (not isinstance(patch, list) or len(patch) != 3
+                or any(type(value) is not int or value <= 0 for value in patch)):
+            raise ValueError("snn.validation_patch_size must contain three positive integers")
+        if snn["validation_every"] and config["gpus"] != 1:
+            raise ValueError("Periodic full-fold validation requires single-GPU training")
         if type(snn.get("use_fptt")) is not bool:
             raise ValueError("snn.use_fptt must be true or false")
-        vss_output_spiking = snn.get("vss_output_spiking", True)
-        if type(vss_output_spiking) is not bool:
-            raise ValueError("snn.vss_output_spiking must be true or false")
-        snn["vss_output_spiking"] = vss_output_spiking
+        from snn_nnunet.model import output_spiking_option
+        snn["output_spiking"] = output_spiking_option(snn)
+        snn.pop("vss_output_spiking", None)
         spatial = snn.get("spatial_mamba", {})
         if not isinstance(spatial, dict):
             raise ValueError("snn.spatial_mamba must be a YAML mapping")
@@ -59,12 +81,22 @@ def _config(path: Path) -> dict[str, Any]:
             "dwconv2d_spiking": True,
             "output_spiking": False,
         }
-        if spatial.keys() - spatial_defaults.keys():
+        from snn_nnunet.model import ARCHITECTURE_DEFAULTS, architecture_options
+        from snn_nnunet.config_aliases import normalize_spiking_options
+        spatial = normalize_spiking_options(spatial)
+        if spatial.keys() - (spatial_defaults.keys() | ARCHITECTURE_DEFAULTS.keys()):
             raise ValueError("snn.spatial_mamba has unknown options")
-        spatial_defaults.update(spatial)
+        for key in spatial_defaults:
+            if key in spatial:
+                spatial_defaults[key] = spatial[key]
         for key, value in spatial_defaults.items():
             if type(value) is not bool:
                 raise ValueError(f"snn.spatial_mamba.{key} must be true or false")
+        spatial_defaults.update(architecture_options(spatial))
+        if spatial_defaults["decoder_block"] == "resdecoder" and snn["variant"] != "orig":
+            raise ValueError("decoder_block=resdecoder requires snn.variant: orig")
+        if any(spatial_defaults[key] for key in ("fue_skip1", "fue_skip2")) and snn["variant"] != "orig":
+            raise ValueError("FUE skips require snn.variant: orig")
         snn["spatial_mamba"] = spatial_defaults
         temporal = snn.get("temporal_mamba", {})
         if not isinstance(temporal, dict):
@@ -169,15 +201,32 @@ def run(config_path: Path) -> None:
         from snn_nnunet import cli
 
         snn = config["snn"]
+        architecture_args = []
+        if snn.get("training_patch_size") is not None:
+            architecture_args.extend(["--training-patch-size", *map(str, snn["training_patch_size"])])
+        architecture_args.extend(["--silif", json.dumps(snn["spatial_mamba"]["silif"])])
+        for key in ("stem_depth", "stem_channels", "downsample_kernel_size", "dwconv2d_kernel_size",
+                    "final_skip_fusion", "decoder_block", "neuron_model"):
+            architecture_args.extend(["--" + key.replace("_", "-"), str(snn["spatial_mamba"][key])])
+        for key in ("encoder_channels", "vss_depths", "downsample_strides"):
+            architecture_args.extend(["--" + key.replace("_", "-"),
+                                      *map(str, snn["spatial_mamba"][key])])
+        for key in ("hierarchical_encoder", "full_resolution_skip", "stem_spiking", "downsampling_spiking",
+                    "resdecoder_spiking1", "resdecoder_spiking2", "fue_skip1", "fue_skip2"):
+            architecture_args.append(("--" if snn["spatial_mamba"][key] else "--no-") + key.replace("_", "-"))
         cli.main([
             "train", "--dataset-id", str(dataset_id), "--fold", str(fold),
             "--run-dir", str(run_dir), "--gpus", str(gpus),
             "--model", snn["variant"],
             "--temporal-axis", str(snn["temporal_axis"]),
             "--k", str(snn["k"]),
+            "--epochs", str(snn["epochs"]),
+            "--lr", str(snn["lr"]),
+            "--validation-every", str(snn["validation_every"]),
+            "--validation-patch-size", *map(str, snn["validation_patch_size"]),
             "--fptt" if snn["use_fptt"] else "--no-fptt",
-            "--vss-output-spiking" if snn["vss_output_spiking"]
-            else "--no-vss-output-spiking",
+            "--output-spiking" if snn["output_spiking"]
+            else "--no-output-spiking",
             "--temporal-mamba" if snn["temporal_mamba"]["enabled"] else "--no-temporal-mamba",
             "--temporal-mamba-kernel-size", str(snn["temporal_mamba"]["kernel_size"]),
             "--temporal-mamba-d-state", str(snn["temporal_mamba"]["d_state"]),
@@ -194,20 +243,22 @@ def run(config_path: Path) -> None:
             else "--no-spatial-dwconv2d-spiking",
             "--spatial-output-spiking" if snn["spatial_mamba"]["output_spiking"]
             else "--no-spatial-output-spiking",
+            *architecture_args,
         ])
     else:
         from nnunetv2.run.run_training import run_training
         from nnunetv2.utilities.file_path_utilities import get_output_folder
-        from snn_nnunet.empty_dice_evaluation import finalize_fold_summary
+        from snn_nnunet.empty_dice_evaluation import finalize_fold_summary, native_empty_dice_evaluation
 
-        run_training(
-            dataset_name_or_id=str(dataset_id),
-            configuration=configuration,
-            fold=fold,
-            trainer_class_name="nnUNetTrainer",
-            plans_identifier="nnUNetPlans",
-            num_gpus=gpus,
-        )
+        with native_empty_dice_evaluation():
+            run_training(
+                dataset_name_or_id=str(dataset_id),
+                configuration=configuration,
+                fold=fold,
+                trainer_class_name="nnUNetTrainer",
+                plans_identifier="nnUNetPlans",
+                num_gpus=gpus,
+            )
         model_folder = Path(get_output_folder(
             dataset_id, "nnUNetTrainer", "nnUNetPlans", configuration
         ))

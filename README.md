@@ -59,6 +59,290 @@ switching model family. `unet2d` and `unet3d` call nnU-Net's standard
 `nnUNetTrainer` with configuration `2d` and `3d_fullres`, respectively. `snn`
 calls this repository's existing training CLI with `3d_fullres`.
 
+Set `snn.epochs: 100` in the launcher YAML for a 100-epoch SNN experiment.
+The value must be a positive integer and controls both the training limit
+and the native polynomial learning-rate schedule. It is saved as
+`snn_config.num_epochs` in plans and checkpoint initialization arguments.
+The CLI equivalent is `--epochs 100`; omitting the flag preserves the
+value in plans. Old configs/plans without an epoch count use 300.
+The legacy experiment YAML keeps its existing top-level `epochs` key.
+
+Set `snn.lr: 0.001` to choose the SNN initial learning rate. The value must
+be positive and finite; it controls both SGD and the polynomial scheduler.
+The CLI equivalent is `--lr 0.001`. It is saved as
+`snn_config.initial_lr` in plans, run configuration, and checkpoint init
+arguments. Old YAML files/plans without the field retain `0.01`; omitting
+`--lr` on the CLI preserves the saved plans value. Use a new run directory
+when changing the initial LR. Editing the launcher YAML does not change an
+already running job or a saved continuation schedule.
+
+
+Set `snn.training_patch_size: [162, 128, 128]` to use the same spatial patch
+size for training and online patch validation. The launcher sets
+`configurations.3d_fullres.patch_size` in the effective plans and saves it
+in run metadata and checkpoint initialization arguments. The CLI equivalent
+is `--training-patch-size 162 128 128`; omitting the setting preserves the
+existing plans. Preprocessed data are reused. The current fold-0 YAML uses
+this patch, with batch size from the plans and the existing `k` unchanged;
+a final shorter temporal chunk is supported. Existing runs keep their saved
+geometry and reject incompatible overrides. This spatial patch size is
+separate from the internal 2D patch-embedding factor.
+
+Set `snn.validation_every: 50` to evaluate the selected fold on complete
+validation volumes at completed epochs 50, 100, 150, etc., using the exact
+current weights and the existing BraTS component filtering and closing.
+`snn.validation_patch_size: [162, 128, 128]` uses the full temporal extent
+of Dataset001 on axis 0, with padding for shorter cases. The current fold-0
+YAML enables these settings. The pipeline uses FP32, Gaussian blending,
+50% overlap and mirroring on the non-temporal axes. Training mode and RNG
+states are restored afterward. This path supports single-GPU training.
+
+Each boundary saves `fold_0/checkpoint_epoch_0050.pth`, etc., and
+`fold_0/validation_periodic/epoch_0050/summary.json`, masks and metrics.
+`validation_periodic/dice_history.csv` records WT/TC/ET and mean Dice before
+and after postprocessing. `checkpoint_best_postprocessed.pth` retains the
+best postprocessed mean among evaluated boundaries. Plans and checkpoint
+initialization arguments preserve the interval and validation patch size;
+old plans default to interval 0 (disabled) and a 128-cubed validation patch.
+The resume command inherits the saved interval unless `--validation-every`
+overrides it, including `0` to disable periodic validation. Existing running
+jobs require a restart to pick up these changes.
+
+To extend a saved SNN run beyond its original epoch limit, use the saved
+checkpoint and plans directly (the YAML launcher only starts fresh runs):
+
+~~~bash
+.venv/bin/python -m snn_nnunet.resume_training \
+  --run-dir /path/to/existing/run --epochs 300 --check-only
+~~~
+
+`--check-only` verifies restoration on CPU using temporary output files.
+Omit it to train on one GPU. `--epochs` is the total, including completed
+epochs. Weights, optimizer momentum, epoch counter and history are restored;
+`--lr-mode global` uses the native polynomial schedule with the new total
+and the saved global epoch (also the default for runs without a saved
+continuation schedule). Extending 100 completed epochs to 300 therefore starts at human
+epoch 101 with LR `0.0069425316` (initial LR `0.01`), while the first 100
+epochs retain their original schedule. Final/latest and periodic checkpoints are compared
+by epoch, so an old final checkpoint cannot hide newer interrupted progress.
+Before changing run metadata or results, the command copies the original
+model folder and experiment configs into `run_dir/resume_backups/`.
+Shared preprocessed plans are not changed. Rerunning after the target epoch
+has been reached retries validation without further training.
+
+Use `--lr-mode continuous` to stretch the remaining polynomial decay from
+the current LR, avoiding a new increase when extending the horizon. Its
+origin and LR are saved in checkpoints and restored on subsequent resumes.
+`--validation-every 100` evaluates the exact current weights on the complete
+validation split at completed epochs 100, 200, etc., including the starting
+boundary when needed. It uses the existing FP32 128-cubed sliding-window
+inference and BraTS postprocessing, retaining empty-empty Dice = 1.
+Training mode and Python/NumPy/PyTorch RNG states are restored afterward.
+
+Inside `fold_0`, outputs are `checkpoint_epoch_0100.pth`, etc., and
+`validation_periodic/epoch_0100/summary.json`, `metrics.csv`, raw and
+postprocessed predictions. `validation_periodic/dice_history.csv` collects
+WT/TC/ET and mean Dice at each boundary. The highest postprocessed mean
+among these boundaries is saved as `checkpoint_best_postprocessed.pth`.
+Interrupted validation is retried from its boundary checkpoint; completed
+reports are reused. Native full-volume validation also runs after training.
+Custom validation after a fresh or resumed training run uses
+`checkpoint_final.pth`, including runs stopped at 100, 200, or 300 epochs;
+it does not require `checkpoint_best.pth`. Periodic validation uses the exact
+current weights saved in each `checkpoint_epoch_*.pth`, so an older final
+checkpoint cannot affect intermediate results.
+
+For `SNNMamba_k128_v2_analog_gelu`, the prepared H100 job requests **5 days**,
+targets **600 total epochs**, uses a continuous LR extension and performs
+full-volume validation with postprocessing every **100 epochs**:
+
+~~~bash
+sbatch resume_snn_brats24_fold0.sbatch
+~~~
+
+Full-volume validation uses the same Dice convention before and after
+postprocessing: two empty masks score **1**, while empty ground truth with
+false-positive predictions scores **0**. Empty predictions against nonempty
+ground truth also score **0**. Cases with absent regions remain in the mean.
+The SNN native validator applies this convention before saving `summary.json`
+or logging the full-volume Dice. The stock U-Net launcher applies it for
+single-GPU validation; stock multi-GPU workers retain nnU-Net's native logging
+until the launcher finalizes their summary. Custom validation and saved-volume
+postprocessing print the convention and the absolute Dice gain
+(`postprocessed - raw`) for WT, TC, ET, and their mean. The convention is recorded
+in summaries as `dice_convention`; training loss and online patch pseudo-Dice
+are unchanged.
+
+For `snn.variant: orig`, choose `snn.spatial_mamba.decoder_block: standard`
+(the default) or `resdecoder`. This replaces only the first two skip-fusion
+blocks; the upsampling blocks, their refinement convolutions, and the final
+full-resolution fusion keep their existing structure. The same option is
+available as `--decoder-block standard|resdecoder` on the training CLI, or
+as top-level `decoder_block` in the legacy experiment YAML.
+
+ResDecoder applies `Conv3x3 -> GN -> spike -> Conv3x3`, adds the
+`Conv1x1(input)` projection, then applies `GN -> spike -> dropout`. Its two
+spiking neurons have independent temporal state and follow `snn.output_spiking`
+(legacy YAML: `output_spiking`); setting it to false replaces both
+with GELU activations while retaining the GN layers. The per-layer switches
+`snn.spatial_mamba.resdecoder_spiking1` and `resdecoder_spiking2` (both true
+by default) separately disable the neuron after the first convolution/GN
+and the neuron after the residual sum/GN. The global `output_spiking: false`
+always disables both and all other decoder output neurons. These flags
+are also available as `--[no-]resdecoder-spiking1` and
+`--[no-]resdecoder-spiking2`; the master switch is `--[no-]output-spiking`.
+Old `vss_output_spiking` config/checkpoint keys and CLI spellings remain
+accepted aliases; newly saved configurations use `output_spiking`.
+Dropout remains 0.1 in
+the existing three positions per stage: after upsampling, after the
+pre-fusion refinement, and after fusion. Select a fresh `run_dir` when
+changing decoder type; the choice is saved in the experiment and plans
+for checkpoint reconstruction. Existing plans without this key use
+the standard decoder.
+
+All disabled spiking activation sites use `nn.GELU()` instead of an
+identity or a skipped activation. This applies to the stem, hierarchical
+downsampling, spatial Mamba input/depthwise/output activations, encoder
+output, decoder (including each ResDecoder activation), enabled FUE skip
+branches, and Temporal Mamba normalization/depthwise activations. The
+existing independent switches and their legacy aliases select the neuron
+when true and GELU when false. A disabled Temporal Mamba or FUE branch is
+still absent; it is not replaced by GELU. Prediction heads keep raw logits
+without GELU, and disabled linear projections remain identities.
+
+GELU has no trainable parameters, so state-dict parameter names and shapes
+remain compatible. However, loading a checkpoint trained before this change
+with disabled spiking sites now applies GELU at those sites and changes its
+predictions. Train a fresh run for this architecture; reproduce old results
+with the code version used to train the old checkpoint. This includes an
+omitted spiking option whose default is false.
+
+The generic switch names are `stem_spiking`, `downsampling_spiking`,
+`resdecoder_spiking1`, and `resdecoder_spiking2`, for either neuron model.
+Old `stem_plif`, `downsampling_plif`, `resdecoder_plif1`, and
+`resdecoder_plif2` names remain accepted aliases in configs, plans and CLI
+flags. Newly saved configurations use the generic names. Specify only one
+name for each switch; supplying both aliases is rejected. The rename
+preserves the configured values and checkpoint weight names.
+
+Set `snn.spatial_mamba.neuron_model: silif` to use real-valued SiLIF neurons
+instead of the default `plif`, for `variant: orig`. Existing switches
+(`stem_spiking`, `downsampling_spiking`, `patch_embedding_spiking`,
+`dwconv2d_spiking`, `output_spiking`, the ResDecoder/FUE switches, and the
+temporal neuron switches) still control whether each neuron is active.
+Selecting SiLIF alone does not enable any disabled position. For example:
+
+~~~yaml
+snn:
+  spatial_mamba:
+    neuron_model: silif
+    dwconv2d_spiking: true
+~~~
+
+This enables SiLIF after the spatial depthwise convolutions; other
+positions follow their configured switches. The CLI flag is
+`--neuron-model silif`; legacy experiment YAML uses top-level
+`neuron_model`. The choice is saved in plans/checkpoint config and changing
+it requires a fresh run. Old configs/checkpoints default to PLIF.
+
+SiLIF follows Algorithm 1 of [Fabre et al.](https://arxiv.org/abs/2506.06374):
+five trainable parameters per channel, log-parameterized membrane and
+adaptation rates and timestep, and feedback coefficients bounded to
+`a in [0,1]` and `b in [0,2]`. Defaults follow the authors' initialization:
+rate ranges `[10,250]` and `[2.5,10]`, with initial timestep `0.004`.
+`init_tau` remains a PLIF-only setting. This implementation adapts the
+neuron to sequential MRI inference: states start at zero, parameters are
+shared across spatial positions, and the existing ATan surrogate is used.
+The membrane reset path detaches the previous spike as in the project's
+PLIF integration; the adaptation feedback remains differentiable.
+All three states are detached at TBPTT boundaries and reset at a new volume
+or tile (`time_step=0`). Runtime states are omitted from checkpoints.
+
+SiLIF tuning is available in the launcher YAML under
+`snn.spatial_mamba.silif`. Omitted entries retain the defaults:
+
+~~~yaml
+snn:
+  spatial_mamba:
+    neuron_model: silif
+    silif:
+      v_threshold: 1.0
+      dt_init: 0.004
+      rate_u_range: [10.0, 250.0]
+      rate_w_range: [2.5, 10.0]
+      a_range: [0.0, 1.0]
+      b_range: [0.0, 2.0]
+      surrogate_alpha: 2.0
+      detach_reset: true
+~~~
+
+Both rate ranges are sampled uniformly in log space; `a_range` and `b_range`
+are sampled uniformly in linear space. Equal endpoints initialize a constant.
+Rates, timestep, and feedback coefficients are learned after initialization;
+the recurrence still clamps `a` to `[0,1]` and `b` to `[0,2]`. Threshold,
+surrogate slope, and reset detachment remain fixed. The membrane reset subtracts
+one previous spike regardless of the threshold. Invalid ranges and unknown
+keys fail before training. The same settings apply to all enabled SiLIF sites,
+including optional temporal, ResDecoder, and FUE neurons. PLIF ignores them.
+
+When `neuron_model: silif`, construction prints a `SiLIF configuration`
+block with every setting and the number of active neuron modules to stdout,
+including the SLURM `.out`. These are initialization settings, not measurements
+of learned parameters. Values are saved in plans/checkpoint metadata and used
+when rebuilding validation/inference models; old SiLIF runs use the original
+defaults. Start a fresh run when changing them. The direct CLI equivalent is
+`--silif '{"v_threshold": 0.8, "rate_u_range": [15, 375]}'`.
+
+For small-lesion experiments, change one factor per run: compare threshold
+`1.0` versus `0.8`, membrane initialization `[10,250]` versus `[15,375]`
+at fixed timestep, or weaker feedback ranges `[0,0.5]` and `[0,1]`.
+Compare raw lesion detection/recall and false positives before postprocessing;
+the custom validation's default component filters remove ET components below
+161 voxels and TC components below 166 voxels. A small-lesion improvement may
+therefore be lost after filtering. These are experimental starting points,
+not demonstrated improvements or a guarantee of matching a 3D U-Net.
+
+Set `snn.spatial_mamba.dwconv2d_kernel_size` to a positive odd integer
+(default `3`, for example `5` or `7`) to choose the spatial depthwise
+kernel inside every SpikMamba block, including additional VSS blocks.
+Its stride stays 1 and padding is half the kernel size, preserving feature
+map resolution. `downsample_kernel_size` controls the separate encoder
+downsampling convolution. The CLI flag is `--dwconv2d-kernel-size`; legacy
+experiment YAML uses top-level `dwconv2d_kernel_size`. This option applies
+to `variant: orig` and is saved in plans/checkpoint config for evaluation.
+Older configs/checkpoints default to 3. Start a fresh run when changing
+kernel size because the convolution weight shapes change.
+
+Set `snn.spatial_mamba.downsample_strides` to three positive integers,
+ordered from encoder stage 1 to 3 (default `[2, 2, 2]`). For example,
+`[1, 2, 2]` maps a 256-pixel side to `256 -> 256 -> 128 -> 64`, while
+`[2, 2, 2]` gives `256 -> 128 -> 64 -> 32`. Each stride applies to both
+spatial axes. The decoder uses the reversed strides, and input padding
+uses their product, so skip connections also match for odd input sizes.
+A stride-1 stage retains its convolution and channel projection. Higher
+resolution increases activation/state memory and spatial scan work.
+The CLI option is `--downsample-strides 1 2 2`; legacy experiment YAML uses
+top-level `downsample_strides`. Custom strides require `variant: orig`
+and `hierarchical_encoder: true`. The list is saved in plans/checkpoint
+config; old configs/checkpoints default to `[2, 2, 2]`. Start a fresh run
+when changing strides. The legacy encoder retains its `patch_size` stride.
+
+Optional FUE skip branches are controlled independently by
+`snn.spatial_mamba.fue_skip1` and `fue_skip2` (both false by default).
+They apply SegMamba's `p = sigmoid(mean_channels(x))`, `u = -p*log(p)`,
+`FUE(x) = x*(2-u)` to the final VSS's normalized, pre-PLIF features in
+encoder stages 1 and 2. Each enabled skip has its own PLIF followed by
+0.1 dropout; the original encoder path continues through its existing
+PLIF and dropout. `snn.output_spiking: false` disables the new skip
+PLIFs and uses GELU while keeping FUE active. Skip 1 feeds `concat2_conv`; skip 2 feeds
+`concat1_conv`. Both decoder types support FUE, for `variant: orig`.
+The final full-resolution stem skip keeps its existing structure.
+CLI flags are `--[no-]fue-skip1` and `--[no-]fue-skip2`; legacy YAML uses
+the same names at top level. Flags are saved in plans/checkpoint config;
+changing them requires a fresh run. Old checkpoints default to FUE off.
+PyTorch dropout remains after PLIF and rescales surviving spikes during
+training; dropout is inactive during evaluation.
+
 On the cluster, submit the generic GPU launcher. It requests one H100 by
 default; the command-line partition overrides that default when an A100 is
 preferred:
@@ -139,7 +423,7 @@ Each fold uses native nnU-Net distributed training, while `full-cv` runs the fol
 
 ## Validate and predict
 
-After each fold finishes training through `train` or `full-cv`, the CLI automatically runs the custom full-volume validation using `checkpoint_best.pth`. It uses a `96×96×96` inference patch, 50% tile overlap, probability threshold `0.5`, and the BraTS postprocessing configured in `custom_full_validation.py`. Results are written to `fold_<n>/validation_96patch_postprocessed` under the run's nnU-Net results folder.
+After each fold finishes training through `train` or `full-cv`, the CLI automatically runs the custom full-volume validation using `checkpoint_final.pth`. It uses a `128×128×128` inference patch in FP32, 50% tile overlap, probability threshold `0.5`, and the BraTS postprocessing configured in `custom_full_validation.py`. Results are written to `fold_<n>/validation_128patch_postprocessed` under the run's nnU-Net results folder. Direct invocation of `snn_nnunet.custom_full_validation` also defaults to `checkpoint_final.pth`; pass `--checkpoint-name checkpoint_best.pth` to select best explicitly.
 
 You can also run nnU-Net's native full-volume validation manually; it uses the final checkpoint by default, while `--best` selects `checkpoint_best.pth`:
 
@@ -194,7 +478,7 @@ Postprocessed results appear in `/path/to/predictions_5fold_selected_postprocess
 
 The adapter accepts native `[B, 4, X, Y, Z]` patches and returns `[B, 3, X, Y, Z]` region logits. `--temporal-axis` chooses X, Y, or Z in **preprocessed nnU-Net coordinates**, which need not match original NIfTI orientation. Slices are traversed in order. Neuron state continues across windows within one patch and resets for the next independent patch or inference tile. Native augmentation and inference mirroring exclude the temporal axis: axes 0, 1, and 2 allow `(1, 2)`, `(0, 2)`, and `(0, 1)` respectively.
 
-The trainer uses native region Dice/BCE loss. For each `k`-slice window, it takes one optimizer update and detaches neuron state: truncated backpropagation through time (TBPTT). FPTT adds its regularizer and updates auxiliary running parameters once per window; `--no-fptt` retains TBPTT without FPTT operations. A temporal length of 128 at `k=16` gives 8 updates per minibatch. At 250 minibatches per epoch this is **2,000 optimizer updates per epoch across 32,000 temporal positions per batch element** (128 × 250), or 600,000 updates over the configured 300 epochs. Batch size 4 therefore processes 128,000 individual slice instances per epoch. These are job-level update counts, not multiplied by GPU count; they describe the schedule, not measured production throughput.
+The trainer uses native region Dice/BCE loss. For each `k`-slice window, it takes one optimizer update and detaches neuron state: truncated backpropagation through time (TBPTT). FPTT adds its regularizer and updates auxiliary running parameters once per window; `--no-fptt` retains TBPTT without FPTT operations. A temporal length of 128 at `k=16` gives 8 updates per minibatch. At 250 minibatches per epoch this is **2,000 optimizer updates per epoch across 32,000 temporal positions per batch element** (128 × 250), or 200,000 updates over 100 epochs (600,000 over the default 300 epochs). Batch size 4 therefore processes 128,000 individual slice instances per epoch. These are job-level update counts, not multiplied by GPU count; they describe the schedule, not measured production throughput.
 
 ## Troubleshooting
 
@@ -207,3 +491,18 @@ The trainer uses native region Dice/BCE loss. For each `k`-slice window, it take
 ## Legacy workflow
 
 The earlier 2D slice-cache experiment remains available through `data/preprocess_brats24.py`, `experiments_snn_fptt.yaml`, and `snn_fptt.py`. It uses separate preprocessing and Accelerate commands.
+
+## SNN source layout
+
+The model implementation and its supporting modules live in `snn_nnunet/`:
+`model.py`, `spikmamba.py`, `spike_neurons.py`, `spike_neuron.py`,
+`spike_activations.py`, `surrogate.py`, and `accelerating.py`.
+Use package-qualified imports, for example
+`from snn_nnunet.model import build_model`.
+Training entry points remain `python -m snn_nnunet.run_model` and
+`python -m snn_nnunet.cli`.
+
+SNN inference keeps the model forward pass, Gaussian blending weights, and
+sliding-window accumulation in FP32, including native full-volume validation.
+AMP is disabled inside inference, and non-finite logits raise an error before
+thresholding. No reduced-precision or quantized model conversion is applied.

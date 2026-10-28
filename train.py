@@ -13,7 +13,7 @@ from torch.utils.data import Dataset
 
 from torchmetrics.classification import Dice
 
-from model import SNN
+from snn_nnunet.model import SNN
 from data import HippoDataset
 
 

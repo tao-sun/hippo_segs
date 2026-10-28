@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 from datetime import datetime
 from typing import Sequence
+from snn_nnunet.config_aliases import SPIKING_OPTION_ALIASES
 
 
 TRAINER = "nnUNetTrainerSNNFPTT"
@@ -24,6 +26,20 @@ def _positive_int(value: str) -> int:
     number = int(value)
     if number < 1:
         raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
+def _nonnegative_int(value: str) -> int:
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be a nonnegative integer")
+    return number
+
+
+def _positive_float(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise argparse.ArgumentTypeError("must be a positive finite number")
     return number
 
 
@@ -67,6 +83,14 @@ def _add_training_config(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model", choices=("orig", "shallow", "medium", "deep"), default="orig")
     parser.add_argument("--temporal-axis", type=int, choices=(0, 1, 2), default=0)
     parser.add_argument("--k", type=_positive_int, default=16)
+    parser.add_argument("--epochs", type=_positive_int, help="total SNN training epochs; defaults to saved plans")
+    parser.add_argument("--lr", type=_positive_float, help="initial learning rate; defaults to saved plans or 0.01")
+    parser.add_argument("--training-patch-size", nargs=3, type=_positive_int,
+                        help="training patch in preprocessed axis order; defaults to saved plans")
+    parser.add_argument("--validation-every", type=_nonnegative_int,
+                        help="full-fold validation with postprocessing every N completed epochs; 0 disables")
+    parser.add_argument("--validation-patch-size", nargs=3, type=_positive_int,
+                        help="spatial patch for periodic validation in preprocessed axis order")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--fptt", dest="use_fptt", action="store_true", default=True)
     mode.add_argument("--no-fptt", dest="use_fptt", action="store_false")
@@ -102,10 +126,31 @@ def _add_training_config(parser: argparse.ArgumentParser) -> None:
         group.add_argument(f"--{flag}", dest=destination, action="store_true")
         group.add_argument(f"--no-{flag}", dest=destination, action="store_false")
         parser.set_defaults(**{destination: None})
+    for key in ("stem_depth", "stem_channels", "downsample_kernel_size", "dwconv2d_kernel_size"):
+        parser.add_argument("--" + key.replace("_", "-"), dest=key, type=_positive_int)
+    for key in ("encoder_channels", "vss_depths", "downsample_strides"):
+        parser.add_argument("--" + key.replace("_", "-"), dest=key, type=_positive_int, nargs=3)
+    parser.add_argument("--final-skip-fusion", choices=("concat",))
+    parser.add_argument("--decoder-block", choices=("standard", "resdecoder"))
+    parser.add_argument("--neuron-model", choices=("plif", "silif"))
+    parser.add_argument("--silif", type=json.loads, help="SiLIF options as a JSON mapping; stored in plans")
+    for key in ("hierarchical_encoder", "full_resolution_skip", "stem_spiking", "downsampling_spiking",
+                "resdecoder_spiking1", "resdecoder_spiking2", "fue_skip1", "fue_skip2"):
+        flag = key.replace("_", "-")
+        legacy_flags = [legacy.replace("_", "-")
+                        for legacy, canonical in SPIKING_OPTION_ALIASES.items() if canonical == key]
+        group = parser.add_mutually_exclusive_group()
+        group.add_argument("--" + flag, *("--" + alias for alias in legacy_flags),
+                           dest=key, action="store_true")
+        group.add_argument("--no-" + flag, *("--no-" + alias for alias in legacy_flags),
+                           dest=key, action="store_false")
+        parser.set_defaults(**{key: None})
     final_plif = parser.add_mutually_exclusive_group()
-    final_plif.add_argument("--vss-output-spiking", dest="vss_output_spiking", action="store_true")
-    final_plif.add_argument("--no-vss-output-spiking", dest="vss_output_spiking", action="store_false")
-    parser.set_defaults(vss_output_spiking=None)
+    final_plif.add_argument("--output-spiking", "--vss-output-spiking",
+                            dest="output_spiking", action="store_true")
+    final_plif.add_argument("--no-output-spiking", "--no-vss-output-spiking",
+                            dest="output_spiking", action="store_false")
+    parser.set_defaults(output_spiking=None)
 
 
 def _add_native_training_flags(parser: argparse.ArgumentParser) -> None:
@@ -265,6 +310,16 @@ def _requested_config(args: argparse.Namespace, plans_path: Path) -> dict:
         config = SNNConfig.from_plans(json.load(stream)).to_dict()
     config.update(model_name=args.model, temporal_axis=args.temporal_axis,
                   k=args.k, use_fptt=args.use_fptt)
+    epochs = getattr(args, "epochs", None)
+    if epochs is not None:
+        config["num_epochs"] = epochs
+    learning_rate = getattr(args, "lr", None)
+    if learning_rate is not None:
+        config["initial_lr"] = learning_rate
+    for key in ("validation_every", "validation_patch_size"):
+        value = getattr(args, key, None)
+        if value is not None:
+            config[key] = value
     temporal_names = {
         "enabled": "temporal_mamba_enabled",
         "kernel_size": "temporal_mamba_kernel_size",
@@ -293,7 +348,7 @@ def _requested_config(args: argparse.Namespace, plans_path: Path) -> dict:
             if value is not None:
                 temporal[key] = value
         config["model_kwargs"]["temporal_mamba"] = temporal
-    final_spiking = getattr(args, "vss_output_spiking", None)
+    final_spiking = getattr(args, "output_spiking", None)
     if final_spiking is not None:
         output_key = next(
             key for key in ("output_spiking", "vss_output_spiking")
@@ -309,6 +364,12 @@ def _requested_config(args: argparse.Namespace, plans_path: Path) -> dict:
         value = getattr(args, argument, None)
         if value is not None:
             config["model_kwargs"][name] = value
+    from snn_nnunet.model import ARCHITECTURE_DEFAULTS, architecture_options
+    for key in ARCHITECTURE_DEFAULTS:
+        value = getattr(args, key, None)
+        if value is not None:
+            config["model_kwargs"][key] = value
+    architecture_options(config["model_kwargs"])
     return config
 
 
@@ -326,7 +387,10 @@ def _persist_training_config(args: argparse.Namespace) -> None:
     if args.continue_training:
         _restore_run_plans(args)
     plans_path = _plans_path(args.dataset_id)
-    update_snn_config(plans_path, _requested_config(args, plans_path), _results_folder(args.dataset_id))
+    update_snn_config(
+        plans_path, _requested_config(args, plans_path), _results_folder(args.dataset_id),
+        training_patch_size=getattr(args, "training_patch_size", None),
+    )
 
 
 def _save_run_config(args: argparse.Namespace) -> None:
@@ -382,14 +446,14 @@ def _run_training(args: argparse.Namespace, fold: int, *, validation: bool) -> N
 
 
 def _run_custom_full_validation(args: argparse.Namespace, fold: int) -> None:
-    """Run the custom 96-cubed validation after a fold finishes training."""
+    """Run the custom FP32 128-cubed validation after a fold finishes training."""
 
     from snn_nnunet.custom_full_validation import main as run_custom_validation
 
     output_dir = (
         _results_folder(args.dataset_id)
         / f"fold_{fold}"
-        / "validation_96patch_postprocessed"
+        / "validation_128patch_postprocessed"
     )
     run_custom_validation([
         "--dataset-id", str(args.dataset_id),
@@ -399,7 +463,7 @@ def _run_custom_full_validation(args: argparse.Namespace, fold: int) -> None:
         "--configuration", CONFIGURATION,
         "--trainer", TRAINER,
         "--plans", PLANS,
-        "--checkpoint-name", "checkpoint_best.pth",
+        "--checkpoint-name", "checkpoint_final.pth",
     ])
 
 
@@ -460,7 +524,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.select_best:
             _select_best(args.dataset_id)
     elif args.command == "predict":
-        from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
+        from snn_nnunet.inference import FP32nnUNetPredictor as nnUNetPredictor
 
         predictor = nnUNetPredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True)
         predictor.initialize_from_trained_model_folder(

@@ -6,8 +6,11 @@ from contextlib import contextmanager
 from copy import deepcopy
 import json
 from pathlib import Path
+from time import perf_counter
 
 import numpy as np
+
+from snn_nnunet.empty_dice_evaluation import DICE_CONVENTION
 
 from postprocessing import morphological_closing_3d, remove_small_components_3d
 
@@ -33,8 +36,8 @@ def build_parser():
     parser.add_argument("--configuration", default="3d_fullres")
     parser.add_argument("--trainer", default="nnUNetTrainer")
     parser.add_argument("--plans", default="nnUNetPlans")
-    parser.add_argument("--checkpoint-name", default="checkpoint_best.pth")
-    parser.add_argument("--patch-size", nargs=3, type=int, default=(96, 96, 96))
+    parser.add_argument("--checkpoint-name", default="checkpoint_final.pth")
+    parser.add_argument("--patch-size", nargs=3, type=int, default=(128, 128, 128))
     parser.add_argument("--tile-step-size", type=float, default=0.5)
     parser.add_argument("--prob-threshold", type=float, default=0.5)
     parser.add_argument(
@@ -105,7 +108,19 @@ def summarize_cases(cases):
         key: means["postprocessed"][key] - means["raw"][key]
         for key in (*REGION_ORDER, "mean")
     }
-    return {"cases": cases, "mean": means, "delta": delta}
+    return {"cases": cases, "mean": means, "delta": delta, "dice_convention": dict(DICE_CONVENTION)}
+
+
+def print_dice_summary(summary):
+    """Report a directly comparable raw/PP pair and its absolute Dice gain."""
+    print("Dice convention (raw and postprocessed): empty-empty=1; empty GT with false positives=0", flush=True)
+    print(
+        f"Mean Dice (raw): {summary['mean']['raw']['mean']:.6f}; "
+        f"postprocessed: {summary['mean']['postprocessed']['mean']:.6f}",
+        flush=True,
+    )
+    gains = " ".join(f"{region}={summary['delta'][region]:+.6f}" for region in REGION_ORDER)
+    print(f"Dice gain from postprocessing: {gains} mean={summary['delta']['mean']:+.6f}", flush=True)
 
 
 def postprocess_regions(regions, min_component_sizes_et_tc_wt, closing_radius):
@@ -157,7 +172,7 @@ def run_fold_validation(
     trainer,
     *,
     output_dir,
-    patch_size=(96, 96, 96),
+    patch_size=(128, 128, 128),
     tile_step_size=0.5,
     prob_threshold=0.5,
     min_component_sizes=(161, 166, 50),
@@ -169,9 +184,9 @@ def run_fold_validation(
     import torch
 
     if predictor_class is None:
-        from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
+        from snn_nnunet.inference import FP32nnUNetPredictor
 
-        predictor_class = nnUNetPredictor
+        predictor_class = FP32nnUNetPredictor
     if export_prediction is None:
         from nnunetv2.inference.export_prediction import export_prediction_from_logits
 
@@ -221,10 +236,11 @@ def run_fold_validation(
     with temporary_patch_size(trainer.configuration_manager, patch_size):
         print(
             f"Inference patch: {tuple(patch_size)}; tile step: {tile_step_size}; "
-            "Gaussian blending: on; mirroring: on",
+            "precision: FP32; Gaussian blending: on; mirroring: on",
             flush=True,
         )
         for index, case_id in enumerate(dataset_val.identifiers, start=1):
+            case_started = perf_counter()
             print(f"[{index}/{len(dataset_val.identifiers)}] {case_id}", flush=True)
             data, seg, seg_prev, properties = dataset_val.load_case(case_id)
             data = np.asarray(data)
@@ -258,6 +274,8 @@ def run_fold_validation(
                 raise ValueError(
                     f"Expected 3 region logits [WT, TC, ET] for {case_id}; got {tuple(logits.shape)}"
                 )
+            if not torch.isfinite(logits).all():
+                raise FloatingPointError(f"Non-finite logits for {case_id}")
             probabilities = torch.sigmoid(logits).numpy()
             raw_prediction = threshold_probabilities(probabilities, prob_threshold)
             raw_prediction = _canonicalize_regions(raw_prediction, trainer.label_manager)
@@ -293,9 +311,23 @@ def run_fold_validation(
             np.savez_compressed(
                 pp_regions_folder / f"{case_id}.npz", regions=processed_prediction
             )
+            metric_lines = []
+            for stage, metrics in (("raw", raw_metrics), ("postprocessed", pp_metrics)):
+                scores = " ".join(
+                    f"{region}={metrics[region]['dice']:.4f}" for region in REGION_ORDER
+                )
+                mean_dice = sum(metrics[region]["dice"] for region in REGION_ORDER) / len(REGION_ORDER)
+                metric_lines.append(f"  Dice {stage}: {scores} mean={mean_dice:.4f}")
+            elapsed = perf_counter() - case_started
+            print(
+                f"[{index}/{len(dataset_val.identifiers)}] {case_id} completed in {elapsed:.1f}s\n"
+                + "\n".join(metric_lines),
+                flush=True,
+            )
 
     summary = summarize_cases(case_results)
     summary["settings"] = {
+        "precision": "float32",
         "patch_size": [int(value) for value in patch_size],
         "tile_step_size": float(tile_step_size),
         "gaussian_blending": True,
@@ -322,34 +354,59 @@ def run_fold_validation(
                             metrics["gt_voxels"], metrics["pred_voxels"],
                         )
                     )
-    print(
-        f"Mean Dice (raw): {summary['mean']['raw']['mean']:.6f}; "
-        f"postprocessed: {summary['mean']['postprocessed']['mean']:.6f}",
-        flush=True,
-    )
+    print_dice_summary(summary)
     return summary
 
 
 def main(argv=None):
+    import os
     import torch
-    from nnunetv2.run.run_training import get_trainer_from_args
 
     args = build_parser().parse_args(argv)
+    args.results_root = args.results_root.resolve()
     if not args.results_root.is_dir():
         raise FileNotFoundError(f"Results root does not exist: {args.results_root}")
+
+    # Rebuild the model from this run's metadata. The shared preprocessed plans
+    # may have been replaced by a later experiment with a different architecture.
+    model_name = f"{args.trainer}__{args.plans}__{args.configuration}"
+    model_dirs = sorted(
+        folder for folder in args.results_root.glob(f"Dataset{args.dataset_id:03d}_*/{model_name}")
+        if folder.is_dir()
+    )
+    if len(model_dirs) != 1:
+        raise RuntimeError(
+            f"Expected one saved model for dataset {args.dataset_id} and {model_name} "
+            f"under {args.results_root}; found {len(model_dirs)}: {model_dirs}"
+        )
+    model_dir = model_dirs[0]
+    checkpoint = model_dir / f"fold_{args.fold}" / args.checkpoint_name
+    for required_file in (model_dir / "plans.json", model_dir / "dataset.json", checkpoint):
+        if not required_file.is_file():
+            raise FileNotFoundError(f"Required saved model file not found: {required_file}")
+    with (model_dir / "plans.json").open(encoding="utf-8") as stream:
+        plans = json.load(stream)
+    with (model_dir / "dataset.json").open(encoding="utf-8") as stream:
+        dataset_json = json.load(stream)
+    if plans["dataset_name"] != model_dir.parent.name or plans["plans_name"] != args.plans:
+        raise ValueError(f"Saved plans do not match the selected model directory: {model_dir}")
+    plans["continue_training"] = True
+
+    # Set the result root before importing nnU-Net so trainer paths and logs
+    # belong to the selected run, even when the shell points to another run.
+    os.environ["nnUNet_results"] = str(args.results_root)
+    from nnunetv2.utilities.find_objects import recursive_find_trainer_class_by_name
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    trainer = get_trainer_from_args(
-        str(args.dataset_id),
-        args.configuration,
-        args.fold,
-        args.trainer,
-        args.plans,
-        continue_training=True,
+    trainer_class = recursive_find_trainer_class_by_name(args.trainer)
+    print(f"Loading saved plans: {model_dir / 'plans.json'}", flush=True)
+    trainer = trainer_class(
+        plans=plans,
+        configuration=args.configuration,
+        fold=args.fold,
+        dataset_json=dataset_json,
         device=device,
     )
-    checkpoint = Path(trainer.output_folder) / args.checkpoint_name
-    if not checkpoint.is_file():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
     print(f"Loading checkpoint: {checkpoint}", flush=True)
     trainer.load_checkpoint(str(checkpoint))
     print(f"Validation output: {args.output_dir}", flush=True)

@@ -8,8 +8,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import surrogate
-from spike_neurons import PLIFNode
+from snn_nnunet import surrogate
+from snn_nnunet.spike_neurons import SPIKING_NODE_TYPES, make_spiking_node
 
 try:
     from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
@@ -32,11 +32,14 @@ def _positive_int(name: str, value: int) -> int:
     return value
 
 
-def _make_plif(init_tau: float, device=None, dtype=None) -> PLIFNode:
-    node = PLIFNode(
+def _make_neuron(init_tau, channels, channel_dim, neuron_model="plif", device=None, dtype=None, silif=None):
+    node = make_spiking_node(
+        neuron_model,
+        channels=channels,
+        channel_dim=channel_dim,
         init_tau=init_tau,
         surrogate_function=surrogate.ATan(),
-        detach_reset=True,
+        detach_reset=True, silif=silif,
     )
     if device is not None or dtype is not None:
         node = node.to(device=device, dtype=dtype)
@@ -55,11 +58,16 @@ class Spiking2DPatchEmbedding(nn.Module):
         max_time_steps: int = 256,
         device=None,
         dtype=None,
+        kernel_size=None,
     ) -> None:
         super().__init__()
         self.in_channels = _positive_int("in_channels", in_channels)
         self.embed_dim = _positive_int("embed_dim", embed_dim)
         self.patch_size = _positive_int("patch_size", patch_size)
+        self.overlapping = kernel_size is not None
+        kernel = self.patch_size if kernel_size is None else _positive_int("kernel_size", kernel_size)
+        if self.overlapping and kernel % 2 == 0:
+            raise ValueError("kernel_size must be odd for overlapping downsampling")
         self.max_time_steps = _positive_int(
             "max_time_steps", max_time_steps
         )
@@ -67,15 +75,16 @@ class Spiking2DPatchEmbedding(nn.Module):
             raise ValueError("image_size must be a (height, width) tuple")
         height = _positive_int("image_size[0]", image_size[0])
         width = _positive_int("image_size[1]", image_size[1])
-        if height % self.patch_size or width % self.patch_size:
+        if not self.overlapping and (height % self.patch_size or width % self.patch_size):
             raise ValueError("image_size must be divisible by patch_size")
 
         kwargs = {"device": device, "dtype": dtype}
         self.proj = nn.Conv2d(
             self.in_channels,
             self.embed_dim,
-            self.patch_size,
+            kernel,
             stride=self.patch_size,
+            padding=kernel // 2 if self.overlapping else 0,
             bias=True,
             **kwargs,
         )
@@ -91,7 +100,7 @@ class Spiking2DPatchEmbedding(nn.Module):
                 f"expected {self.in_channels} channels, got {x.shape[1]}"
             )
         height, width = x.shape[-2:]
-        if height % self.patch_size or width % self.patch_size:
+        if not self.overlapping and (height % self.patch_size or width % self.patch_size):
             raise ValueError("input size must be divisible by patch_size")
         if (
             isinstance(time_step, bool)
@@ -128,6 +137,9 @@ class SpikeMambaLayer(nn.Module):
         patch_embedding_spiking: bool = False,
         dwconv2d_spiking: bool = True,
         spatial_output_spiking: bool = False,
+        dwconv2d_kernel_size: int = 3,
+        neuron_model: str = "plif",
+        silif=None,
     ) -> None:
         super().__init__()
         self.dim = _positive_int("dim", dim)
@@ -146,6 +158,12 @@ class SpikeMambaLayer(nn.Module):
         self.patch_embedding_spiking = patch_embedding_spiking
         self.dwconv2d_spiking = dwconv2d_spiking
         self.spatial_output_spiking = spatial_output_spiking
+        if neuron_model not in ("plif", "silif"):
+            raise ValueError("neuron_model must be 'plif' or 'silif'")
+        self.neuron_model = neuron_model
+        self.dwconv2d_kernel_size = _positive_int("dwconv2d_kernel_size", dwconv2d_kernel_size)
+        if self.dwconv2d_kernel_size % 2 == 0:
+            raise ValueError("dwconv2d_kernel_size must be odd")
         self.num_directions = 4
         self.d_inner = self.expand * self.dim if linear_projection else self.dim
         self.dt_rank = (
@@ -173,28 +191,28 @@ class SpikeMambaLayer(nn.Module):
         else:
             self.linear_m = nn.Identity()
         self.patch_sl = (
-            _make_plif(init_tau, device=device, dtype=dtype)
+            _make_neuron(init_tau, self.d_inner, -1, neuron_model, device=device, dtype=dtype, silif=silif)
             if self.patch_embedding_spiking
-            else None
+            else nn.GELU()
         )
         self.dwconv2d = nn.Conv2d(
             self.d_inner,
             self.d_inner,
-            kernel_size=3,
+            kernel_size=self.dwconv2d_kernel_size,
             groups=self.d_inner,
-            padding=1,
+            padding=self.dwconv2d_kernel_size // 2,
             bias=conv_bias,
             **kwargs,
         )
         self.dwconv2d_sl = (
-            _make_plif(init_tau, device=device, dtype=dtype)
+            _make_neuron(init_tau, self.d_inner, 1, neuron_model, device=device, dtype=dtype, silif=silif)
             if self.dwconv2d_spiking
-            else None
+            else nn.GELU()
         )
         self.ss2d_output_plif = (
-            _make_plif(init_tau, device=device, dtype=dtype)
+            _make_neuron(init_tau, self.d_inner, -1, neuron_model, device=device, dtype=dtype, silif=silif)
             if self.spatial_output_spiking
-            else None
+            else nn.GELU()
         )
         x_proj_layers = [
             nn.Linear(
@@ -321,6 +339,8 @@ class SpikeMambaLayer(nn.Module):
                 sequence = p_global.reshape(sequence_batch, steps, *p_global.shape[1:])
                 values = [self.patch_sl(sequence[:, t], time_step + t)[0] for t in range(steps)]
                 p_global = torch.stack(values, dim=1).reshape_as(p_global)
+        else:
+            p_global = self.patch_sl(p_global)
 
         spatial_features = (
             p_global.transpose(1, 2)
@@ -343,6 +363,8 @@ class SpikeMambaLayer(nn.Module):
                     for t in range(steps)
                 ]
                 spatial_features = torch.stack(values, dim=1).reshape_as(spatial_features)
+        else:
+            spatial_features = self.dwconv2d_sl(spatial_features)
         p_global = (
             spatial_features.flatten(2)
             .transpose(1, 2)
@@ -445,7 +467,7 @@ class SpikeMambaLayer(nn.Module):
         y = 0.25 * (
             row_forward + row_backward + col_forward + col_backward
         )
-        if self.ss2d_output_plif is not None:
+        if isinstance(self.ss2d_output_plif, SPIKING_NODE_TYPES):
             if sequence_shape is None:
                 y, _ = self.ss2d_output_plif(y, time_step)
             else:
@@ -456,6 +478,8 @@ class SpikeMambaLayer(nn.Module):
                     for t in range(steps)
                 ]
                 y = torch.stack(values, dim=1).reshape_as(y)
+        else:
+            y = self.ss2d_output_plif(y)
         if return_inner:
             return y
         if self.linear_projection:
@@ -485,6 +509,8 @@ class TemporalSpikMamba(nn.Module):
         norm_spiking: bool = True,
         dwconv1D_spiking: bool = True,
         plif_enabled: Optional[bool] = None,
+        neuron_model: str = "plif",
+        silif=None,
     ) -> None:
         super().__init__()
         self.dim = _positive_int("dim", dim)
@@ -513,12 +539,12 @@ class TemporalSpikMamba(nn.Module):
             raise NotImplementedError(f"unsupported dt_init={dt_init!r}")
 
         self.norm = nn.GroupNorm(1, self.dim)
-        self.norm_plif = _make_plif(init_tau) if self.norm_spiking else None
+        self.norm_plif = _make_neuron(init_tau, self.dim, -1, neuron_model, silif=silif) if self.norm_spiking else nn.GELU()
         self.dwconv1d = nn.Conv1d(
             self.dim, self.dim, self.kernel_size, groups=self.dim,
             padding=0, bias=True,
         )
-        self.conv_plif = _make_plif(init_tau) if self.dwconv1D_spiking else None
+        self.conv_plif = _make_neuron(init_tau, self.dim, -1, neuron_model, silif=silif) if self.dwconv1D_spiking else nn.GELU()
         self.x_proj = nn.Linear(self.dim, self.dt_rank + 2 * self.d_state, bias=False)
         self.dt_proj_weight = nn.Parameter(torch.empty(self.dim, self.dt_rank))
         std = self.dt_rank ** -0.5 * dt_scale
@@ -539,7 +565,7 @@ class TemporalSpikMamba(nn.Module):
         self.selective_scan = selective_scan if selective_scan is not None else selective_scan_fn
 
     @staticmethod
-    def _step_plif(node: PLIFNode, x: torch.Tensor, time_step: int) -> torch.Tensor:
+    def _step_plif(node: nn.Module, x: torch.Tensor, time_step: int) -> torch.Tensor:
         """Advance membrane state one temporal slice at a time."""
         outputs = []
         for t in range(x.shape[1]):
@@ -567,8 +593,10 @@ class TemporalSpikMamba(nn.Module):
         temporal = self.norm(temporal.transpose(1, 2).contiguous())
         # [B*N,C,T] -> [B*N,T,C]; PLIF advances once for each T position.
         temporal = temporal.transpose(1, 2).contiguous()
-        if self.norm_plif is not None:
+        if self.norm_spiking:
             temporal = self._step_plif(self.norm_plif, temporal, time_step)
+        else:
+            temporal = self.norm_plif(temporal)
         # [B*N,C,T] receives asymmetric end padding so any kernel size preserves T.
         conv_input = temporal.transpose(1, 2).contiguous()
         pad_left = (self.kernel_size - 1) // 2
@@ -578,8 +606,10 @@ class TemporalSpikMamba(nn.Module):
         if self.debug_shapes:
             print(f"after temporal DWConv1D [B*N,C,T]: {tuple(temporal_conv.shape)}")
         temporal = temporal_conv.transpose(1, 2).contiguous()
-        if self.conv_plif is not None:
+        if self.dwconv1D_spiking:
             temporal = self._step_plif(self.conv_plif, temporal, time_step)
+        else:
+            temporal = self.conv_plif(temporal)
         if temporal.shape[1] != steps:
             raise RuntimeError("temporal depthwise convolution changed sequence length")
 
@@ -661,6 +691,8 @@ class SpikMambaBlock(nn.Module):
                 debug_shapes=temporal_config.get("debug_shapes", False),
                 norm_spiking=norm_spiking,
                 dwconv1D_spiking=dwconv1D_spiking,
+                neuron_model=mamba_kwargs.get("neuron_model", "plif"),
+                silif=mamba_kwargs.get("silif"),
             )
         else:
             self.temporal_mamba = None

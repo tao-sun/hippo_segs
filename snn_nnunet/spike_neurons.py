@@ -8,12 +8,13 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 
 
-from accelerating import soft_voltage_transform, hard_voltage_transform
-from spike_neuron import act_fun_adp
-from spike_activations import get_activation
+from snn_nnunet.accelerating import soft_voltage_transform, hard_voltage_transform
+from snn_nnunet.spike_neuron import act_fun_adp
+from snn_nnunet.spike_activations import get_activation
 
-import accelerating
-import surrogate
+from snn_nnunet import accelerating
+from snn_nnunet import surrogate
+from snn_nnunet.silif_config import silif_options
 
 
 def get_neuro(type, **kwargs):
@@ -444,3 +445,129 @@ class PLIFNode(BaseNode):
 
     def extra_repr(self):
         return f'v_threshold={self.v_threshold}, v_reset={self.v_reset}, tau={self.tau()}'
+
+
+class SiLIFNode(torch.nn.Module):
+    """Real-valued SiLIF dynamics from Fabre et al., arXiv:2506.06374, Alg. 1.
+
+    Five parameters per feature channel are shared across spatial positions.
+    The membrane and adaptation states evolve once per slice, with the reset
+    applied on the next step. Initial rates and timestep follow the authors'
+    reference implementation. This adapter uses zero initial states and the
+    project's ATan surrogate for deterministic volume inference.
+    """
+
+    is_spiking_layer = True
+
+    def __init__(self, channels, channel_dim=1, v_threshold=1.0,
+                 dt_init=0.004, surrogate_function=None, detach_reset=True,
+                 rate_u_range=(10.0, 250.0), rate_w_range=(2.5, 10.0),
+                 a_range=(0.0, 1.0), b_range=(0.0, 2.0)):
+        super().__init__()
+        options = silif_options(dict(v_threshold=v_threshold, dt_init=dt_init,
+                                     detach_reset=detach_reset, rate_u_range=rate_u_range,
+                                     rate_w_range=rate_w_range, a_range=a_range, b_range=b_range))
+        if type(channels) is not int or channels <= 0:
+            raise ValueError("channels must be a positive integer")
+        if type(channel_dim) is not int or channel_dim == 0:
+            raise ValueError("channel_dim must be a non-batch integer axis")
+        for name, value in (("v_threshold", v_threshold), ("dt_init", dt_init)):
+            if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be positive and finite")
+        if type(detach_reset) is not bool:
+            raise ValueError("detach_reset must be a boolean")
+        self.channels = channels
+        self.channel_dim = channel_dim
+        self.v_threshold = float(v_threshold)
+        self.detach_reset = detach_reset
+        self.surrogate_function = surrogate_function if surrogate_function is not None else surrogate.ATan()
+        self.log_rate_u = torch.nn.Parameter(torch.empty(channels).uniform_(
+            *map(math.log, options["rate_u_range"])))
+        self.log_rate_w = torch.nn.Parameter(torch.empty(channels).uniform_(
+            *map(math.log, options["rate_w_range"])))
+        self.log_dt = torch.nn.Parameter(torch.full((channels,), math.log(dt_init)))
+        self.a = torch.nn.Parameter(torch.empty(channels).uniform_(*options["a_range"]))
+        self.b = torch.nn.Parameter(torch.empty(channels).uniform_(*options["b_range"]))
+        # Runtime state belongs to one volume/tile, not to the checkpoint.
+        self.register_buffer("v", None, persistent=False)
+        self.register_buffer("s", None, persistent=False)
+        self.register_buffer("adaptation", None, persistent=False)
+
+    def reset(self):
+        self.v = self.s = self.adaptation = None
+
+    def detach(self):
+        for name in ("v", "s", "adaptation"):
+            value = getattr(self, name)
+            if value is not None:
+                setattr(self, name, value.detach())
+
+    def init_neuro_states(self, x):
+        self.v = torch.zeros_like(x)
+        self.s = torch.zeros_like(x)
+        self.adaptation = torch.zeros_like(x)
+
+    def get_neuro_states(self, x, time_step):
+        if time_step == 0 or self.v is None:
+            self.init_neuro_states(x)
+        return self.s, self.v
+
+    def forward(self, x, time_step):
+        if type(time_step) is not int or time_step < 0:
+            raise ValueError("time_step must be a nonnegative integer")
+        if not x.is_floating_point() or x.ndim < 2:
+            raise ValueError("SiLIF input must be a floating-point tensor with batch and channel axes")
+        if not -x.ndim <= self.channel_dim < x.ndim:
+            raise ValueError("channel_dim is outside the input dimensions")
+        axis = self.channel_dim % x.ndim
+        if axis == 0 or x.shape[axis] != self.channels:
+            raise ValueError(f"expected {self.channels} features on channel_dim={self.channel_dim}")
+        if time_step == 0 or self.v is None:
+            self.init_neuro_states(x)
+        elif self.v.shape != x.shape or self.v.device != x.device or self.v.dtype != x.dtype:
+            raise ValueError("SiLIF state shape/device/dtype changed; reset with time_step=0 for a new sequence")
+        shape = [1] * x.ndim
+        shape[axis] = self.channels
+
+        # exp(log_rate + log_dt) is rate * dt. Cap only at the numerical
+        # overflow boundary; large rates still give the limiting decay 0.
+        limit = math.log(torch.finfo(self.log_dt.dtype).max) - 2
+        rate_u_dt = (self.log_rate_u + self.log_dt).clamp(max=limit).exp()
+        rate_w_dt = (self.log_rate_w + self.log_dt).clamp(max=limit).exp()
+        alpha = (-rate_u_dt).exp().to(x.dtype).view(shape)
+        beta = (-rate_w_dt).exp().to(x.dtype).view(shape)
+        input_gain = -torch.expm1(-rate_u_dt).to(x.dtype).view(shape)
+        a = self.a.clamp(0, 1).to(x.dtype).view(shape)
+        b = self.b.clamp(0, 2).to(x.dtype).view(shape)
+        reset_spike = self.s.detach() if self.detach_reset else self.s
+        self.adaptation = beta * self.adaptation + a * self.v + b * self.s
+        self.v = alpha * (self.v - reset_spike) + input_gain * (x - self.adaptation)
+        self.s = self.surrogate_function(self.v - self.v_threshold)
+        return self.s, self.v
+
+    def extra_repr(self):
+        return f"channels={self.channels}, channel_dim={self.channel_dim}, v_threshold={self.v_threshold}"
+
+
+SPIKING_NODE_TYPES = (PLIFNode, SiLIFNode)
+
+
+def make_spiking_node(neuron_model="plif", *, channels=None, channel_dim=1,
+                      init_tau=2.0, surrogate_function=None, detach_reset=True, silif=None):
+    """Construct an enabled neuron; callers retain their existing on/off flags."""
+    function = surrogate_function if surrogate_function is not None else surrogate.ATan()
+    if neuron_model == "plif":
+        return PLIFNode(init_tau=init_tau, surrogate_function=function, detach_reset=detach_reset)
+    if neuron_model == "silif":
+        options = silif_options({} if silif is None else silif)
+        surrogate_alpha = options.pop("surrogate_alpha")
+        # Explicit SiLIF settings override callers' historical PLIF defaults.
+        options["surrogate_function"] = (
+            surrogate.ATan(alpha=surrogate_alpha)
+            if silif is not None else function
+        )
+        if silif is None:
+            options["detach_reset"] = detach_reset
+        return SiLIFNode(channels=channels, channel_dim=channel_dim,
+                         **options)
+    raise ValueError("neuron_model must be 'plif' or 'silif'")

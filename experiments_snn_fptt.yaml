@@ -7,12 +7,30 @@ val_fold: 1
 view: sagittal
 model: orig
 # model architecture
+neuron_model: plif  # plif or silif; existing spiking switches select active positions
+hierarchical_encoder: true  # false reconstructs original Arch 2 / old checkpoints
+stem_depth: 1
+stem_spiking: true  # spiking neuron in each stem ConvBlock
+downsampling_spiking: true  # spiking neuron after downsampling Conv2D + GroupNorm
+stem_channels: 32
+encoder_channels: [64, 128, 256]
+downsample_kernel_size: 3
+downsample_strides: [2, 2, 2]  # per-stage strides; [1, 2, 2] preserves full resolution in stage 1
+dwconv2d_kernel_size: 3  # spatial depthwise inside every Mamba block; positive odd (3, 5, 7, ...)
+vss_depths: [1, 1, 2]
+full_resolution_skip: true
+final_skip_fusion: concat
+decoder_block: standard  # standard or resdecoder; neurons follow output_spiking
+resdecoder_spiking1: true  # after the first Conv3x3 + GN
+resdecoder_spiking2: true  # after the residual sum + GN
+fue_skip1: false  # encoder stage 1 -> decoder concat2_conv
+fue_skip2: false  # encoder stage 2 -> decoder concat1_conv
 patch_size: 2
 linear_projection: true
 residual_connections: true
 dwconv2d_spiking: true
 patch_embedding_spiking: true
-vss_output_spiking: true  # final PLIF after every VSS encoder block
+output_spiking: true  # output neurons in VSS and every decoder stage
 temporal_mamba:
   enabled: false
   kernel_size: 3
@@ -39,7 +57,7 @@ loader_workers: 2          # one GPU; applies to both train and validation loade
 loader_prefetch_factor: 1  # subjects are large, so keep RAM usage bounded
 batch_size_subjects: 8
 lr: 0.001
-epochs: 250
+epochs: 100
 weight_decay: 0.00001
 grad_clip: 0.3
 use_fptt: true  # false = plain TBPTT; FPTT hyperparameters are ignored

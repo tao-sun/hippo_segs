@@ -9,7 +9,7 @@ from typing import Sequence
 
 from snn_nnunet.empty_dice_evaluation import (
     finalize_summary,
-    metric_writer_empty_as_one,
+    native_empty_dice_evaluation,
     write_voxel_counts_csv,
 )
 
@@ -37,26 +37,21 @@ def run(
     dataset_json: Path,
     num_processes: int,
 ) -> None:
-    from nnunetv2.evaluation.evaluate_predictions import (
-        compute_metrics_on_folder as native_metric_writer,
-    )
     from nnunetv2.postprocessing import remove_connected_components
 
     summary_path = predictions / "summary.json"
     raw_summary = finalize_summary(summary_path)
     _print_voxel_totals(raw_summary, "Raw")
 
-    remove_connected_components.compute_metrics_on_folder = metric_writer_empty_as_one(
-        native_metric_writer
-    )
-    remove_connected_components.determine_postprocessing(
-        str(predictions),
-        str(references),
-        str(plans_json),
-        str(dataset_json),
-        num_processes=num_processes,
-        keep_postprocessed_files=True,
-    )
+    with native_empty_dice_evaluation():
+        remove_connected_components.determine_postprocessing(
+            str(predictions),
+            str(references),
+            str(plans_json),
+            str(dataset_json),
+            num_processes=num_processes,
+            keep_postprocessed_files=True,
+        )
 
     postprocessed_summary_path = predictions / "postprocessed" / "summary.json"
     with postprocessed_summary_path.open(encoding="utf-8") as stream:

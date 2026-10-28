@@ -12,7 +12,7 @@
 
 Usage
 -----
-python ensemble_eval_snn.py \
+python dnn_2D_baseline/dnn_evaluation.py \
   --data-root data/BRATS2017_preprocessed/Brats17TrainingData \
   --folds 1 2 3 4 5 \
   --ckpt-sag checkpoints/checkpoint_snn_fold{fold}_sagittal.pt \
@@ -31,7 +31,6 @@ from tqdm import tqdm
 import torch
 from torch.utils.data import DataLoader
 
-from model import SNNBraTS
 from dnn_3ch import UNetLike2D
 
 # Use the exact per-subject dataset & stacking used by evaluate_3d_snn(). :contentReference[oaicite:2]{index=2}

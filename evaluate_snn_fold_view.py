@@ -173,6 +173,7 @@ def read_model_spec(payload: Mapping[str, Any]) -> Tuple[Mapping[str, Any], Dict
     if missing:
         raise ValueError(f"Checkpoint config is missing: {', '.join(missing)}")
 
+    from snn_nnunet.model import output_spiking_option
     kwargs = {
         "model_name": model_config["model"],
         "out_channels": 3,
@@ -181,13 +182,20 @@ def read_model_spec(payload: Mapping[str, Any]) -> Tuple[Mapping[str, Any], Dict
         "residual_connections": model_config["residual_connections"],
         "dwconv2d_spiking": model_config["dwconv2d_spiking"],
         "patch_embedding_spiking": model_config["patch_embedding_spiking"],
-        "vss_output_spiking": model_config.get("vss_output_spiking", True),
+        "output_spiking": output_spiking_option(model_config),
         "input_skip": model_config.get("input_skip", False),
         "temporal_mamba": model_config.get(
             "temporal_mamba",
             {"enabled": False, "kernel_size": 3, "d_state": 16, "dt_rank": "auto", "debug_shapes": False},
         ),
     }
+    from snn_nnunet.model import architecture_options
+    options = architecture_options(model_config)
+    # Older checkpoints contain the original model, before a stem existed.
+    if "hierarchical_encoder" not in model_config:
+        options["hierarchical_encoder"] = any(
+            key.startswith("stem.") for key in payload["model"])
+    kwargs.update(options)
     return payload["model"], kwargs
 
 

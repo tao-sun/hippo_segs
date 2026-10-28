@@ -255,7 +255,7 @@ def _run_native_validation(
     import torch
     from batchgenerators.utilities.file_and_folder_operations import maybe_mkdir_p
     from nnunetv2.inference.export_prediction import export_prediction_from_logits
-    from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
+    from snn_nnunet.inference import FP32nnUNetPredictor as nnUNetPredictor
     from nnunetv2.postprocessing.remove_connected_components import determine_postprocessing
     from nnunetv2.run.run_training import get_trainer_from_args
 
@@ -370,10 +370,13 @@ def _run_native_validation(
         del logits, data
 
     print("Selecting nnU-Net postprocessing rules on all validation predictions.", flush=True)
-    pp_fns, pp_fn_kwargs = determine_postprocessing(
-        str(prediction_folder), str(reference_folder), trainer.plans_manager.plans,
-        trainer.dataset_json, num_processes=2, keep_postprocessed_files=True,
-    )
+    from snn_nnunet.empty_dice_evaluation import native_empty_dice_evaluation
+
+    with native_empty_dice_evaluation():
+        pp_fns, pp_fn_kwargs = determine_postprocessing(
+            str(prediction_folder), str(reference_folder), trainer.plans_manager.plans,
+            trainer.dataset_json, num_processes=2, keep_postprocessed_files=True,
+        )
     selected_rules = [
         (fn.__name__, kwargs) for fn, kwargs in zip(pp_fns, pp_fn_kwargs)
     ]

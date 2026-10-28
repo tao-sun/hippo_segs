@@ -31,7 +31,7 @@ from tqdm import tqdm
 import torch
 from torch.utils.data import DataLoader
 
-from model import SNNBraTS
+from snn_nnunet.model import SNNBraTS
 # Use the exact per-subject dataset & stacking used by evaluate_3d_snn(). :contentReference[oaicite:2]{index=2}
 from snn_fptt import BratsVolumeDataset, stack_back   # :contentReference[oaicite:3]{index=3}
 
@@ -50,12 +50,18 @@ def get_device(arg: str) -> torch.device:
     return torch.device("cpu")
 
 
-def load_model(ckpt: Path, device: torch.device) -> SNNBraTS:
-    m = SNNBraTS(out_channels=3).to(device)
-    sd = torch.load(str(ckpt), map_location=device)
-    # Your checkpoints from snn_fptt.py save {"model": state_dict, ...}. :contentReference[oaicite:4]{index=4}
-    if isinstance(sd, dict) and "model" in sd and isinstance(sd["model"], dict):
-        sd = sd["model"]
+def load_model(ckpt: Path, device: torch.device) -> torch.nn.Module:
+    payload = torch.load(str(ckpt), map_location=device, weights_only=False)
+    if isinstance(payload, dict) and "model" in payload and "config" in payload:
+        from evaluate_snn_fold_view import read_model_spec
+        from snn_fptt import build_model
+
+        sd, kwargs = read_model_spec(payload)
+        m = build_model(**kwargs).to(device)
+    else:
+        # Preserve the original default-model loader for bare state dicts.
+        m = SNNBraTS(out_channels=3).to(device)
+        sd = payload["model"] if isinstance(payload, dict) and "model" in payload else payload
     m.load_state_dict(sd, strict=True)
     m.eval()
     return m

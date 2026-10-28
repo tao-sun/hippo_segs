@@ -9,7 +9,8 @@ from typing import Any, Mapping
 import torch
 from torch import Tensor, nn
 
-from model import ConvBlock, build_model
+from snn_nnunet.model import ConvBlock, build_model, ARCHITECTURE_DEFAULTS, architecture_options
+from snn_nnunet.config_aliases import normalize_spiking_options
 
 
 _MODEL_KWARGS = (
@@ -33,6 +34,10 @@ _FIELDS = (
     "fptt_lambda",
     "num_input_channels",
     "num_output_channels",
+    "num_epochs",
+    "initial_lr",
+    "validation_every",
+    "validation_patch_size",
 )
 
 
@@ -101,6 +106,10 @@ class SNNConfig:
     fptt_lambda: float
     num_input_channels: int
     num_output_channels: int
+    num_epochs: int = 300
+    initial_lr: float = 0.01
+    validation_every: int = 0
+    validation_patch_size: tuple[int, int, int] = (128, 128, 128)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "model_kwargs", MappingProxyType(dict(self.model_kwargs)))
@@ -112,6 +121,11 @@ class SNNConfig:
         data = plans["snn_config"]
         if not isinstance(data, Mapping):
             raise ValueError("snn_config must be a mapping")
+        data = dict(data)
+        data.setdefault("num_epochs", 300)
+        data.setdefault("initial_lr", 0.01)
+        data.setdefault("validation_every", 0)
+        data.setdefault("validation_patch_size", (128, 128, 128))
         _require_keys(data, _FIELDS, "snn_config")
 
         if data["model_name"] not in {"orig", "shallow", "medium", "deep"}:
@@ -119,10 +133,11 @@ class SNNConfig:
         kwargs = data["model_kwargs"]
         if not isinstance(kwargs, Mapping):
             raise ValueError("model_kwargs must be a mapping")
+        kwargs = normalize_spiking_options(kwargs)
         output_keys = tuple(name for name in _OUTPUT_SPIKING_KEYS if name in kwargs)
-        output_key = output_keys[0] if len(output_keys) == 1 else "vss_output_spiking"
+        output_key = output_keys[0] if len(output_keys) == 1 else "output_spiking"
         required_kwargs = set(_MODEL_KWARGS + (output_key,))
-        allowed_kwargs = required_kwargs | {"temporal_mamba", "spatial_output_spiking"}
+        allowed_kwargs = required_kwargs | {"temporal_mamba", "spatial_output_spiking"} | ARCHITECTURE_DEFAULTS.keys()
         missing = required_kwargs - kwargs.keys()
         extra = kwargs.keys() - allowed_kwargs
         if missing or extra:
@@ -135,19 +150,27 @@ class SNNConfig:
         if len(output_keys) != 1:
             raise ValueError("model_kwargs must contain exactly one output_spiking or vss_output_spiking")
         kwargs = dict(kwargs)
-        if output_key == "output_spiking":
-            # Normalize legacy plans to the public VSS-specific schema key.
-            kwargs["vss_output_spiking"] = kwargs.pop("output_spiking")
+        validated_architecture = architecture_options(kwargs)
+        for key in ARCHITECTURE_DEFAULTS:
+            if key in kwargs:
+                kwargs[key] = validated_architecture[key]
+        if kwargs.get("decoder_block", "standard") != "standard" and data["model_name"] != "orig":
+            raise ValueError("decoder_block=resdecoder is supported only for model_name=orig")
+        if output_key == "vss_output_spiking":
+            # Normalize old plans to the general output switch.
+            kwargs["output_spiking"] = kwargs.pop("vss_output_spiking")
         if "spatial_output_spiking" in kwargs and type(kwargs["spatial_output_spiking"]) is not bool:
             raise ValueError("spatial_output_spiking must be a boolean")
         if "temporal_mamba" in kwargs:
             kwargs["temporal_mamba"] = _validate_temporal_mamba(kwargs["temporal_mamba"])
             if kwargs["temporal_mamba"]["enabled"] and data["model_name"] != "orig":
                 raise ValueError("temporal_mamba.enabled=true is supported only for model_name=orig")
+        if any(kwargs.get(key, False) for key in ("fue_skip1", "fue_skip2")) and data["model_name"] != "orig":
+            raise ValueError("FUE skips are supported only for model_name=orig")
         patch_size = kwargs["patch_size"]
         if type(patch_size) is not int or patch_size <= 0:
             raise ValueError("patch_size must be a positive integer")
-        for name in _MODEL_KWARGS[1:] + ("vss_output_spiking",):
+        for name in _MODEL_KWARGS[1:] + ("output_spiking",):
             if type(kwargs[name]) is not bool:
                 raise ValueError(f"{name} must be a boolean")
         if kwargs["input_skip"] and data["model_name"] != "orig":
@@ -159,6 +182,19 @@ class SNNConfig:
         k = data["k"]
         if type(k) is not int or k <= 0:
             raise ValueError("k must be a positive integer")
+        if type(data["num_epochs"]) is not int or data["num_epochs"] <= 0:
+            raise ValueError("num_epochs must be a positive integer")
+        if type(data["validation_every"]) is not int or data["validation_every"] < 0:
+            raise ValueError("validation_every must be a nonnegative integer")
+        patch = data["validation_patch_size"]
+        if (not isinstance(patch, (list, tuple)) or len(patch) != 3
+                or any(type(value) is not int or value <= 0 for value in patch)):
+            raise ValueError("validation_patch_size must contain three positive integers")
+        data["validation_patch_size"] = tuple(patch)
+        learning_rate = data["initial_lr"]
+        if type(learning_rate) not in (int, float) or not math.isfinite(learning_rate) or learning_rate <= 0:
+            raise ValueError("initial_lr must be a positive finite number")
+        data["initial_lr"] = float(learning_rate)
         if type(data["use_fptt"]) is not bool:
             raise ValueError("use_fptt must be a boolean")
         for name in ("fptt_alpha", "fptt_beta", "fptt_rho", "fptt_lambda"):
@@ -188,11 +224,18 @@ class SNNConfig:
             "fptt_lambda": self.fptt_lambda,
             "num_input_channels": self.num_input_channels,
             "num_output_channels": self.num_output_channels,
+            "num_epochs": self.num_epochs,
+            "initial_lr": self.initial_lr,
+            "validation_every": self.validation_every,
+            "validation_patch_size": list(self.validation_patch_size),
         }
 
 
 def build_core(config: SNNConfig) -> nn.Module:
     kwargs = dict(config.model_kwargs)
+    # Plans written before the hierarchical encoder existed describe the
+    # original patch-embedding encoder; preserve that checkpoint architecture.
+    kwargs.setdefault("hierarchical_encoder", False)
     kwargs.setdefault("temporal_mamba", dict(_TEMPORAL_MAMBA_DEFAULTS))
     kwargs.setdefault("spatial_output_spiking", False)
     output_key = next(name for name in _OUTPUT_SPIKING_KEYS if name in kwargs)
@@ -266,7 +309,10 @@ class SNNnnUNetAdapter(nn.Module):
 
     def forward_window(self, window: Tensor, *, t0: int) -> Tensor:
         self._check_input(window)
-        logits = self.core(to_core_layout(window, self.temporal_axis), t0=t0)
+        # Native predictors may enable AMP around the adapter. Keep the core
+        # in FP32 even when called from such an outer autocast context.
+        with torch.autocast(window.device.type, enabled=False):
+            logits = self.core(to_core_layout(window.float(), self.temporal_axis), t0=t0)
         if logits.ndim != 5 or logits.shape[1] != self.config.num_output_channels:
             raise ValueError(f"expected {self.config.num_output_channels} output channels")
         return from_core_layout(logits, self.temporal_axis)

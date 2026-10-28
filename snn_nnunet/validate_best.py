@@ -11,7 +11,10 @@ def validate_best_checkpoint(trainer: Any, checkpoint: Path) -> None:
     if not checkpoint.is_file():
         raise FileNotFoundError(f"Best checkpoint not found: {checkpoint}")
     trainer.load_checkpoint(str(checkpoint))
-    trainer.perform_actual_validation(save_probabilities=False)
+    from snn_nnunet.empty_dice_evaluation import native_empty_dice_evaluation
+
+    with native_empty_dice_evaluation():
+        trainer.perform_actual_validation(save_probabilities=False)
 
 
 def build_parser() -> argparse.ArgumentParser:

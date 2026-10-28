@@ -21,6 +21,12 @@ USAGE
 # Edit this path to process another run or fold.
 VALIDATION_DIR="/gpfs/scratch1/shared/apiaghiardelli/SNNMamba_k128_temporal_analog/Dataset001_BraTS24GLI/nnUNetTrainerSNNFPTT__SNNPlans__3d_fullres/fold_0/validation"
 
+# Minimum connected-component sizes in voxels (ET, TC, WT).
+MIN_COMPONENT_ET=300
+MIN_COMPONENT_TC=300
+MIN_COMPONENT_WT=50
+CLOSING_RADIUS=1
+
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     usage
     exit 0
@@ -95,7 +101,8 @@ printf 'Raw Dice summary: %s/summary.json\n' "$VALIDATION_DIR"
 POSTPROCESSED_DIR="$VALIDATION_DIR/postprocessed_custom"
 printf 'Custom postprocessed outputs: %s/\n' "$POSTPROCESSED_DIR"
 printf 'Log files: %s and %s\n' "$LOG_OUT" "$LOG_ERR"
-printf 'Component thresholds ET/TC/WT: 161/166/50; closing radius: 1\n'
+printf 'Component thresholds ET/TC/WT: %s/%s/%s; closing radius: %s\n' \
+    "$MIN_COMPONENT_ET" "$MIN_COMPONENT_TC" "$MIN_COMPONENT_WT" "$CLOSING_RADIUS"
 printf 'Running custom postprocessing; inference is not run.\n\n'
 
 cd "$REPO_DIR"
@@ -105,5 +112,5 @@ uv run --python 3.10 python -m snn_nnunet.postprocess_saved_volumes \
     --output-dir "$POSTPROCESSED_DIR" \
     --plans-json "$PLANS_JSON" \
     --dataset-json "$DATASET_JSON" \
-    --min-component-sizes 161 166 50 \
-    --closing-radius 1
+    --min-component-sizes "$MIN_COMPONENT_ET" "$MIN_COMPONENT_TC" "$MIN_COMPONENT_WT" \
+    --closing-radius "$CLOSING_RADIUS"

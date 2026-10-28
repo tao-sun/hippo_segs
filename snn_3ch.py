@@ -17,7 +17,7 @@ from torch.utils.data import Dataset, DataLoader, ConcatDataset
 
 # ==== use your spiking UNet-like model ====
 # SNNBraTS: forward(x_win[B,k,4,H,W], t0) -> (B, out_channels, k, H, W)
-from model import SNNBraTS  # mirrors your SNN implementation with PLIF nodes
+from snn_nnunet.model import SNNBraTS  # mirrors your SNN implementation with PLIF nodes
 
 # -----------------------------
 # Constants & helpers
