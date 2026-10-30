@@ -7,7 +7,6 @@ import json
 import math
 import os
 from pathlib import Path
-import shutil
 from typing import Any
 
 import yaml
@@ -36,12 +35,21 @@ def _config(path: Path) -> dict[str, Any]:
     _integer(config, "dataset_id", 0, 999)
     _integer(config, "fold", 0, 4)
     _integer(config, "gpus", 1, 64)
+    if os.environ.get("SLURM_JOB_ID"):
+        import torch
+
+        allocated = torch.cuda.device_count()
+        if allocated < 1:
+            raise ValueError("CUDA non disponibile nel job SLURM")
+        config["gpus"] = allocated
     if not isinstance(config.get("run_dir"), str) or not config["run_dir"].strip():
         raise ValueError("run_dir must be a nonempty path")
     if config["family"] == "snn":
         snn = config.get("snn")
         if not isinstance(snn, dict):
             raise ValueError("snn settings must be a YAML mapping")
+        from snn_nnunet.config_layout import normalize_snn_layout
+        snn = config["snn"] = normalize_snn_layout(snn)
         if snn.get("variant") not in {"orig", "shallow", "medium", "deep"}:
             raise ValueError("snn.variant must be orig, shallow, medium, or deep")
         _integer(snn, "temporal_axis", 0, 2)
@@ -66,8 +74,6 @@ def _config(path: Path) -> dict[str, Any]:
         if (not isinstance(patch, list) or len(patch) != 3
                 or any(type(value) is not int or value <= 0 for value in patch)):
             raise ValueError("snn.validation_patch_size must contain three positive integers")
-        if snn["validation_every"] and config["gpus"] != 1:
-            raise ValueError("Periodic full-fold validation requires single-GPU training")
         if type(snn.get("use_fptt")) is not bool:
             raise ValueError("snn.use_fptt must be true or false")
         from snn_nnunet.model import output_spiking_option
@@ -79,7 +85,7 @@ def _config(path: Path) -> dict[str, Any]:
         spatial_defaults = {
             "patch_embedding_spiking": True,
             "dwconv2d_spiking": True,
-            "output_spiking": False,
+            "output_spiking": False,  # Legacy compatibility; SS2D output has no activation.
         }
         from snn_nnunet.model import ARCHITECTURE_DEFAULTS, architecture_options
         from snn_nnunet.config_aliases import normalize_spiking_options
@@ -97,6 +103,12 @@ def _config(path: Path) -> dict[str, Any]:
             raise ValueError("decoder_block=resdecoder requires snn.variant: orig")
         if any(spatial_defaults[key] for key in ("fue_skip1", "fue_skip2")) and snn["variant"] != "orig":
             raise ValueError("FUE skips require snn.variant: orig")
+        if snn["variant"] != "orig" and any(
+                spatial_defaults[key] is not None
+                for key in ("encoder_output_spiking", "decoder_conv_spiking")):
+            raise ValueError("Stage spiking controls require snn.variant: orig")
+        if spatial_defaults["recurrent_neuron"] is not None and snn["variant"] != "orig":
+            raise ValueError("recurrent_neuron requires snn.variant: orig")
         snn["spatial_mamba"] = spatial_defaults
         temporal = snn.get("temporal_mamba", {})
         if not isinstance(temporal, dict):
@@ -188,7 +200,10 @@ def run(config_path: Path) -> None:
         raise ValueError(f"Run directory already contains files: {run_dir}. Choose a new run_dir.")
 
     run_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(config_path, run_dir / "experiment.yaml")
+    with config_path.open(encoding="utf-8") as stream:
+        saved_config = yaml.safe_load(stream)
+    saved_config["gpus"] = gpus
+    (run_dir / "experiment.yaml").write_text(yaml.safe_dump(saved_config, sort_keys=False))
     os.environ["nnUNet_results"] = str(run_dir)
     print(
         f"Model family: {family}; configuration: {configuration}; "
@@ -201,7 +216,7 @@ def run(config_path: Path) -> None:
         from snn_nnunet import cli
 
         snn = config["snn"]
-        architecture_args = []
+        architecture_args = ["--recurrent-neuron", json.dumps(snn["spatial_mamba"]["recurrent_neuron"])]
         if snn.get("training_patch_size") is not None:
             architecture_args.extend(["--training-patch-size", *map(str, snn["training_patch_size"])])
         architecture_args.extend(["--silif", json.dumps(snn["spatial_mamba"]["silif"])])
@@ -214,6 +229,12 @@ def run(config_path: Path) -> None:
         for key in ("hierarchical_encoder", "full_resolution_skip", "stem_spiking", "downsampling_spiking",
                     "resdecoder_spiking1", "resdecoder_spiking2", "fue_skip1", "fue_skip2"):
             architecture_args.append(("--" if snn["spatial_mamba"][key] else "--no-") + key.replace("_", "-"))
+        if snn["variant"] == "orig":
+            for key in ("encoder_output_spiking", "decoder_conv_spiking"):
+                enabled = snn["spatial_mamba"][key]
+                if enabled is None:
+                    enabled = snn["output_spiking"]
+                architecture_args.append(("--" if enabled else "--no-") + key.replace("_", "-"))
         cli.main([
             "train", "--dataset-id", str(dataset_id), "--fold", str(fold),
             "--run-dir", str(run_dir), "--gpus", str(gpus),

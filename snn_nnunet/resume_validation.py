@@ -145,6 +145,28 @@ class PeriodicFullValidation:
         epoch = trainer.current_epoch
         if epoch <= 0 or epoch % self.every:
             return
+        distributed = getattr(trainer, 'is_ddp', False)
+        if not distributed:
+            return self._validate_current_rank_zero()
+
+        # All ranks reach the completed epoch before rank zero reads weights.
+        torch.distributed.barrier()
+        status = [None]
+        if torch.distributed.get_rank() == 0:
+            try:
+                self._validate_current_rank_zero()
+            except Exception as error:
+                status[0] = f'{type(error).__name__}: {error}'
+        # This collective also holds other ranks until validation is complete.
+        torch.distributed.broadcast_object_list(status, src=0)
+        if status[0] is not None:
+            raise RuntimeError(f'Periodic full-fold validation failed: {status[0]}')
+
+    def _validate_current_rank_zero(self):
+        trainer = self.trainer
+        epoch = trainer.current_epoch
+        if epoch <= 0 or epoch % self.every:
+            return
         destination = self.root / f'epoch_{epoch:04d}'
         summary_path = destination / 'summary.json'
         if summary_path.is_file():
@@ -164,7 +186,14 @@ class PeriodicFullValidation:
             validator = run_fold_validation
         trainer.print_to_log_file(f'Full-volume validation with postprocessing: completed epoch {epoch}')
         with _preserve_training_state(trainer), torch.no_grad():
-            summary = validator(trainer, output_dir=destination, patch_size=self.patch_size)
+            network = trainer.network
+            if isinstance(network, torch.nn.parallel.DistributedDataParallel):
+                # A rank-zero-only DDP forward would wait for buffer broadcasts.
+                trainer.network = network.module
+            try:
+                summary = validator(trainer, output_dir=destination, patch_size=self.patch_size)
+            finally:
+                trainer.network = network
         summary.setdefault('settings', {})['patch_size'] = list(self.patch_size)
         summary['epoch'] = epoch
         summary['checkpoint'] = str(checkpoint_path)

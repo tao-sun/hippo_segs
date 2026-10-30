@@ -11,6 +11,7 @@ from torch import Tensor, nn
 
 from snn_nnunet.model import ConvBlock, build_model, ARCHITECTURE_DEFAULTS, architecture_options
 from snn_nnunet.config_aliases import normalize_spiking_options
+from snn_nnunet.precision import FP32Module, fp32_forward
 
 
 _MODEL_KWARGS = (
@@ -154,6 +155,11 @@ class SNNConfig:
         for key in ARCHITECTURE_DEFAULTS:
             if key in kwargs:
                 kwargs[key] = validated_architecture[key]
+        # Keep legacy serialized plans identical when the optional branch is absent.
+        if kwargs.get("recurrent_neuron") is None:
+            kwargs.pop("recurrent_neuron", None)
+        if kwargs.get("recurrent_neuron") is not None and data["model_name"] != "orig":
+            raise ValueError("recurrent_neuron requires model_name=orig")
         if kwargs.get("decoder_block", "standard") != "standard" and data["model_name"] != "orig":
             raise ValueError("decoder_block=resdecoder is supported only for model_name=orig")
         if output_key == "vss_output_spiking":
@@ -291,7 +297,7 @@ def from_core_layout(logits: Tensor, axis: int) -> Tensor:
     return logits.movedim(2, 2 + axis)
 
 
-class SNNnnUNetAdapter(nn.Module):
+class SNNnnUNetAdapter(FP32Module):
     """Run a 2D stateful SNN over one spatial axis of a 3D volume."""
 
     def __init__(self, config: SNNConfig, core: nn.Module | None = None):
@@ -307,12 +313,11 @@ class SNNnnUNetAdapter(nn.Module):
         if x.shape[1] != self.config.num_input_channels:
             raise ValueError(f"expected {self.config.num_input_channels} input channels")
 
+    @fp32_forward
     def forward_window(self, window: Tensor, *, t0: int) -> Tensor:
         self._check_input(window)
-        # Native predictors may enable AMP around the adapter. Keep the core
-        # in FP32 even when called from such an outer autocast context.
-        with torch.autocast(window.device.type, enabled=False):
-            logits = self.core(to_core_layout(window.float(), self.temporal_axis), t0=t0)
+        # fp32_forward rejects rounded inputs and disables any outer AMP context.
+        logits = self.core(to_core_layout(window, self.temporal_axis), t0=t0)
         if logits.ndim != 5 or logits.shape[1] != self.config.num_output_channels:
             raise ValueError(f"expected {self.config.num_output_channels} output channels")
         return from_core_layout(logits, self.temporal_axis)

@@ -63,7 +63,7 @@ Preparation runs native nnU-Net fingerprinting, planning, and preprocessing with
 ## Train and resume
 
 To select the model without changing its trainer, edit
-`brats24_fold0_model.yaml`. The supported families are `unet2d`, `unet3d`,
+`brats24_config.yaml`. The supported families are `unet2d`, `unet3d`,
 and `snn`; give each experiment a fresh `run_dir`. The launcher reads the
 appropriate plans (`nnUNetPlans` or `SNNPlans`), verifies that the selected
 configuration was preprocessed, and keeps checkpoints in that run directory.
@@ -74,7 +74,7 @@ repository root after exporting the existing data paths:
 export nnUNet_raw=/gpfs/scratch1/shared/apiaghiardelli/nnUNet_raw
 export nnUNet_preprocessed=/gpfs/scratch1/shared/apiaghiardelli/nnUNet_preprocessed
 uv run --python 3.10 python -m snn_nnunet.run_model \
-  --config brats24_fold0_model.yaml
+  --config brats24_config.yaml
 ~~~
 
 The launcher refuses a nonempty `run_dir` and saves a copy of the YAML as
@@ -257,23 +257,22 @@ changing them requires a fresh run. Old checkpoints default to FUE off.
 PyTorch dropout remains after PLIF and rescales surviving spikes during
 training; dropout is inactive during evaluation.
 
-On the cluster, submit the generic GPU launcher. It requests one H100 by
-default; the command-line partition overrides that default when an A100 is
-preferred:
+On the cluster, submit the SNN GPU launcher. It requests one A100 by
+default; the command-line partition can select an H100 instead:
 
 ~~~bash
-sbatch train_brats24_fold0.sbatch
-sbatch --partition=gpu_h100 train_brats24_fold0.sbatch
-sbatch --partition=gpu_a100 train_brats24_fold0.sbatch
+sbatch train_validate_snn_brats24_fold0.sbatch
+sbatch --partition=gpu_h100 train_validate_snn_brats24_fold0.sbatch
+sbatch --partition=gpu_a100 train_validate_snn_brats24_fold0.sbatch
 ~~~
 
 The script reads the model family and GPU count from
-`brats24_fold0_model.yaml`. Its `#SBATCH --gpus=1` must match the YAML `gpus`
+`brats24_config.yaml`. Its `#SBATCH --gpus=1` must match the YAML `gpus`
 value. To use another experiment file, submit with:
 
 ~~~bash
 sbatch --export=ALL,CONFIG_PATH=/absolute/path/to/config.yaml \
-  train_brats24_fold0.sbatch
+  train_validate_snn_brats24_fold0.sbatch
 ~~~
 
 If the 2D preprocessed directory is absent, create it before submitting the

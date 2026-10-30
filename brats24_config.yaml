@@ -1,0 +1,105 @@
+# Supported families: unet2d, unet3d, snn. Use a fresh run_dir for every run.
+family: snn
+dataset_id: 1
+fold: 0
+gpus: 1
+run_dir: /gpfs/scratch1/shared/apiaghiardelli/SNNMamba_selective_multitimescale_fold0_k1
+snn:
+  # Training and validation. Patch axes follow the preprocessed volume; axis 0 is time.
+  variant: orig
+  epochs: 200
+  lr: 0.001
+  training_patch_size: [81, 128, 128]
+  validation_every: 50
+  validation_patch_size: [81, 128, 128]
+  temporal_axis: 0
+  k: 1
+  use_fptt: true
+
+  # Shared neuron type. Disabled spiking activations use GELU; heads keep raw logits.
+  neurons:
+    model: plif
+    # Used only with model: silif; ranges initialize learned per-channel parameters.
+    silif:
+      v_threshold: 1.0
+      dt_init: 0.004
+      rate_u_range: [10.0, 250.0]
+      rate_w_range: [2.5, 10.0]
+      a_range: [0.0, 1.0]
+      b_range: [0.0, 2.0]
+      surrogate_alpha: 2.0
+      detach_reset: true
+
+  # Full-resolution Conv3x3 -> GN -> activation.
+  stem:
+    depth: 1
+    channels: 32
+    spiking: false
+    skip: true  # Stem features -> final decoder concatenation.
+    skip_fusion: concat
+
+  encoder:
+    hierarchical: true
+    channels: [64, 128, 256]
+    stage:
+      depths: [1, 1, 1]
+      spiking: true  # Output activation after VSS residual sum + GN.
+      recurrent_neuron:
+        model: selective_multitimescale_lif
+        compartments: 3
+        lambda_init: [0.50, 0.80, 0.95]
+        spatial_mixing:
+          enabled: true
+          kernel_size: 3
+          padding: zeros
+          eta_init: 0.1
+          kernel_init: near_identity
+          kernel_center_init: 0.95
+          kernel_surround_init: 0.001
+          max_kernel_l1_norm: 1.0
+        selective_readout:
+          enabled: true
+          gate: sigmoid
+          gate_kernel_size: 1
+          gate_init: zeros
+          static_gate_init: 0.5
+          fusion: weighted_sum
+        memory_projection:
+          kernel_size: 1
+          bias: false
+          init: xavier_uniform
+        memory_dtype: float32
+        direction: forward
+        diagnostics:
+          every_n_windows: 100  # 0 disables sampling; summaries enter the native epoch logger.
+          near_lambda_gap: 0.001
+          growth_ratio_threshold: 100.0
+      # Settings shared by all stages; strides/depths list stages 1, 2, 3.
+      downsampling:
+        kernel_size: 3
+        strides: [2, 2, 2]
+        spiking: false
+      # SS2D fusion ends with GN only, followed by output projection.
+      spatial_mamba:
+        dwconv2d_kernel_size: 5
+        patch_embedding_spiking: false
+        dwconv2d_spiking: false
+      temporal_mamba:
+        enabled: false
+        kernel_size: 3
+        d_state: 16
+        dt_rank: auto
+        debug_shapes: false
+        norm_spiking: false
+        dwconv1D_spiking: false
+
+  decoder:
+    stage:
+      block: standard
+      conv_block_spiking: true  # All ConvBlock/DeconvBlock activations in decoder stages.
+      # Used only with block: resdecoder; independent of conv_block_spiking.
+      resdecoder_spiking1: false
+      resdecoder_spiking2: false
+    skips:
+      fue_skip1: false
+      fue_skip2: false

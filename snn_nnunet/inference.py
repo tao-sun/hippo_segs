@@ -10,6 +10,7 @@ from tqdm import tqdm
 from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
 from nnunetv2.inference.sliding_window_prediction import compute_gaussian
 from nnunetv2.utilities.helpers import empty_cache
+from snn_nnunet.precision import configure_full_precision, require_fp32, require_fp32_module
 
 
 class FP32nnUNetPredictor(nnUNetPredictor):
@@ -22,7 +23,9 @@ class FP32nnUNetPredictor(nnUNetPredictor):
         results_device = self.device if do_on_device else torch.device("cpu")
         predicted_logits = n_predictions = prediction = gaussian = tile = None
         try:
-            self.network.float()
+            configure_full_precision()
+            require_fp32(data, "Inference input")
+            require_fp32_module(self.network)
             # The public nnU-Net predictor enables AMP outside this method.
             # Disable it here, inside that context, for the whole tile path.
             with torch.autocast(self.device.type, enabled=False):

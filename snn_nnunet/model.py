@@ -7,6 +7,9 @@ import torch.nn.functional as F
 
 from snn_nnunet import surrogate
 from snn_nnunet.config_aliases import normalize_spiking_options
+from snn_nnunet.precision import FP32Module, fp32_forward
+from snn_nnunet.recurrent_config import recurrent_options
+from snn_nnunet.recurrent_neuron import SelectiveMultiTimescaleLIF
 from snn_nnunet.spike_neurons import PLIFNode, SiLIFNode, SPIKING_NODE_TYPES, make_spiking_node
 from snn_nnunet.silif_config import SILIF_DEFAULTS, silif_options
 from snn_nnunet.spikmamba import Spiking2DPatchEmbedding, SpikMambaBlock
@@ -54,12 +57,15 @@ def print_model_info(model: nn.Module):
 
 
 ARCHITECTURE_DEFAULTS = {
+    "recurrent_neuron": None,
     "neuron_model": "plif",
     "silif": SILIF_DEFAULTS,
     "hierarchical_encoder": True,
     "stem_depth": 1,
     "stem_spiking": True,
     "downsampling_spiking": True,
+    "encoder_output_spiking": None,
+    "decoder_conv_spiking": None,
     "stem_channels": 32,
     "encoder_channels": (64, 128, 256),
     "downsample_kernel_size": 3,
@@ -93,12 +99,18 @@ def architecture_options(values):
     values = normalize_spiking_options(values)
     result = {key: values.get(key, default) for key, default in ARCHITECTURE_DEFAULTS.items()}
     result["silif"] = silif_options(result["silif"])
+    result["recurrent_neuron"] = recurrent_options(result["recurrent_neuron"])
+    if result["recurrent_neuron"] is not None and not result["hierarchical_encoder"]:
+        raise ValueError("recurrent_neuron requires hierarchical_encoder=true")
     if result["neuron_model"] not in ("plif", "silif"):
         raise ValueError("neuron_model must be 'plif' or 'silif'")
     for key in ("hierarchical_encoder", "full_resolution_skip", "stem_spiking", "downsampling_spiking",
                 "resdecoder_spiking1", "resdecoder_spiking2", "fue_skip1", "fue_skip2"):
         if type(result[key]) is not bool:
             raise ValueError(f"{key} must be a boolean")
+    for key in ("encoder_output_spiking", "decoder_conv_spiking"):
+        if result[key] is not None and type(result[key]) is not bool:
+            raise ValueError(f"{key} must be a boolean or null (legacy fallback)")
     for key in ("stem_depth", "stem_channels", "downsample_kernel_size", "dwconv2d_kernel_size"):
         if type(result[key]) is not int or result[key] < 1:
             raise ValueError(f"{key} must be a positive integer")
@@ -171,6 +183,7 @@ class _SpikMambaEncoderAdapter(nn.Module):
         dwconv2d_kernel_size=3,
         neuron_model="plif",
         silif=None,
+        recurrent_neuron=None,
     ) -> None:
         super().__init__()
         if not isinstance(output_spiking, bool):
@@ -216,17 +229,22 @@ class _SpikMambaEncoderAdapter(nn.Module):
             temporal_mamba=temporal_mamba,
         )
         if skip_patch_activation:
+            self.spik_mamba.mamba_layer.patch_norm = nn.Identity()
             self.spik_mamba.mamba_layer.patch_sl = nn.Identity()
         self.post_norm = nn.GroupNorm(1, self.out_channels)
-        self.post_plif = (
-            make_spiking_node(
-                neuron_model, channels=self.out_channels,
-                init_tau=init_tau,
-                surrogate_function=surrogate.ATan(),
-                detach_reset=True, silif=silif,
+        recurrent_neuron = recurrent_options(recurrent_neuron)
+        if output_spiking and recurrent_neuron is not None:
+            self.post_plif = SelectiveMultiTimescaleLIF(
+                self.out_channels, recurrent_neuron, init_tau=init_tau,
+                surrogate_function=surrogate.ATan(), detach_reset=True,
             )
-            if output_spiking else nn.GELU()
-        )
+        elif output_spiking:
+            self.post_plif = make_spiking_node(
+                neuron_model, channels=self.out_channels, init_tau=init_tau,
+                surrogate_function=surrogate.ATan(), detach_reset=True, silif=silif,
+            )
+        else:
+            self.post_plif = nn.GELU()
 
     def forward(self, x: torch.Tensor, time_step: int, *, return_pre_spike=False):
         if x.ndim != 4:
@@ -319,11 +337,13 @@ class FeatureUncertaintyEnhancement(nn.Module):
 
 
 class FUESkipConnection(nn.Module):
-    """Reweight pre-PLIF encoder features with an independent optional PLIF."""
+    """Reweight and normalize encoder features before an independent activation."""
 
     def __init__(self, output_spiking=True, init_tau=2.0, channels=None, neuron_model="plif", silif=None):
         super().__init__()
         self.fue = FeatureUncertaintyEnhancement()
+        # Direct PLIF/GELU use may omit C; configured model skips learn affine weights.
+        self.norm = nn.GroupNorm(1, channels) if channels is not None else None
         self.plif = (
             make_spiking_node(neuron_model, channels=channels, init_tau=init_tau,
                               surrogate_function=surrogate.ATan(), detach_reset=True, silif=silif)
@@ -332,6 +352,7 @@ class FUESkipConnection(nn.Module):
 
     def forward(self, x, time_step):
         x = self.fue(x)
+        x = self.norm(x) if self.norm is not None else F.group_norm(x, 1)
         return self.plif(x, time_step)[0] if isinstance(self.plif, SPIKING_NODE_TYPES) else self.plif(x)
 
     def forward_sequence(self, x, time_step):
@@ -355,7 +376,7 @@ class ConvBlock(nn.Module):
                  spatial_output_spiking=False,
                  downsample_kernel_size=None, vss_depth=1, downsampling_spiking=True,
                  fue_skip=False, dwconv2d_kernel_size=3, neuron_model="plif", silif=None,
-                 activation=True):
+                 activation=True, recurrent_neuron=None):
         super().__init__()
         self.dropout = float(dropout)
         self.normalization = normalization
@@ -388,6 +409,7 @@ class ConvBlock(nn.Module):
                 downsampling_spiking=downsampling_spiking,
                 dwconv2d_kernel_size=dwconv2d_kernel_size,
                 neuron_model=neuron_model, silif=silif,
+                recurrent_neuron=recurrent_neuron,
             )
             self.extra_vss = nn.ModuleList([
                 _SpikMambaEncoderAdapter(
@@ -401,7 +423,7 @@ class ConvBlock(nn.Module):
                     patch_embedding_spiking=patch_embedding_spiking,
                     spatial_output_spiking=spatial_output_spiking,
                     output_spiking=output_spiking, temporal_mamba=None,
-                    downsample=False,
+                    downsample=False, recurrent_neuron=recurrent_neuron,
                 ) for _ in range(vss_depth - 1)
             ])
         else:
@@ -559,7 +581,7 @@ class DeconvBlock(nn.Module):
         return out
 
 
-class SNNBraTS(nn.Module):
+class SNNBraTS(FP32Module):
     """
     Forward takes a window x_win: (B, k, 4, H, W) and an absolute starting time t0.
     Enumerates time_step = t0, t0+1, ..., t0+k-1 (no resets inside a sequence).
@@ -591,7 +613,8 @@ class SNNBraTS(nn.Module):
                  resdecoder_spiking1: bool = True, resdecoder_spiking2: bool = True,
                  fue_skip1: bool = False, fue_skip2: bool = False,
                  dwconv2d_kernel_size: int = 3,
-                 downsample_strides=(2, 2, 2), neuron_model="plif", silif=None):
+                 downsample_strides=(2, 2, 2), neuron_model="plif", silif=None,
+                 encoder_output_spiking=None, decoder_conv_spiking=None, recurrent_neuron=None):
 
         super().__init__()
         if isinstance(patch_size, bool) or not isinstance(patch_size, int) or patch_size <= 0:
@@ -628,10 +651,12 @@ class SNNBraTS(nn.Module):
         silif = silif_options({} if silif is None else silif)
         self.architecture_config = architecture_options({
             "neuron_model": neuron_model,
+            "recurrent_neuron": recurrent_neuron,
             "silif": silif,
             "hierarchical_encoder": hierarchical_encoder, "stem_depth": stem_depth,
             "stem_channels": stem_channels, "encoder_channels": encoder_channels,
             "stem_spiking": stem_spiking, "downsampling_spiking": downsampling_spiking,
+            "encoder_output_spiking": encoder_output_spiking, "decoder_conv_spiking": decoder_conv_spiking,
             "downsample_kernel_size": downsample_kernel_size, "vss_depths": vss_depths,
             "dwconv2d_kernel_size": dwconv2d_kernel_size,
             "downsample_strides": downsample_strides,
@@ -648,6 +673,9 @@ class SNNBraTS(nn.Module):
         self.stem_depth = stem_depth
         self.stem_spiking = stem_spiking
         self.downsampling_spiking = downsampling_spiking
+        # Preserve shared-switch behavior only for legacy callers without stage controls.
+        self.encoder_output_spiking = output_spiking if encoder_output_spiking is None else encoder_output_spiking
+        self.decoder_conv_spiking = output_spiking if decoder_conv_spiking is None else decoder_conv_spiking
         self.encoder_channels = tuple(encoder_channels) if hierarchical_encoder else (32, 64, 128)
         self.vss_depths = tuple(vss_depths) if hierarchical_encoder else (1, 1, 1)
         self.decoder_block = self.architecture_config["decoder_block"]
@@ -663,6 +691,7 @@ class SNNBraTS(nn.Module):
                                     neuron_model=neuron_model, silif=silif)
         # Encoder
         spik_mamba_kwargs = {
+            "recurrent_neuron": self.architecture_config["recurrent_neuron"],
             "neuron_model": neuron_model,
             "silif": silif,
             "spikMamba": True,
@@ -677,7 +706,7 @@ class SNNBraTS(nn.Module):
             "dwconv2d_spiking": self.dwconv2d_spiking,
             "patch_embedding_spiking": self.patch_embedding_spiking,
             "spatial_output_spiking": self.spatial_output_spiking,
-            "output_spiking": output_spiking,
+            "output_spiking": self.encoder_output_spiking,
             "temporal_mamba": self.temporal_mamba_config,
         }
         c1, c2, c3 = self.encoder_channels
@@ -695,29 +724,29 @@ class SNNBraTS(nn.Module):
         # Mirror encoder strides; stride 1 projects channels at the same resolution.
         d1, d2, d3 = (c2, c1, stem_channels) if hierarchical_encoder else (128, 128, 128)
         stride1, stride2, stride3 = reversed(stage_strides)
-        self.deconv_block1 = DeconvBlock(c3, d1, stride1, stride1, dropout=0.1, output_spiking=output_spiking, neuron_model=neuron_model, silif=silif)
-        self.deconv1_conv = ConvBlock(d1, d1, padding=1, dropout=0.1, output_spiking=output_spiking, neuron_model=neuron_model, silif=silif)
+        self.deconv_block1 = DeconvBlock(c3, d1, stride1, stride1, dropout=0.1, output_spiking=self.decoder_conv_spiking, neuron_model=neuron_model, silif=silif)
+        self.deconv1_conv = ConvBlock(d1, d1, padding=1, dropout=0.1, output_spiking=self.decoder_conv_spiking, neuron_model=neuron_model, silif=silif)
         self.concat1_conv = (
             ResDecoderBlock(d1 + c2, d1, dropout=0.1, output_spiking=output_spiking, neuron_model=neuron_model, silif=silif,
                             spiking1_enabled=self.resdecoder_spiking1,
                             spiking2_enabled=self.resdecoder_spiking2)
             if self.decoder_block == "resdecoder" else
-            ConvBlock(d1 + c2, d1, padding=1, dropout=0.1, output_spiking=output_spiking, neuron_model=neuron_model, silif=silif)
+            ConvBlock(d1 + c2, d1, padding=1, dropout=0.1, output_spiking=self.decoder_conv_spiking, neuron_model=neuron_model, silif=silif)
         )
-        self.deconv_block2 = DeconvBlock(d1, d2, stride2, stride2, dropout=0.1, output_spiking=output_spiking, neuron_model=neuron_model, silif=silif)
-        self.deconv2_conv = ConvBlock(d2, d2, padding=1, dropout=0.1, output_spiking=output_spiking, neuron_model=neuron_model, silif=silif)
+        self.deconv_block2 = DeconvBlock(d1, d2, stride2, stride2, dropout=0.1, output_spiking=self.decoder_conv_spiking, neuron_model=neuron_model, silif=silif)
+        self.deconv2_conv = ConvBlock(d2, d2, padding=1, dropout=0.1, output_spiking=self.decoder_conv_spiking, neuron_model=neuron_model, silif=silif)
         self.concat2_conv = (
             ResDecoderBlock(d2 + c1, d2, dropout=0.1, output_spiking=output_spiking, neuron_model=neuron_model, silif=silif,
                             spiking1_enabled=self.resdecoder_spiking1,
                             spiking2_enabled=self.resdecoder_spiking2)
             if self.decoder_block == "resdecoder" else
-            ConvBlock(d2 + c1, d2, padding=1, dropout=0.1, output_spiking=output_spiking, neuron_model=neuron_model, silif=silif)
+            ConvBlock(d2 + c1, d2, padding=1, dropout=0.1, output_spiking=self.decoder_conv_spiking, neuron_model=neuron_model, silif=silif)
         )
-        self.deconv_block3 = DeconvBlock(d2, d3, stride3, stride3, dropout=0.1, output_spiking=output_spiking, neuron_model=neuron_model, silif=silif)
-        self.deconv3_conv = ConvBlock(d3, d3, padding=1, dropout=0.1, output_spiking=output_spiking, neuron_model=neuron_model, silif=silif)
+        self.deconv_block3 = DeconvBlock(d2, d3, stride3, stride3, dropout=0.1, output_spiking=self.decoder_conv_spiking, neuron_model=neuron_model, silif=silif)
+        self.deconv3_conv = ConvBlock(d3, d3, padding=1, dropout=0.1, output_spiking=self.decoder_conv_spiking, neuron_model=neuron_model, silif=silif)
         if self.full_resolution_skip:
             self.concat0_conv = ConvBlock(d3 + stem_channels, d3, padding=1,
-                                          dropout=0.1, output_spiking=output_spiking, neuron_model=neuron_model, silif=silif)
+                                          dropout=0.1, output_spiking=self.decoder_conv_spiking, neuron_model=neuron_model, silif=silif)
         self.class_conv = ConvBlock(d3, out_channels, padding=1, dropout=0.0,
                                      normalization=False, spiking=False, activation=False)
         if self.input_skip:
@@ -756,6 +785,7 @@ class SNNBraTS(nn.Module):
         super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
                                      missing_keys, unexpected_keys, error_msgs)
 
+    @fp32_forward
     def forward(self, x_win: torch.Tensor, t0: int = 0) -> torch.Tensor:
         B, k, C, H, W = x_win.shape
         pad_h = (-H) % self.encoder_scale
@@ -812,7 +842,7 @@ def _pad_rb(x: torch.Tensor, ph: int, pw: int):
 # =========================
 # Deep U-Net — 4 pools (×16)
 # =========================
-class SNNBraTSUNetDeep(nn.Module):
+class SNNBraTSUNetDeep(FP32Module):
     """
     L1: 32→32 | pool
     L2: 64→64 | pool
@@ -839,6 +869,7 @@ class SNNBraTSUNetDeep(nn.Module):
         self.up1   = DeconvBlock( 64, 32,dropout=dropout); self.dec1a = ConvBlock( 32+ 32, 32,padding=1,dropout=dropout); self.dec1b = ConvBlock( 32, 32,padding=1,dropout=dropout)
         self.class_conv = ConvBlock(32, self.out_channels, kernel_size=1, padding=0, dropout=0.0, normalization=False, spiking=False, activation=False)
 
+    @fp32_forward
     def forward(self, x_win: torch.Tensor, t0: int = 0) -> torch.Tensor:
         B,k,C,H,W = x_win.shape
         ph,pw = _pad_needed(H,W,self.multiple)
@@ -865,7 +896,7 @@ class SNNBraTSUNetDeep(nn.Module):
 # =========================
 # 4L U-Net — 3 pools (×8)
 # =========================
-class SNNBraTSUNetMedium(nn.Module):
+class SNNBraTSUNetMedium(FP32Module):
     """
     L1: 32→32 | pool
     L2: 64→64 | pool
@@ -891,6 +922,7 @@ class SNNBraTSUNetMedium(nn.Module):
         self.up1   = DeconvBlock( 64, 32,dropout=dropout); self.dec1a = ConvBlock( 32+ 32, 32,padding=1,dropout=dropout); self.dec1b = ConvBlock( 32, 32,padding=1,dropout=dropout)
         self.class_conv = ConvBlock(32, self.out_channels, kernel_size=1, padding=0, dropout=0.0, normalization=False, spiking=False, activation=False)
 
+    @fp32_forward
     def forward(self, x_win: torch.Tensor, t0: int = 0) -> torch.Tensor:
         B,k,C,H,W = x_win.shape
         ph,pw = _pad_needed(H,W,self.multiple)
@@ -916,7 +948,7 @@ class SNNBraTSUNetMedium(nn.Module):
 # =========================
 # 3L U-Net — 2 pools (×4)
 # =========================
-class SNNBraTSUNetShallow(nn.Module):
+class SNNBraTSUNetShallow(FP32Module):
     """
     L1: 32→32 | pool
     L2: 64→64 | pool
@@ -939,6 +971,7 @@ class SNNBraTSUNetShallow(nn.Module):
         self.up1   = DeconvBlock( 64, 32,dropout=dropout); self.dec1a = ConvBlock( 32+ 32, 32,padding=1,dropout=dropout); self.dec1b = ConvBlock( 32, 32,padding=1,dropout=dropout)
         self.class_conv = ConvBlock(32, self.out_channels, kernel_size=1, padding=0, dropout=0.0, normalization=False, spiking=False, activation=False)
 
+    @fp32_forward
     def forward(self, x_win: torch.Tensor, t0: int = 0) -> torch.Tensor:
         B,k,C,H,W = x_win.shape
         ph,pw = _pad_needed(H,W,self.multiple)
@@ -973,6 +1006,12 @@ def build_model(model_name: str, out_channels: int = 3, patch_size: int = 4,
     unknown = architecture.keys() - ARCHITECTURE_DEFAULTS.keys()
     if unknown:
         raise TypeError(f"Unknown architecture options: {sorted(unknown)}")
+    if model_name != "orig" and architecture.get("recurrent_neuron") is not None:
+        raise ValueError("recurrent_neuron requires model: orig")
+    if model_name != "orig" and any(
+            architecture.get(key) is not None
+            for key in ("encoder_output_spiking", "decoder_conv_spiking")):
+        raise ValueError("Stage spiking controls require model: orig")
     if architecture.get("neuron_model", "plif") != "plif" and model_name != "orig":
         raise ValueError("neuron_model=silif is supported only for model: orig")
     if model_name != "orig" and architecture_options(architecture)["downsample_strides"] != [2, 2, 2]:

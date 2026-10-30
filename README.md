@@ -39,7 +39,7 @@ Preparation runs native nnU-Net fingerprinting, planning, and preprocessing with
 ## Train and resume
 
 To select the model without changing its trainer, edit
-`brats24_fold0_model.yaml`. The supported families are `unet2d`, `unet3d`,
+`brats24_config.yaml`. The supported families are `unet2d`, `unet3d`,
 and `snn`; give each experiment a fresh `run_dir`. The launcher reads the
 appropriate plans (`nnUNetPlans` or `SNNPlans`), verifies that the selected
 configuration was preprocessed, and keeps checkpoints in that run directory.
@@ -50,7 +50,7 @@ repository root after exporting the existing data paths:
 export nnUNet_raw=/gpfs/scratch1/shared/apiaghiardelli/nnUNet_raw
 export nnUNet_preprocessed=/gpfs/scratch1/shared/apiaghiardelli/nnUNet_preprocessed
 uv run --python 3.10 python -m snn_nnunet.run_model \
-  --config brats24_fold0_model.yaml
+  --config brats24_config.yaml
 ~~~
 
 The launcher refuses a nonempty `run_dir` and saves a copy of the YAML as
@@ -95,7 +95,8 @@ current weights and the existing BraTS component filtering and closing.
 of Dataset001 on axis 0, with padding for shorter cases. The current fold-0
 YAML enables these settings. The pipeline uses FP32, Gaussian blending,
 50% overlap and mirroring on the non-temporal axes. Training mode and RNG
-states are restored afterward. This path supports single-GPU training.
+states are restored afterward. With multiple GPUs, rank 0 validates the
+unwrapped network while all other ranks wait; training then resumes together.
 
 Each boundary saves `fold_0/checkpoint_epoch_0050.pth`, etc., and
 `fold_0/validation_periodic/epoch_0050/summary.json`, masks and metrics.
@@ -173,7 +174,69 @@ postprocessing print the convention and the absolute Dice gain
 in summaries as `dice_convention`; training loss and online patch pseudo-Dice
 are unchanged.
 
-For `snn.variant: orig`, choose `snn.spatial_mamba.decoder_block: standard`
+The main `brats24_config.yaml` groups architecture settings by their
+position in the network:
+
+~~~yaml
+snn:
+  neurons:
+    model: plif                     # shared neuron type; plif or silif
+    silif: {}                       # SiLIF initialization options
+  stem:
+    depth: 1
+    channels: 32
+    spiking: false
+    skip: true                      # full-resolution connection to final decoder fusion
+    skip_fusion: concat
+  encoder:
+    hierarchical: true
+    channels: [64, 128, 256]
+    stage:
+      depths: [1, 1, 1]
+      spiking: true                 # after each VSS residual sum + GN
+      recurrent_neuron:
+        model: selective_multitimescale_lif
+      downsampling:
+        kernel_size: 3
+        strides: [2, 2, 2]
+        spiking: false
+      spatial_mamba:
+        dwconv2d_kernel_size: 5
+        patch_embedding_spiking: false
+        dwconv2d_spiking: false
+      temporal_mamba:
+        enabled: false
+  decoder:
+    stage:
+      block: standard
+      conv_block_spiking: true      # ConvBlock and DeconvBlock activations
+      resdecoder_spiking1: false    # only for block: resdecoder
+      resdecoder_spiking2: false    # only for block: resdecoder
+    skips:
+      fue_skip1: false
+      fue_skip2: false
+~~~
+
+These stage controls require `variant: orig`. Stage settings are shared
+by the three stages; channel, depth, and stride
+lists follow encoder stage order. `decoder.stage.conv_block_spiking` controls
+upsampling, refinement, standard skip fusion, and final full-resolution
+fusion. ResDecoder's two activations have their own switches, independent
+of this Conv/Deconv control. `encoder.stage.spiking` independently controls
+the VSS output and enabled FUE skip activations. Disabled neurons use GELU;
+GN remains in place. No activation follows SS2D fusion/GN itself.
+
+The launcher translates this hierarchy into flat model settings for plans
+and checkpoint reconstruction. The new controls are saved as
+`encoder_output_spiking` and `decoder_conv_spiking`; their CLI equivalents
+are `--[no-]encoder-output-spiking` and `--[no-]decoder-conv-spiking`.
+The full-resolution stem connection is controlled by `snn.stem.skip`,
+with its fusion selected by `snn.stem.skip_fusion` (currently `concat`).
+The grouped YAML needs no global `snn.output_spiking`. Legacy YAML and
+saved plans still accept the old shared switch: when a new stage control
+is omitted, it inherits the legacy `output_spiking` value.
+
+For `snn.variant: orig`, choose `snn.decoder.stage.block: standard`
 (the default) or `resdecoder`. This replaces only the first two skip-fusion
 blocks; the upsampling blocks, their refinement convolutions, and the final
 full-resolution fusion keep their existing structure. The same option is
@@ -182,17 +245,15 @@ as top-level `decoder_block` in the legacy experiment YAML.
 
 ResDecoder applies `Conv3x3 -> GN -> spike -> Conv3x3`, adds the
 `Conv1x1(input)` projection, then applies `GN -> spike -> dropout`. Its two
-spiking neurons have independent temporal state and follow `snn.output_spiking`
-(legacy YAML: `output_spiking`); setting it to false replaces both
-with GELU activations while retaining the GN layers. The per-layer switches
-`snn.spatial_mamba.resdecoder_spiking1` and `resdecoder_spiking2` (both true
-by default) separately disable the neuron after the first convolution/GN
-and the neuron after the residual sum/GN. The global `output_spiking: false`
-always disables both and all other decoder output neurons. These flags
-are also available as `--[no-]resdecoder-spiking1` and
-`--[no-]resdecoder-spiking2`; the master switch is `--[no-]output-spiking`.
-Old `vss_output_spiking` config/checkpoint keys and CLI spellings remain
-accepted aliases; newly saved configurations use `output_spiking`.
+spiking neurons have independent temporal state and are controlled by
+`snn.decoder.stage.resdecoder_spiking1` and `resdecoder_spiking2` (both true
+by default). These separately select a neuron or GELU after the first
+convolution/GN and after the residual sum/GN, retaining both GN layers.
+The CLI equivalents are `--[no-]resdecoder-spiking1` and
+`--[no-]resdecoder-spiking2`. In legacy YAML, the switches live under
+`snn.spatial_mamba`, and the old global `output_spiking: false` still gates
+both ResDecoder neurons. Old `vss_output_spiking` config/checkpoint keys
+and CLI spellings remain accepted aliases for the legacy shared control.
 Dropout remains 0.1 in
 the existing three positions per stage: after upsampling, after the
 pre-fusion refinement, and after fusion. Select a fresh `run_dir` when
@@ -202,7 +263,7 @@ the standard decoder.
 
 All disabled spiking activation sites use `nn.GELU()` instead of an
 identity or a skipped activation. This applies to the stem, hierarchical
-downsampling, spatial Mamba input/depthwise/output activations, encoder
+downsampling, spatial Mamba input/depthwise activations, encoder
 output, decoder (including each ResDecoder activation), enabled FUE skip
 branches, and Temporal Mamba normalization/depthwise activations. The
 existing independent switches and their legacy aliases select the neuron
@@ -210,11 +271,27 @@ when true and GELU when false. A disabled Temporal Mamba or FUE branch is
 still absent; it is not replaced by GELU. Prediction heads keep raw logits
 without GELU, and disabled linear projections remain identities.
 
-GELU has no trainable parameters, so state-dict parameter names and shapes
-remain compatible. However, loading a checkpoint trained before this change
-with disabled spiking sites now applies GELU at those sites and changes its
-predictions. Train a fresh run for this architecture; reproduce old results
-with the code version used to train the old checkpoint. This includes an
+Every GELU or spiking activation is preceded by `GroupNorm(1, C)`.
+Spatial Mamba now applies `input projection -> GN -> activation`,
+`DWConv2D -> GN -> activation`, and `SS2D fusion -> GN -> output projection`.
+There is no GELU, PLIF, or SiLIF between SS2D fusion/GN and output projection.
+The legacy `spatial_output_spiking` model option, YAML
+`snn.spatial_mamba.output_spiking`, and CLI `--[no-]spatial-output-spiking`
+remain accepted for compatibility but have no effect. With Temporal Mamba
+enabled, normalized SS2D features enter the temporal branch before projection.
+The output projection is followed by the existing residual sum, GN, and
+output activation. Spatial GN normalizes channels and spatial positions
+independently for each sample and slice, including in sequence mode.
+Temporal Mamba also normalizes after DWConv1D, using the same per-token
+channel/time domain as its existing input GN. Enabled FUE skips apply
+`FUE weighting -> GN -> activation`. Suppressed duplicate patch activations
+(without a linear projection after spiking downsampling) omit their GN too.
+
+The added GN layers have learned affine parameters and new state-dict keys;
+checkpoints from before these layers were added cannot be loaded strictly
+into this architecture. Train a fresh run. To reproduce earlier results,
+use the code version used to train the checkpoint. Replacing a disabled
+spiking activation with GELU also changes predictions, including for an
 omitted spiking option whose default is false.
 
 The generic switch names are `stem_spiking`, `downsampling_spiking`,
@@ -343,23 +420,33 @@ changing them requires a fresh run. Old checkpoints default to FUE off.
 PyTorch dropout remains after PLIF and rescales surviving spikes during
 training; dropout is inactive during evaluation.
 
-On the cluster, submit the generic GPU launcher. It requests one H100 by
-default; the command-line partition overrides that default when an A100 is
-preferred:
+On the cluster, submit the SNN GPU launcher. It requests two A100s by
+default; the command-line partition can select an H100 instead:
 
 ~~~bash
-sbatch train_brats24_fold0.sbatch
-sbatch --partition=gpu_h100 train_brats24_fold0.sbatch
-sbatch --partition=gpu_a100 train_brats24_fold0.sbatch
+sbatch train_validate_snn_brats24_fold0.sbatch
+sbatch --partition=gpu_h100 train_validate_snn_brats24_fold0.sbatch
+sbatch --partition=gpu_a100 train_validate_snn_brats24_fold0.sbatch
 ~~~
 
-The script reads the model family and GPU count from
-`brats24_fold0_model.yaml`. Its `#SBATCH --gpus=1` must match the YAML `gpus`
-value. To use another experiment file, submit with:
+The script reads the model settings from `brats24_config.yaml`. Inside a
+SLURM job, all visible allocated GPUs override the YAML `gpus` value.
+SNN training uses Accelerate with one DDP worker per GPU and FP32 precision;
+preparation and final custom validation run once in the parent process.
+The saved `experiment.yaml` records the effective GPU count. Outside SLURM,
+the YAML `gpus` value applies. The global batch size in the nnU-Net plans
+must be at least the number of GPUs (two GPUs split a batch of two into
+one example per GPU).
+
+~~~bash
+sbatch --gpus=2 train_validate_snn_brats24_fold0.sbatch
+~~~
+
+To use another experiment file, submit with:
 
 ~~~bash
 sbatch --export=ALL,CONFIG_PATH=/absolute/path/to/config.yaml \
-  train_brats24_fold0.sbatch
+  train_validate_snn_brats24_fold0.sbatch
 ~~~
 
 If the 2D preprocessed directory is absent, create it before submitting the

@@ -15,6 +15,7 @@ from nnunetv2.training.loss.dice import get_tp_fp_fn_tn
 from nnunetv2.utilities.plans_handling.plans_handler import ConfigurationManager, PlansManager
 
 from snn_nnunet import fptt, network_adapter
+from snn_nnunet.recurrent_neuron import SelectiveMultiTimescaleLIF
 from snn_nnunet.inference import native_fp32_predictor
 from snn_nnunet.empty_dice_evaluation import native_empty_dice_evaluation
 from snn_nnunet.network_adapter import SNNConfig, SNNnnUNetAdapter, slice_temporal_window
@@ -79,8 +80,6 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
         return network_adapter.SNNnnUNetAdapter(config)
 
     def on_train_start(self):
-        if self.validation_every and self.is_ddp:
-            raise ValueError("Periodic full-fold validation requires single-GPU training")
         super().on_train_start()
         if self.validation_every and self._periodic_validation is None:
             from snn_nnunet.resume_validation import install_periodic_validation
@@ -157,6 +156,15 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
             from snn_nnunet.silif_config import silif_options
             if silif_options(saved_kwargs.get("silif", {})) != silif_options(self.snn_config.model_kwargs.get("silif", {})):
                 raise ValueError("Checkpoint silif settings do not match the current SNN plans; start a new run")
+        from snn_nnunet.recurrent_config import recurrent_options
+        saved_recurrence = recurrent_options(saved_kwargs.get("recurrent_neuron"))
+        current_recurrence = recurrent_options(self.snn_config.model_kwargs.get("recurrent_neuron"))
+        # Diagnostic cadence may change on resume; dynamical settings may not.
+        for options in (saved_recurrence, current_recurrence):
+            if options is not None:
+                options.pop("diagnostics")
+        if saved_recurrence != current_recurrence:
+            raise ValueError("Checkpoint recurrent_neuron does not match the current SNN plans; start a new run")
         for name in ("fue_skip1", "fue_skip2"):
             saved = saved_kwargs.get(name, False)
             current = self.snn_config.model_kwargs.get(name, False)
@@ -217,6 +225,9 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
         total_sum = 0.0
         updates = 0
         windows = 0
+        recurrent_cells = [(name, module) for name, module in adapter.named_modules()
+                           if isinstance(module, SelectiveMultiTimescaleLIF)]
+        diagnostic_sums, diagnostic_counts = {}, {}
 
         for t0 in range(0, length, config.k):
             end = min(t0 + config.k, length)
@@ -224,6 +235,10 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
             data_window = slice_temporal_window(data, t0, end, axis)
             target_window = slice_temporal_window(target, t0, end, axis)
             self.optimizer.zero_grad(set_to_none=True)
+            window_index = getattr(self, "_recurrent_window_count", 0)
+            for _, cell in recurrent_cells:
+                frequency = cell.config["diagnostics"]["every_n_windows"]
+                cell.collect_diagnostics = bool(frequency and window_index % frequency == 0)
             logits = self.network(data_window, t0=t0, chunk_size=window_length)
             task_loss = self.loss(logits, target_window)
             regularization = torch.zeros_like(task_loss)
@@ -247,6 +262,19 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
 
             if config.use_fptt and did_step:
                 fptt.update_running_params(adapter, config.fptt_alpha, config.fptt_beta)
+            sampled = {}
+            for name, cell in recurrent_cells:
+                if cell.collect_diagnostics:
+                    sampled.update({f"recurrent/{name}/{key}": value
+                                    for key, value in cell.diagnostics().items()})
+                cell.collect_diagnostics = False
+            if sampled:
+                # One host transfer per sampled window, no scalar GPU sync per metric.
+                values = torch.stack(list(sampled.values())).detach().cpu().tolist()
+                for key, value in zip(sampled, values):
+                    diagnostic_sums[key] = diagnostic_sums.get(key, 0.) + value
+                    diagnostic_counts[key] = diagnostic_counts.get(key, 0) + 1
+            self._recurrent_window_count = window_index + 1
             adapter.detach_states()
             task_sum += float(task_loss.detach())
             regularization_sum += float(regularization.detach())
@@ -263,6 +291,9 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
             "optimizer_updates": updates,
             "k": config.k,
             "fptt_mode": config.use_fptt,
+            "recurrent_diagnostics": {key: value / diagnostic_counts[key]
+                                      for key, value in diagnostic_sums.items()},
+            "recurrent_diagnostic_counts": diagnostic_counts,
         }
 
     def perform_actual_validation(self, save_probabilities: bool = False):
@@ -318,10 +349,30 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
             "fn_hard": fn_hard,
         }
 
+    def _log_recurrent_diagnostics(self, values):
+        store = self.logger.local_logger.my_fantastic_logging
+        keys = {key for key in store if key.startswith("recurrent/")} | values.keys()
+        for key in sorted(keys):
+            history = store.setdefault(key, [])
+            history.extend([float("nan")] * max(0, self.current_epoch - len(history)))
+            self.logger.log(key, values.get(key, float("nan")), self.current_epoch)
+        summary = {key: round(value, 6) for key, value in values.items()
+                   if key.endswith(("soma/firing_rate", "projection/input_ratio", "lambda/min_gap"))}
+        if summary:
+            self.print_to_log_file("Recurrent neuron diagnostics:", summary)
+        anomalies = {key: value for key, value in values.items()
+                     if (key.endswith(("state/nonfinite", "state/growth_anomaly", "/nonfinite", "/missing")) and value > 0)
+                     or (key.endswith("lambda/ordered") and value < 1)
+                     or (key.endswith("lambda/nearly_equal") and value > 0)
+                     or (key.endswith("consecutive_zero_samples") and value >= 3)}
+        if anomalies:
+            self.print_to_log_file("Recurrent neuron anomalies:", anomalies)
+
     def on_train_epoch_end(self, train_outputs: list[dict]):
         if self.snn_config.use_fptt:
             fptt.reset_running_params(self._get_adapter())
-        super().on_train_epoch_end(train_outputs)
+        # nnU-Net collates every key; nested recurrent diagnostics are aggregated below.
+        super().on_train_epoch_end([{"loss": row["loss"]} for row in train_outputs])
         keys = ("task_loss", "fptt_regularization", "total_loss")
         local_windows = sum(int(row.get("window_count", row["optimizer_updates"])) for row in train_outputs)
         local_updates = sum(int(row["optimizer_updates"]) for row in train_outputs)
@@ -346,3 +397,20 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
         }
         for key, value in values.items():
             self.logger.log(key, value, self.current_epoch)
+
+        local_diagnostics = {}
+        for row in train_outputs:
+            for key, value in row.get("recurrent_diagnostics", {}).items():
+                count = row["recurrent_diagnostic_counts"][key]
+                total, previous_count = local_diagnostics.get(key, (0., 0))
+                local_diagnostics[key] = (total + value * count, previous_count + count)
+        gathered_diagnostics = [local_diagnostics]
+        if self.is_ddp:
+            gathered_diagnostics = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered_diagnostics, local_diagnostics)
+        totals = {}
+        for rank_values in gathered_diagnostics:
+            for key, (value, count) in rank_values.items():
+                previous, n = totals.get(key, (0., 0))
+                totals[key] = (previous + value, n + count)
+        self._log_recurrent_diagnostics({key: value / count for key, (value, count) in totals.items()})

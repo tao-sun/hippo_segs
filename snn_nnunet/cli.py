@@ -10,6 +10,8 @@ import argparse
 import json
 import math
 import os
+import subprocess
+import sys
 from pathlib import Path
 from datetime import datetime
 from typing import Sequence
@@ -122,9 +124,13 @@ def _add_training_config(parser: argparse.ArgumentParser) -> None:
         ("spatial-dwconv2d-spiking", "spatial_dwconv2d_spiking"),
         ("spatial-output-spiking", "spatial_output_spiking"),
     ):
+        help_text = (
+            "Legacy option; SS2D output always uses GN without an activation."
+            if destination == "spatial_output_spiking" else None
+        )
         group = parser.add_mutually_exclusive_group()
-        group.add_argument(f"--{flag}", dest=destination, action="store_true")
-        group.add_argument(f"--no-{flag}", dest=destination, action="store_false")
+        group.add_argument(f"--{flag}", dest=destination, action="store_true", help=help_text)
+        group.add_argument(f"--no-{flag}", dest=destination, action="store_false", help=help_text)
         parser.set_defaults(**{destination: None})
     for key in ("stem_depth", "stem_channels", "downsample_kernel_size", "dwconv2d_kernel_size"):
         parser.add_argument("--" + key.replace("_", "-"), dest=key, type=_positive_int)
@@ -133,9 +139,11 @@ def _add_training_config(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--final-skip-fusion", choices=("concat",))
     parser.add_argument("--decoder-block", choices=("standard", "resdecoder"))
     parser.add_argument("--neuron-model", choices=("plif", "silif"))
+    parser.add_argument("--recurrent-neuron", type=json.loads, default=argparse.SUPPRESS, help="Optional VSS recurrent neuron JSON mapping; null selects baseline")
     parser.add_argument("--silif", type=json.loads, help="SiLIF options as a JSON mapping; stored in plans")
     for key in ("hierarchical_encoder", "full_resolution_skip", "stem_spiking", "downsampling_spiking",
-                "resdecoder_spiking1", "resdecoder_spiking2", "fue_skip1", "fue_skip2"):
+                "resdecoder_spiking1", "resdecoder_spiking2", "fue_skip1", "fue_skip2",
+                "encoder_output_spiking", "decoder_conv_spiking"):
         flag = key.replace("_", "-")
         legacy_flags = [legacy.replace("_", "-")
                         for legacy, canonical in SPIKING_OPTION_ALIASES.items() if canonical == key]
@@ -369,6 +377,8 @@ def _requested_config(args: argparse.Namespace, plans_path: Path) -> dict:
         value = getattr(args, key, None)
         if value is not None:
             config["model_kwargs"][key] = value
+    if hasattr(args, "recurrent_neuron"):
+        config["model_kwargs"]["recurrent_neuron"] = args.recurrent_neuron
     architecture_options(config["model_kwargs"])
     return config
 
@@ -426,12 +436,25 @@ def _run_training(args: argparse.Namespace, fold: int, *, validation: bool) -> N
     from nnunetv2.run.run_training import run_training
     from snn_nnunet.empty_dice_evaluation import finalize_fold_summary
 
-    run_training(dataset_name_or_id=str(args.dataset_id), configuration=CONFIGURATION, fold=fold,
-                 trainer_class_name=TRAINER, plans_identifier=PLANS, num_gpus=args.gpus,
-                 continue_training=False if validation else args.continue_training,
-                 only_run_validation=validation, val_with_best=args.best if validation else False,
-                 export_validation_probabilities=args.save_probabilities)
-    if not validation:
+    if validation:
+        run_training(dataset_name_or_id=str(args.dataset_id), configuration=CONFIGURATION, fold=fold,
+                     trainer_class_name=TRAINER, plans_identifier=PLANS, num_gpus=args.gpus,
+                     continue_training=False, only_run_validation=True, val_with_best=args.best,
+                     export_validation_probabilities=args.save_probabilities)
+    else:
+        command = [sys.executable, "-m", "accelerate.commands.launch",
+                   "--num_processes", str(args.gpus), "--num_machines", "1",
+                   "--mixed_precision", "no", "--dynamo_backend", "no"]
+        if args.gpus > 1:
+            command.extend(["--multi_gpu", "--main_process_port", "0"])
+        command.extend(["--module", "snn_nnunet.distributed_training",
+                        "--dataset-id", str(args.dataset_id), "--fold", str(fold)])
+        if args.continue_training:
+            command.append("--continue-training")
+        if args.save_probabilities:
+            command.append("--save-probabilities")
+        print(f"Accelerate: {args.gpus} process(es), one per GPU, FP32", flush=True)
+        subprocess.run(command, check=True)
         _run_custom_full_validation(args, fold)
 
     model_folder = _results_folder(args.dataset_id)
