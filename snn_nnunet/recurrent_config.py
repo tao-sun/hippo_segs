@@ -7,6 +7,8 @@ import math
 RECURRENT_DEFAULTS = {
     'model': 'selective_multitimescale_lif', 'compartments': 3,
     'lambda_init': [.50, .80, .95],
+    'temporal_weight_decay': True,
+    'temporal_fptt_regularization': True,
     'spatial_mixing': {
         'enabled': True, 'kernel_size': 3, 'padding': 'zeros', 'eta_init': .1,
         'kernel_init': 'near_identity', 'kernel_center_init': .95,
@@ -87,6 +89,9 @@ def recurrent_options(value):
         raise ValueError('lambda_init is too small for the supported tau precision')
     initial_temporal_raw(init)
     result['lambda_init'] = list(init)
+    for key in ('temporal_weight_decay', 'temporal_fptt_regularization'):
+        if type(result[key]) is not bool:
+            raise ValueError(f'recurrent_neuron.{key} must be a boolean')
     for section in ('spatial_mixing', 'selective_readout', 'memory_projection'):
         for key, default in RECURRENT_DEFAULTS[section].items():
             if key in ('enabled',):

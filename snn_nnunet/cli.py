@@ -82,7 +82,22 @@ def _add_dataset_id(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_training_config(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--model", choices=("orig", "shallow", "medium", "deep"), default="orig")
+    parser.add_argument('--seed', type=_nonnegative_int)
+    parser.add_argument('--augmentation-workers', type=_positive_int)
+    deterministic = parser.add_mutually_exclusive_group()
+    deterministic.add_argument('--deterministic', dest='deterministic', action='store_true')
+    deterministic.add_argument('--no-deterministic', dest='deterministic', action='store_false')
+    parser.set_defaults(deterministic=None)
+    bidirectional = parser.add_mutually_exclusive_group()
+    bidirectional.add_argument('--bidirectional', dest='bidirectional', action='store_true')
+    bidirectional.add_argument('--no-bidirectional', dest='bidirectional', action='store_false')
+    parser.set_defaults(bidirectional=None)
+    parser.add_argument('--bidirectional-fusion', metavar='{conv_plif,or}',
+                        help='encoder fusion method; ignored when bidirectional is disabled')
+    parser.add_argument("--model", choices=("orig", "shallow", "medium", "deep", "paper_unet"), default="orig")
+    parser.add_argument("--paper-unet", type=json.loads, help="Paper U-Net options; normally supplied by unet_config.yaml")
+    for key in ("fptt_alpha", "fptt_beta", "fptt_rho", "fptt_lambda"):
+        parser.add_argument("--" + key.replace("_", "-"), type=float)
     parser.add_argument("--temporal-axis", type=int, choices=(0, 1, 2), default=0)
     parser.add_argument("--k", type=_positive_int, default=16)
     parser.add_argument("--epochs", type=_positive_int, help="total SNN training epochs; defaults to saved plans")
@@ -138,9 +153,8 @@ def _add_training_config(parser: argparse.ArgumentParser) -> None:
         parser.add_argument("--" + key.replace("_", "-"), dest=key, type=_positive_int, nargs=3)
     parser.add_argument("--final-skip-fusion", choices=("concat",))
     parser.add_argument("--decoder-block", choices=("standard", "resdecoder"))
-    parser.add_argument("--neuron-model", choices=("plif", "silif"))
+    parser.add_argument("--neuron-model", choices=("plif",))
     parser.add_argument("--recurrent-neuron", type=json.loads, default=argparse.SUPPRESS, help="Optional VSS recurrent neuron JSON mapping; null selects baseline")
-    parser.add_argument("--silif", type=json.loads, help="SiLIF options as a JSON mapping; stored in plans")
     for key in ("hierarchical_encoder", "full_resolution_skip", "stem_spiking", "downsampling_spiking",
                 "resdecoder_spiking1", "resdecoder_spiking2", "fue_skip1", "fue_skip2",
                 "encoder_output_spiking", "decoder_conv_spiking"):
@@ -315,7 +329,18 @@ def _requested_config(args: argparse.Namespace, plans_path: Path) -> dict:
     from snn_nnunet.network_adapter import SNNConfig
 
     with plans_path.open(encoding="utf-8") as stream:
-        config = SNNConfig.from_plans(json.load(stream)).to_dict()
+        plans = json.load(stream)
+    saved = plans.get("snn_config", {})
+    reuse_saved_paper = (isinstance(saved, dict) and saved.get("model_name") == "paper_unet"
+                        and getattr(args, "paper_unet", None) is None)
+    if args.model == "paper_unet" and not args.continue_training and not reuse_saved_paper:
+        from copy import deepcopy
+        from snn_nnunet.prepare_plans import DEFAULT_SNN_CONFIG
+        # Fresh paper runs replace the architecture stored in shared preparation
+        # plans. Validate the requested model, not the previous experiment's kwargs.
+        config = deepcopy(DEFAULT_SNN_CONFIG)
+    else:
+        config = SNNConfig.from_plans(plans).to_dict()
     config.update(model_name=args.model, temporal_axis=args.temporal_axis,
                   k=args.k, use_fptt=args.use_fptt)
     epochs = getattr(args, "epochs", None)
@@ -324,10 +349,39 @@ def _requested_config(args: argparse.Namespace, plans_path: Path) -> dict:
     learning_rate = getattr(args, "lr", None)
     if learning_rate is not None:
         config["initial_lr"] = learning_rate
-    for key in ("validation_every", "validation_patch_size"):
+    for key in ("validation_every", "validation_patch_size", 'seed', 'deterministic', 'augmentation_workers', 'bidirectional', 'bidirectional_fusion'):
         value = getattr(args, key, None)
         if value is not None:
             config[key] = value
+    for key in ("fptt_alpha", "fptt_beta", "fptt_rho", "fptt_lambda"):
+        value = getattr(args, key, None)
+        if value is not None:
+            config[key] = value
+    if args.model == "paper_unet":
+        from snn_nnunet.paper_config import paper_options
+        # Do not inherit Mamba kwargs when starting from the preparation plans.
+        supplied = getattr(args, "paper_unet", None)
+        saved = config["model_kwargs"] if "neurons" in config["model_kwargs"] else {}
+        config["model_kwargs"] = paper_options(saved if supplied is None else supplied)
+        incompatible = [key for key in vars(args) if (
+            key.startswith(("temporal_mamba", "spatial_")) or key in
+            {"stem_depth", "stem_channels", "encoder_channels", "vss_depths", "downsample_strides",
+             "hierarchical_encoder", "full_resolution_skip", "stem_spiking", "downsampling_spiking",
+             "final_skip_fusion", "decoder_block", "neuron_model", "recurrent_neuron",
+             "fue_skip1", "fue_skip2", "encoder_output_spiking", "decoder_conv_spiking",
+             "output_spiking", "resdecoder_spiking1", "resdecoder_spiking2",
+             "downsample_kernel_size", "dwconv2d_kernel_size"}) and getattr(args, key) is not None]
+        if incompatible:
+            raise ValueError(f"paper_unet: incompatible options {incompatible}")
+        from copy import deepcopy
+        effective_plans = deepcopy(plans)
+        effective_plans['snn_config'] = config
+        patch = getattr(args, 'training_patch_size', None)
+        if patch is not None:
+            effective_plans.setdefault('configurations', {}).setdefault('3d_fullres', {})['patch_size'] = patch
+        return SNNConfig.from_plans(effective_plans).to_dict()
+    if getattr(args, "paper_unet", None) is not None:
+        raise ValueError("--paper-unet requires --model paper_unet")
     temporal_names = {
         "enabled": "temporal_mamba_enabled",
         "kernel_size": "temporal_mamba_kernel_size",
@@ -454,7 +508,10 @@ def _run_training(args: argparse.Namespace, fold: int, *, validation: bool) -> N
         if args.save_probabilities:
             command.append("--save-probabilities")
         print(f"Accelerate: {args.gpus} process(es), one per GPU, FP32", flush=True)
-        subprocess.run(command, check=True)
+        from snn_nnunet.network_adapter import SNNConfig
+        from snn_nnunet.reproducibility import training_environment
+        policy = SNNConfig.from_plans(json.loads(_plans_path(args.dataset_id).read_text()))
+        subprocess.run(command, check=True, env=training_environment(policy.seed, policy.deterministic))
         _run_custom_full_validation(args, fold)
 
     model_folder = _results_folder(args.dataset_id)
@@ -478,6 +535,14 @@ def _run_custom_full_validation(args: argparse.Namespace, fold: int) -> None:
         / f"fold_{fold}"
         / "validation_128patch_postprocessed"
     )
+    patch_args = []
+    if getattr(args, "model", None) == "paper_unet":
+        patch = getattr(args, "validation_patch_size", None)
+        if patch is None:
+            from snn_nnunet.network_adapter import SNNConfig
+            saved = json.loads(_plans_path(args.dataset_id).read_text())
+            patch = SNNConfig.from_plans(saved).validation_patch_size
+        patch_args = ["--patch-size", *map(str, patch)]
     run_custom_validation([
         "--dataset-id", str(args.dataset_id),
         "--fold", str(fold),
@@ -487,6 +552,7 @@ def _run_custom_full_validation(args: argparse.Namespace, fold: int) -> None:
         "--trainer", TRAINER,
         "--plans", PLANS,
         "--checkpoint-name", "checkpoint_final.pth",
+        *patch_args,
     ])
 
 

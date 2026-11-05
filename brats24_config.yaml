@@ -3,33 +3,25 @@ family: snn
 dataset_id: 1
 fold: 0
 gpus: 1
-run_dir: /gpfs/scratch1/shared/apiaghiardelli/SNNMamba_selective_multitimescale_fold0_k1
+run_dir: /gpfs/scratch1/shared/apiaghiardelli/SNNUnet_selective_multitimescale_fold0_k128
 snn:
   # Training and validation. Patch axes follow the preprocessed volume; axis 0 is time.
   variant: orig
+  seed: 42
+  deterministic: true
+  augmentation_workers: 8
   epochs: 200
   lr: 0.001
-  training_patch_size: [81, 128, 128]
+  training_patch_size: [128, 128, 128]
   validation_every: 50
-  validation_patch_size: [81, 128, 128]
+  validation_patch_size: [128, 128, 128]
   temporal_axis: 0
-  k: 1
-  use_fptt: true
+  k: 128
+  use_fptt: false
 
   # Shared neuron type. Disabled spiking activations use GELU; heads keep raw logits.
   neurons:
     model: plif
-    # Used only with model: silif; ranges initialize learned per-channel parameters.
-    silif:
-      v_threshold: 1.0
-      dt_init: 0.004
-      rate_u_range: [10.0, 250.0]
-      rate_w_range: [2.5, 10.0]
-      a_range: [0.0, 1.0]
-      b_range: [0.0, 2.0]
-      surrogate_alpha: 2.0
-      detach_reset: true
-
   # Full-resolution Conv3x3 -> GN -> activation.
   stem:
     depth: 1

@@ -170,7 +170,7 @@ def validate_checkpoint_input_skip(checkpoint: Dict, input_skip: bool) -> None:
         )
 
 
-def validate_checkpoint_neuron_model(checkpoint: Dict, neuron_model: str, *, silif=None) -> None:
+def validate_checkpoint_neuron_model(checkpoint: Dict, neuron_model: str) -> None:
     saved_architecture = architecture_options(checkpoint.get("config", {}))
     saved = saved_architecture["neuron_model"]
     if saved != neuron_model:
@@ -178,13 +178,6 @@ def validate_checkpoint_neuron_model(checkpoint: Dict, neuron_model: str, *, sil
             f"Checkpoint neuron_model={saved!r} differs from requested neuron_model={neuron_model!r}; "
             "start a new run with resume_from: null when changing neurons."
         )
-    if neuron_model == "silif" and silif is not None:
-        from snn_nnunet.silif_config import silif_options
-        if saved_architecture["silif"] != silif_options(silif):
-            raise ValueError(
-                "Checkpoint silif settings differ from the requested settings; "
-                "start a new run with resume_from: null when changing neurons."
-            )
 
 
 def validate_checkpoint_downsample_strides(checkpoint: Dict, downsample_strides) -> None:
@@ -396,7 +389,6 @@ def load_training_checkpoint(accelerator: Accelerator,
     base_model = accelerator.unwrap_model(model)
     validate_checkpoint_neuron_model(
         checkpoint, getattr(base_model, "neuron_model", "plif"),
-        silif=getattr(base_model, "architecture_config", {}).get("silif", {}),
     )
     validate_checkpoint_downsample_strides(
         checkpoint, getattr(base_model, "downsample_strides", (2, 2, 2))
@@ -1575,7 +1567,7 @@ def run_experiment(exp_cfg: Dict, config_path: Optional[str] = None):
         )
         validate_checkpoint_training_mode(resume_checkpoint, use_fptt)
         validate_checkpoint_neuron_model(
-            resume_checkpoint, architecture["neuron_model"], silif=architecture["silif"]
+            resume_checkpoint, architecture["neuron_model"]
         )
         validate_checkpoint_downsample_strides(
             resume_checkpoint, architecture["downsample_strides"]

@@ -1,6 +1,7 @@
 """Plans-driven SNN trainer that retains nnU-Net's native pipeline."""
 
 from collections.abc import Mapping
+from contextlib import nullcontext
 import os
 import tempfile
 
@@ -11,11 +12,12 @@ from torch._dynamo import OptimizedModule
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
+from nnunetv2.training.lr_scheduler.polylr import PolyLRScheduler
 from nnunetv2.training.loss.dice import get_tp_fp_fn_tn
 from nnunetv2.utilities.plans_handling.plans_handler import ConfigurationManager, PlansManager
 
 from snn_nnunet import fptt, network_adapter
-from snn_nnunet.recurrent_neuron import SelectiveMultiTimescaleLIF
+from snn_nnunet.recurrent_neuron import named_selective_neurons
 from snn_nnunet.inference import native_fp32_predictor
 from snn_nnunet.empty_dice_evaluation import native_empty_dice_evaluation
 from snn_nnunet.network_adapter import SNNConfig, SNNnnUNetAdapter, slice_temporal_window
@@ -49,6 +51,10 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
         # The base trainer enables CUDA AMP by default. Keep SNN training in FP32.
         self.grad_scaler = None
         self.snn_config = SNNConfig.from_plans(self.plans_manager.plans)
+        if self.snn_config.bidirectional:
+            # Save the effective whole-Z BPTT policy, including in native init_args.
+            self.plans_manager.plans['snn_config'] = self.snn_config.to_dict()
+            self.my_init_kwargs['plans']['snn_config'] = self.snn_config.to_dict()
         self.num_epochs = self.snn_config.num_epochs
         self.num_iterations_per_epoch = 250
         self.num_val_iterations_per_epoch = 50
@@ -60,6 +66,29 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
         self.enable_deep_supervision = False
         for key in _EPOCH_METRICS:
             self.logger.local_logger.my_fantastic_logging.setdefault(key, [])
+
+    def configure_optimizers(self):
+        # Select by parameter identity: wrappers can change names, and all other
+        # selective-neuron parameters must retain the native weight decay.
+        exempt = {
+            id(cell.temporal_raw)
+            for _, cell in named_selective_neurons(self.network)
+            if not cell.config['temporal_weight_decay']
+        }
+        if not exempt:
+            # Preserve the single-group optimizer layout of legacy checkpoints.
+            return super().configure_optimizers()
+        parameters = list(self.network.parameters())
+        optimizer = torch.optim.SGD(
+            [
+                {'params': [p for p in parameters if id(p) not in exempt],
+                 'weight_decay': self.weight_decay},
+                {'params': [p for p in parameters if id(p) in exempt],
+                 'weight_decay': 0.},
+            ],
+            lr=self.initial_lr, momentum=0.99, nesterov=True,
+        )
+        return optimizer, PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs)
 
     @staticmethod
     def build_network_architecture(
@@ -104,18 +133,68 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
             return False
         return super()._do_i_compile()
 
-    def _get_adapter(self) -> SNNnnUNetAdapter:
+    def _unwrapped_network(self) -> nn.Module:
         network = self.network
         while isinstance(network, (DDP, OptimizedModule)):
             network = network.module if isinstance(network, DDP) else network._orig_mod
+        return network
+
+    def _get_adapter(self) -> SNNnnUNetAdapter:
+        network = self._unwrapped_network()
         if not isinstance(network, SNNnnUNetAdapter):
             raise TypeError("Trainer network is not an SNNnnUNetAdapter")
         return network
 
     def initialize(self):
+        if not self.was_initialized:
+            from snn_nnunet.reproducibility import configure_reproducibility
+            self.reproducibility = configure_reproducibility(
+                self.snn_config.seed, self.snn_config.deterministic, self.local_rank)
+            self.reproducibility.update(
+                augmentation_workers=self.snn_config.augmentation_workers,
+                device=str(self.device),
+                gpu_name=torch.cuda.get_device_name(self.device) if self.device.type == 'cuda' else None)
+            self.print_to_log_file('Reproducibility:', self.reproducibility)
+            if self.snn_config.bidirectional:
+                self.print_to_log_file(
+                    f'Bidirectional Paper U-Net: {self.snn_config.bidirectional_fusion} fusion after pooling; full-Z BPTT '
+                    f'k={self.snn_config.k}, temporal_axis={self.snn_config.temporal_axis}, use_fptt=False')
         super().initialize()
         if self.snn_config.use_fptt:
             fptt.init_running_params(self._get_adapter())
+        self._check_temporal_regularization()
+
+    def get_dataloaders(self):
+        if not self.snn_config.deterministic:
+            return super().get_dataloaders()
+        from snn_nnunet.reproducibility import deterministic_dataloaders
+        return deterministic_dataloaders(self)
+
+    def _check_temporal_regularization(self):
+        """Check the actual optimizer policy, including after checkpoint restore."""
+        groups = {id(p): group for group in self.optimizer.param_groups for p in group['params']}
+        adapter = self._get_adapter()
+        cells = list(named_selective_neurons(adapter))
+        temporal_ids = {id(p) for name, p in adapter.named_parameters() if name.endswith('.temporal_raw')}
+        if temporal_ids != {id(cell.temporal_raw) for _, cell in cells}:
+            raise ValueError('Unrecognized temporal parameters; cannot verify their regularization policy')
+        fptt_exempt = getattr(adapter, '_fptt_exempt_parameter_names', frozenset())
+        for name, cell in cells:
+            decay = groups[id(cell.temporal_raw)]['weight_decay']
+            expected = self.weight_decay if cell.config['temporal_weight_decay'] else 0.
+            if decay != expected:
+                raise ValueError(f'{name}.temporal_raw optimizer decay is {decay}, expected {expected}')
+            regularized = self.snn_config.use_fptt and cell.config['temporal_fptt_regularization']
+            if self.snn_config.use_fptt:
+                actual = f'{name}.temporal_raw' not in fptt_exempt
+                if actual != regularized:
+                    raise ValueError(f'{name}.temporal_raw FPTT policy does not match configuration')
+            if self.local_rank == 0:
+                self.print_to_log_file(
+                    f'Temporal regularization {name}: parameters={cell.temporal_raw.numel()} '
+                    f'weight_decay={decay:g} fptt_regularization={regularized} '
+                    f'trainable={cell.temporal_raw.requires_grad}'
+                )
 
     def save_checkpoint(self, filename: str) -> None:
         super().save_checkpoint(filename)
@@ -127,6 +206,9 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
         if self.snn_config.use_fptt:
             state.update(fptt.export_fptt_tensors(self._get_adapter()))
         checkpoint["fptt_state"] = state
+        checkpoint['reproducibility'] = self.reproducibility
+        if self.snn_config.model_name == "paper_unet":
+            checkpoint["snn_config"] = self.snn_config.to_dict()
 
         directory = os.path.dirname(os.path.abspath(filename))
         descriptor, temporary = tempfile.mkstemp(prefix=".checkpoint-", suffix=".pth", dir=directory)
@@ -143,6 +225,23 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
             checkpoint = torch.load(filename_or_checkpoint, map_location="cpu", weights_only=False)
         else:
             checkpoint = filename_or_checkpoint
+        saved_plans = checkpoint.get("init_args", {}).get("plans", {})
+        saved_config = saved_plans.get("snn_config", {})
+        restored_policy = SNNConfig.from_plans(saved_plans)
+        for field in ('seed', 'deterministic', 'augmentation_workers'):
+            if getattr(restored_policy, field) != getattr(self.snn_config, field):
+                raise ValueError(f'Checkpoint {field} differs from the current reproducibility policy')
+        if self.snn_config.model_name == "paper_unet" or saved_config.get("model_name") == "paper_unet":
+            restored = SNNConfig.from_plans(saved_plans)
+            if (restored.model_name != self.snn_config.model_name or
+                    restored.bidirectional != self.snn_config.bidirectional or
+                    restored.bidirectional_fusion != self.snn_config.bidirectional_fusion or
+                    restored.model_kwargs != self.snn_config.model_kwargs or
+                    restored.temporal_axis != self.snn_config.temporal_axis):
+                raise ValueError("Checkpoint paper_unet architecture does not match current plans")
+            metadata = checkpoint.get("snn_config")
+            if metadata is not None and SNNConfig.from_plans({"snn_config": metadata}).to_dict() != restored.to_dict():
+                raise ValueError("Checkpoint paper_unet metadata differs from saved plans")
         state = checkpoint.get("fptt_state")
         if not isinstance(state, dict):
             raise ValueError("Checkpoint is missing fptt_state")
@@ -152,10 +251,6 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
         saved_kwargs = checkpoint.get("init_args", {}).get("plans", {}).get("snn_config", {}).get("model_kwargs", {})
         if saved_kwargs.get("neuron_model", "plif") != self.snn_config.model_kwargs.get("neuron_model", "plif"):
             raise ValueError("Checkpoint neuron_model does not match the current SNN plans; start a new run")
-        if self.snn_config.model_kwargs.get("neuron_model", "plif") == "silif":
-            from snn_nnunet.silif_config import silif_options
-            if silif_options(saved_kwargs.get("silif", {})) != silif_options(self.snn_config.model_kwargs.get("silif", {})):
-                raise ValueError("Checkpoint silif settings do not match the current SNN plans; start a new run")
         from snn_nnunet.recurrent_config import recurrent_options
         saved_recurrence = recurrent_options(saved_kwargs.get("recurrent_neuron"))
         current_recurrence = recurrent_options(self.snn_config.model_kwargs.get("recurrent_neuron"))
@@ -170,10 +265,21 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
             current = self.snn_config.model_kwargs.get(name, False)
             if type(saved) is not bool or saved != current:
                 raise ValueError(f"Checkpoint {name} does not match the current SNN plans; start a new run")
+        if not self.was_initialized:
+            self.initialize()
+        if any(named_selective_neurons(self._get_adapter())):
+            saved_groups = checkpoint['optimizer_state']['param_groups']
+            current_groups = self.optimizer.param_groups
+            if (len(saved_groups) != len(current_groups) or any(
+                    len(saved['params']) != len(current['params'])
+                    or saved['weight_decay'] != current['weight_decay']
+                    for saved, current in zip(saved_groups, current_groups))):
+                raise ValueError(
+                    'Checkpoint optimizer conflicts with the temporal regularization policy; '
+                    'start a new run instead of restoring this optimizer'
+                )
         restored_tensors = {}
         if self.snn_config.use_fptt:
-            if not self.was_initialized:
-                self.initialize()
             parameters = dict(self._get_adapter().named_parameters())
             for field in ("avg_weights", "lambdas"):
                 saved = state.get(field)
@@ -212,6 +318,7 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
             adapter = self._get_adapter()
             adapter.avg_weights = restored_tensors["avg_weights"]
             adapter.lambdas = restored_tensors["lambdas"]
+        self._check_temporal_regularization()
 
     def train_step(self, batch: dict) -> dict:
         data = batch["data"].to(self.device, non_blocking=True)
@@ -225,12 +332,12 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
         total_sum = 0.0
         updates = 0
         windows = 0
-        recurrent_cells = [(name, module) for name, module in adapter.named_modules()
-                           if isinstance(module, SelectiveMultiTimescaleLIF)]
+        recurrent_cells = list(named_selective_neurons(adapter))
         diagnostic_sums, diagnostic_counts = {}, {}
 
-        for t0 in range(0, length, config.k):
-            end = min(t0 + config.k, length)
+        window_size = length if config.bidirectional else config.k
+        for t0 in range(0, length, window_size):
+            end = min(t0 + window_size, length)
             window_length = end - t0
             data_window = slice_temporal_window(data, t0, end, axis)
             target_window = slice_temporal_window(target, t0, end, axis)
@@ -275,7 +382,8 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
                     diagnostic_sums[key] = diagnostic_sums.get(key, 0.) + value
                     diagnostic_counts[key] = diagnostic_counts.get(key, 0) + 1
             self._recurrent_window_count = window_index + 1
-            adapter.detach_states()
+            if not config.bidirectional:
+                adapter.detach_states()
             task_sum += float(task_loss.detach())
             regularization_sum += float(regularization.detach())
             total_sum += float(total_loss.detach())
@@ -298,7 +406,11 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
 
     def perform_actual_validation(self, save_probabilities: bool = False):
         """Use FP32 and consistent empty-region Dice before native metrics are logged."""
-        with native_fp32_predictor(), native_empty_dice_evaluation():
+        geometry = nullcontext()
+        if self.snn_config.model_name == "paper_unet":
+            from snn_nnunet.custom_full_validation import temporary_patch_size
+            geometry = temporary_patch_size(self.configuration_manager, self.snn_config.validation_patch_size)
+        with geometry, native_fp32_predictor(), native_empty_dice_evaluation():
             return super().perform_actual_validation(save_probabilities=save_probabilities)
 
     def validation_step(self, batch: dict) -> dict:
@@ -368,9 +480,49 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
         if anomalies:
             self.print_to_log_file("Recurrent neuron anomalies:", anomalies)
 
+    @torch.no_grad()
+    def _log_temporal_parameters(self):
+        """Snapshot actual epoch-end weights, independent of diagnostic cadence."""
+        if self.local_rank != 0:
+            return
+        store = self.logger.local_logger.my_fantastic_logging
+        for name, cell in named_selective_neurons(self._unwrapped_network()):
+            raw = cell.temporal_raw.detach().float()
+            coefficients = cell.temporal_coefficients()
+            tau = cell.temporal_time_constants()
+            # One small device-to-host transfer per cell, once per epoch.
+            stats = torch.stack([
+                reduction(value, dim=1)
+                for value in (raw, coefficients, tau)
+                for reduction in (torch.mean, torch.amin, torch.amax)
+            ]).cpu().tolist()
+            for i, compartment in enumerate(cell.compartment_names):
+                prefix = f'temporal/{name}/{compartment}'
+                values = {
+                    f'{prefix}/{quantity}/{stat}': stats[3*q+s][i]
+                    for q, quantity in enumerate(('raw', 'lambda', 'tau'))
+                    for s, stat in enumerate(('mean', 'min', 'max'))
+                }
+                delta = stats[3][i] - cell.config['lambda_init'][i]
+                values[f'{prefix}/lambda/delta_init_mean'] = delta
+                for key, value in values.items():
+                    history = store.setdefault(key, [])
+                    history.extend([float('nan')] * max(0, self.current_epoch - len(history)))
+                    self.logger.log(key, value, self.current_epoch)
+                self.print_to_log_file(
+                    f'Temporal parameters epoch {self.current_epoch + 1} {name}/{compartment}: '
+                    f'raw={stats[0][i]:.6f} [{stats[1][i]:.6f}, {stats[2][i]:.6f}] '
+                    f'lambda={stats[3][i]:.6f} [{stats[4][i]:.6f}, {stats[5][i]:.6f}] '
+                    f'delta_init={delta:+.6e} '
+                    f'tau={stats[6][i]:.4f} [{stats[7][i]:.4f}, {stats[8][i]:.4f}] slices '
+                    f'temporal_weight_decay={cell.config["temporal_weight_decay"]} '
+                    f'temporal_fptt_regularization={cell.config["temporal_fptt_regularization"]}'
+                )
+
     def on_train_epoch_end(self, train_outputs: list[dict]):
         if self.snn_config.use_fptt:
             fptt.reset_running_params(self._get_adapter())
+        self._log_temporal_parameters()
         # nnU-Net collates every key; nested recurrent diagnostics are aggregated below.
         super().on_train_epoch_end([{"loss": row["loss"]} for row in train_outputs])
         keys = ("task_loss", "fptt_regularization", "total_loss")

@@ -15,6 +15,17 @@ from snn_nnunet.recurrent_config import recurrent_options, initial_temporal_raw,
 from snn_nnunet.spike_neurons import PLIFNode
 
 
+def named_selective_neurons(network):
+    """Recognize cells across nnU-Net's external-module unload/reimport cycle.
+
+    Class identity is not stable after external trainer discovery cleans up
+    sys.modules. The cell's explicit capability marker survives that reload.
+    """
+    for name, module in network.named_modules():
+        if getattr(module, 'is_selective_memory', False):
+            yield name, module
+
+
 class BoundedDepthwiseConv(nn.Conv2d):
     """Train raw signed weights; normalize the *effective* operator every call."""
     def __init__(self, channels, config):
@@ -46,6 +57,7 @@ class SelectiveMultiTimescaleLIF(FP32Module):
     Transient memories are nonpersistent buffers, excluded from checkpoints.
     """
     is_spiking_layer = True
+    is_selective_memory = True
     state_names = ('fast_memory', 'medium_memory', 'slow_memory')
     compartment_names = ('fast', 'medium', 'slow')
 
@@ -101,9 +113,21 @@ class SelectiveMultiTimescaleLIF(FP32Module):
     def somatic_membrane(self):
         return getattr(self.soma, 'v', None)
 
+    def temporal_time_constants(self):
+        increments = F.softplus(self.temporal_raw.float())
+        if torch.are_deterministic_algorithms_enabled():
+            # PyTorch 2.5.1 rejects floating CUDA cumsum in strict mode,
+            # including its backward. The small compartment axis needs only
+            # ordered out-of-place additions, preserving the full gradient.
+            rows = increments.unbind(0)
+            prefixes = [rows[0]]
+            for row in rows[1:]:
+                prefixes.append(prefixes[-1] + row)
+            return torch.stack(prefixes, dim=0) + 1e-6
+        return increments.cumsum(0) + 1e-6
+
     def temporal_coefficients(self):
-        tau = F.softplus(self.temporal_raw.float()).cumsum(0) + 1e-6
-        return torch.exp(-tau.reciprocal())
+        return torch.exp(-self.temporal_time_constants().reciprocal())
 
     def mixing_coefficients(self):
         return self.eta_logits.float().sigmoid() if self.eta_logits is not None else None

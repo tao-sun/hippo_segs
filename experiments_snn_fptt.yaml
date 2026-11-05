@@ -7,7 +7,7 @@ val_fold: 1
 view: sagittal
 model: orig
 # model architecture
-neuron_model: plif  # plif or silif; existing spiking switches select active positions
+neuron_model: plif  # existing spiking switches select active positions
 hierarchical_encoder: true  # false reconstructs original Arch 2 / old checkpoints
 stem_depth: 1
 stem_spiking: true  # spiking neuron in each stem ConvBlock

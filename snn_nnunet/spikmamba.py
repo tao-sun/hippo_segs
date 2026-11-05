@@ -32,14 +32,14 @@ def _positive_int(name: str, value: int) -> int:
     return value
 
 
-def _make_neuron(init_tau, channels, channel_dim, neuron_model="plif", device=None, dtype=None, silif=None):
+def _make_neuron(init_tau, channels, channel_dim, neuron_model="plif", device=None, dtype=None):
     node = make_spiking_node(
         neuron_model,
         channels=channels,
         channel_dim=channel_dim,
         init_tau=init_tau,
         surrogate_function=surrogate.ATan(),
-        detach_reset=True, silif=silif,
+        detach_reset=True,
     )
     if device is not None or dtype is not None:
         node = node.to(device=device, dtype=dtype)
@@ -139,7 +139,6 @@ class SpikeMambaLayer(nn.Module):
         spatial_output_spiking: bool = False,  # Legacy compatibility only; SS2D has no output activation.
         dwconv2d_kernel_size: int = 3,
         neuron_model: str = "plif",
-        silif=None,
     ) -> None:
         super().__init__()
         self.dim = _positive_int("dim", dim)
@@ -157,8 +156,8 @@ class SpikeMambaLayer(nn.Module):
         self.linear_projection = linear_projection
         self.patch_embedding_spiking = patch_embedding_spiking
         self.dwconv2d_spiking = dwconv2d_spiking
-        if neuron_model not in ("plif", "silif"):
-            raise ValueError("neuron_model must be 'plif' or 'silif'")
+        if neuron_model != "plif":
+            raise ValueError("neuron_model must be 'plif'")
         self.neuron_model = neuron_model
         self.dwconv2d_kernel_size = _positive_int("dwconv2d_kernel_size", dwconv2d_kernel_size)
         if self.dwconv2d_kernel_size % 2 == 0:
@@ -191,7 +190,7 @@ class SpikeMambaLayer(nn.Module):
             self.linear_m = nn.Identity()
         self.patch_norm = nn.GroupNorm(1, self.d_inner, **kwargs)
         self.patch_sl = (
-            _make_neuron(init_tau, self.d_inner, -1, neuron_model, device=device, dtype=dtype, silif=silif)
+            _make_neuron(init_tau, self.d_inner, -1, neuron_model, device=device, dtype=dtype)
             if self.patch_embedding_spiking
             else nn.GELU()
         )
@@ -206,7 +205,7 @@ class SpikeMambaLayer(nn.Module):
         )
         self.dwconv2d_norm = nn.GroupNorm(1, self.d_inner, **kwargs)
         self.dwconv2d_sl = (
-            _make_neuron(init_tau, self.d_inner, 1, neuron_model, device=device, dtype=dtype, silif=silif)
+            _make_neuron(init_tau, self.d_inner, 1, neuron_model, device=device, dtype=dtype)
             if self.dwconv2d_spiking
             else nn.GELU()
         )
@@ -501,7 +500,6 @@ class TemporalSpikMamba(nn.Module):
         dwconv1D_spiking: bool = True,
         plif_enabled: Optional[bool] = None,
         neuron_model: str = "plif",
-        silif=None,
     ) -> None:
         super().__init__()
         self.dim = _positive_int("dim", dim)
@@ -530,13 +528,13 @@ class TemporalSpikMamba(nn.Module):
             raise NotImplementedError(f"unsupported dt_init={dt_init!r}")
 
         self.norm = nn.GroupNorm(1, self.dim)
-        self.norm_plif = _make_neuron(init_tau, self.dim, -1, neuron_model, silif=silif) if self.norm_spiking else nn.GELU()
+        self.norm_plif = _make_neuron(init_tau, self.dim, -1, neuron_model) if self.norm_spiking else nn.GELU()
         self.dwconv1d = nn.Conv1d(
             self.dim, self.dim, self.kernel_size, groups=self.dim,
             padding=0, bias=True,
         )
         self.conv_norm = nn.GroupNorm(1, self.dim)
-        self.conv_plif = _make_neuron(init_tau, self.dim, -1, neuron_model, silif=silif) if self.dwconv1D_spiking else nn.GELU()
+        self.conv_plif = _make_neuron(init_tau, self.dim, -1, neuron_model) if self.dwconv1D_spiking else nn.GELU()
         self.x_proj = nn.Linear(self.dim, self.dt_rank + 2 * self.d_state, bias=False)
         self.dt_proj_weight = nn.Parameter(torch.empty(self.dim, self.dt_rank))
         std = self.dt_rank ** -0.5 * dt_scale
@@ -684,7 +682,6 @@ class SpikMambaBlock(nn.Module):
                 norm_spiking=norm_spiking,
                 dwconv1D_spiking=dwconv1D_spiking,
                 neuron_model=mamba_kwargs.get("neuron_model", "plif"),
-                silif=mamba_kwargs.get("silif"),
             )
         else:
             self.temporal_mamba = None

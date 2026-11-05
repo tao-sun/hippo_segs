@@ -57,8 +57,6 @@ def _compatibility_config(plans: Mapping[str, Any]) -> dict[str, Any]:
     result["snn_config"] = _validated_config(result["snn_config"])
     result["snn_config"]["model_kwargs"].setdefault("spatial_output_spiking", False)
     result["snn_config"]["model_kwargs"].setdefault("neuron_model", "plif")
-    from snn_nnunet.silif_config import silif_options
-    result["snn_config"]["model_kwargs"].setdefault("silif", silif_options({}))
     result["snn_config"]["model_kwargs"].setdefault("dwconv2d_kernel_size", 3)
     result["snn_config"]["model_kwargs"].setdefault("downsample_strides", [2, 2, 2])
     result["snn_config"]["model_kwargs"].setdefault("decoder_block", "standard")
@@ -84,6 +82,8 @@ def derive_snn_plans(stock: Mapping[str, Any], snn_config: Mapping[str, Any]) ->
     result["configurations"]["3d_fullres"]["patch_size"] = [128, 128, 128]
     result["configurations"]["3d_fullres"]["batch_size"] = 2
     result["snn_config"] = _validated_config(snn_config)
+    if result['snn_config']['bidirectional']:
+        result['snn_config'] = SNNConfig.from_plans(result).to_dict()
     return result
 
 
@@ -189,6 +189,8 @@ def update_snn_config(
                 or any(type(value) is not int or value <= 0 for value in training_patch_size)):
             raise ValueError("training_patch_size must contain three positive integers")
         plans["configurations"]["3d_fullres"]["patch_size"] = list(training_patch_size)
+    if plans['snn_config']['bidirectional']:
+        plans['snn_config'] = SNNConfig.from_plans(plans).to_dict()
     if results_folder is not None:
         validate_results_compatibility(results_folder, plans)
     _atomic_write_json(plans_path, plans)

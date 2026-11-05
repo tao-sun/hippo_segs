@@ -180,8 +180,7 @@ position in the network:
 ~~~yaml
 snn:
   neurons:
-    model: plif                     # shared neuron type; plif or silif
-    silif: {}                       # SiLIF initialization options
+    model: plif                     # shared neuron type; plif
   stem:
     depth: 1
     channels: 32
@@ -274,7 +273,7 @@ without GELU, and disabled linear projections remain identities.
 Every GELU or spiking activation is preceded by `GroupNorm(1, C)`.
 Spatial Mamba now applies `input projection -> GN -> activation`,
 `DWConv2D -> GN -> activation`, and `SS2D fusion -> GN -> output projection`.
-There is no GELU, PLIF, or SiLIF between SS2D fusion/GN and output projection.
+There is no GELU or PLIF between SS2D fusion/GN and output projection.
 The legacy `spatial_output_spiking` model option, YAML
 `snn.spatial_mamba.output_spiking`, and CLI `--[no-]spatial-output-spiking`
 remain accepted for compatibility but have no effect. With Temporal Mamba
@@ -295,89 +294,12 @@ spiking activation with GELU also changes predictions, including for an
 omitted spiking option whose default is false.
 
 The generic switch names are `stem_spiking`, `downsampling_spiking`,
-`resdecoder_spiking1`, and `resdecoder_spiking2`, for either neuron model.
+`resdecoder_spiking1`, and `resdecoder_spiking2`, for PLIF neurons.
 Old `stem_plif`, `downsampling_plif`, `resdecoder_plif1`, and
 `resdecoder_plif2` names remain accepted aliases in configs, plans and CLI
 flags. Newly saved configurations use the generic names. Specify only one
 name for each switch; supplying both aliases is rejected. The rename
 preserves the configured values and checkpoint weight names.
-
-Set `snn.spatial_mamba.neuron_model: silif` to use real-valued SiLIF neurons
-instead of the default `plif`, for `variant: orig`. Existing switches
-(`stem_spiking`, `downsampling_spiking`, `patch_embedding_spiking`,
-`dwconv2d_spiking`, `output_spiking`, the ResDecoder/FUE switches, and the
-temporal neuron switches) still control whether each neuron is active.
-Selecting SiLIF alone does not enable any disabled position. For example:
-
-~~~yaml
-snn:
-  spatial_mamba:
-    neuron_model: silif
-    dwconv2d_spiking: true
-~~~
-
-This enables SiLIF after the spatial depthwise convolutions; other
-positions follow their configured switches. The CLI flag is
-`--neuron-model silif`; legacy experiment YAML uses top-level
-`neuron_model`. The choice is saved in plans/checkpoint config and changing
-it requires a fresh run. Old configs/checkpoints default to PLIF.
-
-SiLIF follows Algorithm 1 of [Fabre et al.](https://arxiv.org/abs/2506.06374):
-five trainable parameters per channel, log-parameterized membrane and
-adaptation rates and timestep, and feedback coefficients bounded to
-`a in [0,1]` and `b in [0,2]`. Defaults follow the authors' initialization:
-rate ranges `[10,250]` and `[2.5,10]`, with initial timestep `0.004`.
-`init_tau` remains a PLIF-only setting. This implementation adapts the
-neuron to sequential MRI inference: states start at zero, parameters are
-shared across spatial positions, and the existing ATan surrogate is used.
-The membrane reset path detaches the previous spike as in the project's
-PLIF integration; the adaptation feedback remains differentiable.
-All three states are detached at TBPTT boundaries and reset at a new volume
-or tile (`time_step=0`). Runtime states are omitted from checkpoints.
-
-SiLIF tuning is available in the launcher YAML under
-`snn.spatial_mamba.silif`. Omitted entries retain the defaults:
-
-~~~yaml
-snn:
-  spatial_mamba:
-    neuron_model: silif
-    silif:
-      v_threshold: 1.0
-      dt_init: 0.004
-      rate_u_range: [10.0, 250.0]
-      rate_w_range: [2.5, 10.0]
-      a_range: [0.0, 1.0]
-      b_range: [0.0, 2.0]
-      surrogate_alpha: 2.0
-      detach_reset: true
-~~~
-
-Both rate ranges are sampled uniformly in log space; `a_range` and `b_range`
-are sampled uniformly in linear space. Equal endpoints initialize a constant.
-Rates, timestep, and feedback coefficients are learned after initialization;
-the recurrence still clamps `a` to `[0,1]` and `b` to `[0,2]`. Threshold,
-surrogate slope, and reset detachment remain fixed. The membrane reset subtracts
-one previous spike regardless of the threshold. Invalid ranges and unknown
-keys fail before training. The same settings apply to all enabled SiLIF sites,
-including optional temporal, ResDecoder, and FUE neurons. PLIF ignores them.
-
-When `neuron_model: silif`, construction prints a `SiLIF configuration`
-block with every setting and the number of active neuron modules to stdout,
-including the SLURM `.out`. These are initialization settings, not measurements
-of learned parameters. Values are saved in plans/checkpoint metadata and used
-when rebuilding validation/inference models; old SiLIF runs use the original
-defaults. Start a fresh run when changing them. The direct CLI equivalent is
-`--silif '{"v_threshold": 0.8, "rate_u_range": [15, 375]}'`.
-
-For small-lesion experiments, change one factor per run: compare threshold
-`1.0` versus `0.8`, membrane initialization `[10,250]` versus `[15,375]`
-at fixed timestep, or weaker feedback ranges `[0,0.5]` and `[0,1]`.
-Compare raw lesion detection/recall and false positives before postprocessing;
-the custom validation's default component filters remove ET components below
-161 voxels and TC components below 166 voxels. A small-lesion improvement may
-therefore be lost after filtering. These are experimental starting points,
-not demonstrated improvements or a guarantee of matching a 3D U-Net.
 
 Set `snn.spatial_mamba.dwconv2d_kernel_size` to a positive odd integer
 (default `3`, for example `5` or `7`) to choose the spatial depthwise
@@ -593,3 +515,7 @@ SNN inference keeps the model forward pass, Gaussian blending weights, and
 sliding-window accumulation in FP32, including native full-volume validation.
 AMP is disabled inside inference, and non-finite logits raise an error before
 thresholding. No reduced-precision or quantized model conversion is applied.
+
+## Original paper U-Net
+
+Use `snn.variant: paper_unet` in [`unet_config.yaml`](unet_config.yaml) to run the original `main:model.py:SNNBraTS` graph through the existing nnU-Net pipeline, with PLIF or SelectiveMultiTimescaleLIF activations. See [configuration, commands and verification](PAPER_UNET.md).

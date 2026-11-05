@@ -11,6 +11,7 @@ from torch import Tensor, nn
 
 from snn_nnunet.model import ConvBlock, build_model, ARCHITECTURE_DEFAULTS, architecture_options
 from snn_nnunet.config_aliases import normalize_spiking_options
+from snn_nnunet.paper_config import normalize_bidirectional_fusion
 from snn_nnunet.precision import FP32Module, fp32_forward
 
 
@@ -39,6 +40,11 @@ _FIELDS = (
     "initial_lr",
     "validation_every",
     "validation_patch_size",
+    "seed",
+    "deterministic",
+    "augmentation_workers",
+    "bidirectional",
+    "bidirectional_fusion",
 )
 
 
@@ -111,6 +117,11 @@ class SNNConfig:
     initial_lr: float = 0.01
     validation_every: int = 0
     validation_patch_size: tuple[int, int, int] = (128, 128, 128)
+    seed: int = 42
+    deterministic: bool = False
+    augmentation_workers: int = 8
+    bidirectional: bool = False
+    bidirectional_fusion: str = 'conv_plif'
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "model_kwargs", MappingProxyType(dict(self.model_kwargs)))
@@ -127,67 +138,93 @@ class SNNConfig:
         data.setdefault("initial_lr", 0.01)
         data.setdefault("validation_every", 0)
         data.setdefault("validation_patch_size", (128, 128, 128))
+        data.setdefault("seed", 42)
+        data.setdefault("deterministic", False)
+        data.setdefault("augmentation_workers", 8)
+        data.setdefault("bidirectional", False)
+        if type(data['bidirectional']) is not bool:
+            raise ValueError('bidirectional must be boolean')
+        if data['bidirectional'] and data.get('model_name') != 'paper_unet':
+            raise ValueError('bidirectional requires model_name=paper_unet')
+        data['bidirectional_fusion'] = normalize_bidirectional_fusion(
+            data.get('bidirectional_fusion', 'conv_plif'), enabled=data['bidirectional'])
         _require_keys(data, _FIELDS, "snn_config")
+        from snn_nnunet.reproducibility import validate_policy
+        validate_policy(data['seed'], data['deterministic'], data['augmentation_workers'])
 
-        if data["model_name"] not in {"orig", "shallow", "medium", "deep"}:
-            raise ValueError("model_name must be orig, shallow, medium, or deep")
+        if data["model_name"] not in {"orig", "shallow", "medium", "deep", "paper_unet"}:
+            raise ValueError("model_name must be orig, shallow, medium, deep, or paper_unet")
         kwargs = data["model_kwargs"]
         if not isinstance(kwargs, Mapping):
             raise ValueError("model_kwargs must be a mapping")
-        kwargs = normalize_spiking_options(kwargs)
-        output_keys = tuple(name for name in _OUTPUT_SPIKING_KEYS if name in kwargs)
-        output_key = output_keys[0] if len(output_keys) == 1 else "output_spiking"
-        required_kwargs = set(_MODEL_KWARGS + (output_key,))
-        allowed_kwargs = required_kwargs | {"temporal_mamba", "spatial_output_spiking"} | ARCHITECTURE_DEFAULTS.keys()
-        missing = required_kwargs - kwargs.keys()
-        extra = kwargs.keys() - allowed_kwargs
-        if missing or extra:
-            details = []
-            if missing:
-                details.append(f"missing {', '.join(sorted(missing))}")
-            if extra:
-                details.append(f"unexpected {', '.join(sorted(extra))}")
-            raise ValueError(f"model_kwargs: {'; '.join(details)}")
-        if len(output_keys) != 1:
-            raise ValueError("model_kwargs must contain exactly one output_spiking or vss_output_spiking")
-        kwargs = dict(kwargs)
-        validated_architecture = architecture_options(kwargs)
-        for key in ARCHITECTURE_DEFAULTS:
-            if key in kwargs:
-                kwargs[key] = validated_architecture[key]
-        # Keep legacy serialized plans identical when the optional branch is absent.
-        if kwargs.get("recurrent_neuron") is None:
-            kwargs.pop("recurrent_neuron", None)
-        if kwargs.get("recurrent_neuron") is not None and data["model_name"] != "orig":
-            raise ValueError("recurrent_neuron requires model_name=orig")
-        if kwargs.get("decoder_block", "standard") != "standard" and data["model_name"] != "orig":
-            raise ValueError("decoder_block=resdecoder is supported only for model_name=orig")
-        if output_key == "vss_output_spiking":
-            # Normalize old plans to the general output switch.
-            kwargs["output_spiking"] = kwargs.pop("vss_output_spiking")
-        if "spatial_output_spiking" in kwargs and type(kwargs["spatial_output_spiking"]) is not bool:
-            raise ValueError("spatial_output_spiking must be a boolean")
-        if "temporal_mamba" in kwargs:
-            kwargs["temporal_mamba"] = _validate_temporal_mamba(kwargs["temporal_mamba"])
-            if kwargs["temporal_mamba"]["enabled"] and data["model_name"] != "orig":
-                raise ValueError("temporal_mamba.enabled=true is supported only for model_name=orig")
-        if any(kwargs.get(key, False) for key in ("fue_skip1", "fue_skip2")) and data["model_name"] != "orig":
-            raise ValueError("FUE skips are supported only for model_name=orig")
-        patch_size = kwargs["patch_size"]
-        if type(patch_size) is not int or patch_size <= 0:
-            raise ValueError("patch_size must be a positive integer")
-        for name in _MODEL_KWARGS[1:] + ("output_spiking",):
-            if type(kwargs[name]) is not bool:
-                raise ValueError(f"{name} must be a boolean")
-        if kwargs["input_skip"] and data["model_name"] != "orig":
-            raise ValueError("input_skip is supported only for model_name=orig")
-
+        if data["model_name"] == "paper_unet":
+            from snn_nnunet.paper_config import paper_options
+            kwargs = paper_options(kwargs)
+        else:
+            kwargs = normalize_spiking_options(kwargs)
+            output_keys = tuple(name for name in _OUTPUT_SPIKING_KEYS if name in kwargs)
+            output_key = output_keys[0] if len(output_keys) == 1 else "output_spiking"
+            required_kwargs = set(_MODEL_KWARGS + (output_key,))
+            allowed_kwargs = required_kwargs | {"temporal_mamba", "spatial_output_spiking"} | ARCHITECTURE_DEFAULTS.keys()
+            missing = required_kwargs - kwargs.keys()
+            extra = kwargs.keys() - allowed_kwargs
+            if missing or extra:
+                details = []
+                if missing:
+                    details.append(f"missing {', '.join(sorted(missing))}")
+                if extra:
+                    details.append(f"unexpected {', '.join(sorted(extra))}")
+                raise ValueError(f"model_kwargs: {'; '.join(details)}")
+            if len(output_keys) != 1:
+                raise ValueError("model_kwargs must contain exactly one output_spiking or vss_output_spiking")
+            kwargs = dict(kwargs)
+            validated_architecture = architecture_options(kwargs)
+            for key in ARCHITECTURE_DEFAULTS:
+                if key in kwargs:
+                    kwargs[key] = validated_architecture[key]
+            # Keep legacy serialized plans identical when the optional branch is absent.
+            if kwargs.get("recurrent_neuron") is None:
+                kwargs.pop("recurrent_neuron", None)
+            if kwargs.get("recurrent_neuron") is not None and data["model_name"] != "orig":
+                raise ValueError("recurrent_neuron requires model_name=orig")
+            if kwargs.get("decoder_block", "standard") != "standard" and data["model_name"] != "orig":
+                raise ValueError("decoder_block=resdecoder is supported only for model_name=orig")
+            if output_key == "vss_output_spiking":
+                # Normalize old plans to the general output switch.
+                kwargs["output_spiking"] = kwargs.pop("vss_output_spiking")
+            if "spatial_output_spiking" in kwargs and type(kwargs["spatial_output_spiking"]) is not bool:
+                raise ValueError("spatial_output_spiking must be a boolean")
+            if "temporal_mamba" in kwargs:
+                kwargs["temporal_mamba"] = _validate_temporal_mamba(kwargs["temporal_mamba"])
+                if kwargs["temporal_mamba"]["enabled"] and data["model_name"] != "orig":
+                    raise ValueError("temporal_mamba.enabled=true is supported only for model_name=orig")
+            if any(kwargs.get(key, False) for key in ("fue_skip1", "fue_skip2")) and data["model_name"] != "orig":
+                raise ValueError("FUE skips are supported only for model_name=orig")
+            patch_size = kwargs["patch_size"]
+            if type(patch_size) is not int or patch_size <= 0:
+                raise ValueError("patch_size must be a positive integer")
+            for name in _MODEL_KWARGS[1:] + ("output_spiking",):
+                if type(kwargs[name]) is not bool:
+                    raise ValueError(f"{name} must be a boolean")
+            if kwargs["input_skip"] and data["model_name"] != "orig":
+                raise ValueError("input_skip is supported only for model_name=orig")
         axis = data["temporal_axis"]
         if type(axis) is not int or axis not in (0, 1, 2):
             raise ValueError("temporal_axis must be 0, 1, or 2")
         k = data["k"]
         if type(k) is not int or k <= 0:
             raise ValueError("k must be a positive integer")
+        if data['bidirectional']:
+            data['use_fptt'] = False
+            patch = plans.get('configurations', {}).get('3d_fullres', {}).get('patch_size')
+            if patch is not None:
+                if len(patch) != 3 or any(type(n) is not int or n <= 0 for n in patch):
+                    raise ValueError('bidirectional training patch_size must contain three positive integers')
+                data['k'] = patch[axis]
+            if plans.get('image_reader_writer') == 'SimpleITKIO':
+                z_axis = plans.get('transpose_forward', [0, 1, 2]).index(0)
+                if axis != z_axis:
+                    raise ValueError('bidirectional temporal_axis must match anatomical Z in the preprocessed SimpleITK plans')
         if type(data["num_epochs"]) is not int or data["num_epochs"] <= 0:
             raise ValueError("num_epochs must be a positive integer")
         if type(data["validation_every"]) is not int or data["validation_every"] < 0:
@@ -234,11 +271,20 @@ class SNNConfig:
             "initial_lr": self.initial_lr,
             "validation_every": self.validation_every,
             "validation_patch_size": list(self.validation_patch_size),
+            "seed": self.seed,
+            "deterministic": self.deterministic,
+            "augmentation_workers": self.augmentation_workers,
+            "bidirectional": self.bidirectional,
+            "bidirectional_fusion": self.bidirectional_fusion,
         }
 
 
 def build_core(config: SNNConfig) -> nn.Module:
     kwargs = dict(config.model_kwargs)
+    if config.model_name == "paper_unet":
+        from snn_nnunet.paper_unet import PaperUNet
+        return PaperUNet(out_channels=config.num_output_channels, bidirectional=config.bidirectional,
+                         bidirectional_fusion=config.bidirectional_fusion, **kwargs)
     # Plans written before the hierarchical encoder existed describe the
     # original patch-embedding encoder; preserve that checkpoint architecture.
     kwargs.setdefault("hierarchical_encoder", False)
@@ -330,6 +376,10 @@ class SNNnnUNetAdapter(FP32Module):
         length = x.shape[2 + self.temporal_axis]
         if length == 0:
             raise ValueError("temporal dimension must be nonempty")
+        if self.config.bidirectional:
+            if t0 != 0 or (chunk_size is not None and size < length):
+                raise ValueError('bidirectional mode requires a whole patch, without continuation or truncated chunks')
+            return self.forward_window(x, t0=0)
 
         outputs = []
         for start in range(0, length, size):

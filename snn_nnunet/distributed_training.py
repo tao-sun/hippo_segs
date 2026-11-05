@@ -33,8 +33,6 @@ def main(argv=None):
         # Full-fold validation can take hours while the other ranks wait.
         dist.init_process_group('nccl', timeout=timedelta(hours=48))
     try:
-        torch.backends.cudnn.deterministic = False
-        torch.backends.cudnn.benchmark = True
         trainer = get_trainer_from_args(
             args.dataset_id, CONFIGURATION, args.fold, TRAINER, PLANS,
             args.continue_training, device=torch.device('cuda', local_rank),

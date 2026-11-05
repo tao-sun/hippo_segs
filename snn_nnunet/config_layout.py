@@ -7,7 +7,6 @@ from copy import deepcopy
 _LAYOUT = {
     'neurons': {
         'model': 'spatial_mamba.neuron_model',
-        'silif': 'spatial_mamba.silif',
     },
     'stem': {
         'depth': 'spatial_mamba.stem_depth',

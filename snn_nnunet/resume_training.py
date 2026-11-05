@@ -24,6 +24,8 @@ def extended_checkpoint(checkpoint: dict, epochs: int) -> dict:
         raise ValueError('Target epochs must be an integer at least the checkpoint epoch')
     result = deepcopy(checkpoint)
     result['init_args']['plans']['snn_config']['num_epochs'] = epochs
+    if 'snn_config' in result:
+        result['snn_config']['num_epochs'] = epochs
     return result
 
 
@@ -187,6 +189,8 @@ def _resume(run_dir: Path, epochs: int, fold: int, check_only: bool,
             '--checkpoint-name', 'checkpoint_final.pth',
             '--trainer', 'nnUNetTrainerSNNFPTT', '--plans', 'SNNPlans',
             '--configuration', '3d_fullres',
+            *(['--patch-size', *map(str, trainer.snn_config.validation_patch_size)]
+              if trainer.snn_config.model_name == 'paper_unet' else []),
         ])
 
 

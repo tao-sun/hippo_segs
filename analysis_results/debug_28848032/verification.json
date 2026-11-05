@@ -1,0 +1,46 @@
+{
+  "original_job": 28848032,
+  "original_stderr": "deleted by user; original traceback unavailable",
+  "known_failure": "PyTorch 2.5.1 cumsum_cuda_kernel rejects floating CUDA input when strict deterministic algorithms are enabled",
+  "fix": "Ordered out-of-place prefix additions over the compartment axis in strict mode; same time-constant helper used by coefficients and epoch logger; legacy nonstrict formula unchanged",
+  "gpu_test": {
+    "job_id": 28848614,
+    "result": "3 passed, 2 deselected",
+    "gpu": "NVIDIA A100-SXM4-40GB",
+    "torch": "2.5.1+cu124",
+    "batch": 2,
+    "patch": [
+      81,
+      128,
+      128
+    ],
+    "k": 81,
+    "use_fptt": false,
+    "bidirectional": false,
+    "deterministic": true,
+    "temporal_weight_decay": 0,
+    "train_loss": 0.19345027208328247,
+    "val_loss": 0.1933162808418274,
+    "peak_allocated_gib": 31.923532962799072,
+    "seconds_train_plus_validation": 6.734554103109986,
+    "checks": [
+      "old CUDA cumsum raises under strict determinism",
+      "corrected SSN temporal forward/backward",
+      "native external trainer discovery",
+      "one configured full-depth optimizer step",
+      "epoch-end temporal logging",
+      "native validation"
+    ],
+    "scope": "Synthetic first-batch smoke test, not full training or an accuracy/throughput benchmark",
+    "slurm_state": "COMPLETED; exit 0:0; node gcn57"
+  },
+  "source": "https://github.com/pytorch/pytorch/blob/v2.5.1/aten/src/ATen/native/cuda/ScanKernels.cpp#L81-L86",
+  "cpu_suite": {
+    "passed": 150,
+    "skipped_cuda_tests": 2,
+    "warnings": "4 existing SciPy/batchgenerators deprecations",
+    "seconds": 193.17
+  },
+  "retry_config": "/gpfs/home6/apiaghiardelli/hippo_segs/unet_config_retry_28848032.yaml",
+  "retry_run_dir": "/gpfs/scratch1/shared/apiaghiardelli/SNN_paper_unet_sel2_fold0_retry28848032"
+}

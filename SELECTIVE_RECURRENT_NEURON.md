@@ -13,9 +13,9 @@ output projection, without the GELU shown in the request's conceptual diagram.
 This feature preserves the implementation audited in this checkout. The original
 PLIFNode is composed as `cell.soma`: learned `w`, ATan surrogate, threshold 1,
 hard reset to zero, and `detach_reset=True` are reused without new reset equations.
-The global `neurons.model` still selects PLIF or SiLIF everywhere else, including
-the decoder. A globally SiLIF model can therefore use this cell's PLIF soma at VSS
-outputs while retaining SiLIF decoder neurons.
+The global `neurons.model` selects PLIF for the other enabled spiking positions,
+including the decoder. The selective spatial cell remains a separate option at
+VSS outputs and in the paper U-Net blocks.
 
 ## Configuration and experiment
 
@@ -182,6 +182,14 @@ FPTT remains the repository's actual algorithm:
 4. State graphs are detached, with values preserved.
 5. The original epoch-end `reset_running_params` copies averaged parameters.
 
+These steps are the default policy. Setting `temporal_fptt_regularization: false`
+in the selective neuron configuration exempts only `temporal_raw` from the FPTT
+regularizer, auxiliary updates and epoch-end copy. Pair it with
+`temporal_weight_decay: false` to learn memory coefficients only through the task
+loss. Auxiliary checkpoint tensors retain their complete shape/name layout;
+excluded entries are inert. Other cell parameters keep the default algorithm.
+Both options default to `true` for legacy runs and are checked on resume.
+
 When FPTT is disabled, the existing plain TBPTT path runs without these auxiliary
 parameter operations or regularizer. No special neuron hooks, manual parameter
 registration, or replacement of FPTT is introduced.
@@ -193,7 +201,7 @@ independent sequences, so their recurrence is reset before reprocessing shared
 voxels. Native Gaussian logit reconstruction and metrics remain unchanged.
 
 Native checkpoints still store all parameters and original FPTT auxiliary tensors.
-Strict baseline PLIF/SiLIF loading retains old key names. New-cell and baseline
+Strict baseline PLIF loading retains old key names. New-cell and baseline
 checkpoints are different architectures and cannot be interchanged. Trainer resume
 also compares recurrence settings (excluding diagnostic cadence) before loading.
 No old-to-new checkpoint transfer is implemented or requested.
@@ -229,7 +237,7 @@ OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 .venv/bin/python -m pytest -q
 
 Tests cover equations, initializations, constraints, all four ablations and all
 parameter families, AMP FP32 states, resets/offsets/short tails, all VSS counts,
-ordered Temporal Mamba sequence integration, PLIF/SiLIF strict checkpoint roundtrips,
+ordered Temporal Mamba sequence integration, PLIF strict checkpoint roundtrips,
 YAML/CLI/plans reconstruction, actual trainer FPTT and TBPTT steps with native
 BCE+Dice loss, logger serialization, and native overlapping Gaussian volume tiles.
 A separate CPU smoke test uses the actual Mamba `selective_scan_ref` with the
@@ -237,7 +245,7 @@ experiment widths `[64,128,256]`, `k=4`, native training loss and FPTT, followed
 inference; its synthetic spatial crop is reduced to `16x16`. Most CPU architecture tests inject a lightweight scan in place of the external
 CUDA scan; they do not validate that CUDA kernel. Two session-only tests compare
 pre-change audited model source, loading its baseline state_dict strictly and
-checking bit-identical logits for PLIF and SiLIF. They skip elsewhere if the audit
+checking bit-identical logits for PLIF. They skip elsewhere if the audit
 snapshot in /tmp is unavailable. These are synthetic checkpoints, not archived
 trained experiment checkpoints.
 
@@ -296,7 +304,7 @@ Verification on 2026-10-29:
   **147 passed, 1 skipped, 4 warnings in 31.52 s**. The skipped test is
   `test_actual_experiment_cuda_scan_fptt_amp_smoke`: CUDA unavailable.
 - Actual-width CPU reference SS2D + FPTT training and inference passed.
-- PLIF and SiLIF audit-snapshot baseline state_dict loading passed with bit-identical logits.
+- PLIF audit-snapshot baseline state_dict loading passed with bit-identical logits.
 - `python -m compileall -q` for the package and three new test modules: exit 0.
 - `git diff --check`: exit 0. CLI help exposes `--recurrent-neuron`.
 - Read-only independent code review completed. Its one Important finding was

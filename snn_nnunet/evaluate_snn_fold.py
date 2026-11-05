@@ -230,6 +230,17 @@ def _save_fold_summary(all_case_metrics, regions, summary_path):
     return summary
 
 
+def _validation_configuration(trainer):
+    """Use saved paper validation geometry while retaining training plans."""
+    config = getattr(trainer, "snn_config", None)
+    if getattr(config, "model_name", None) != "paper_unet":
+        return trainer.configuration_manager
+    from copy import deepcopy
+    result = deepcopy(trainer.configuration_manager)
+    result.configuration["patch_size"] = list(config.validation_patch_size)
+    return result
+
+
 def _run_native_validation(
     dataset_id: int, fold: int, run_dir: Path, *, best: bool, timestamp: str
 ) -> Path:
@@ -297,7 +308,7 @@ def _run_native_validation(
     predictor.manual_initialization(
         trainer.network,
         trainer.plans_manager,
-        trainer.configuration_manager,
+        _validation_configuration(trainer),
         None,
         trainer.dataset_json,
         trainer.__class__.__name__,
