@@ -37,6 +37,9 @@ _FIELDS = (
     "num_input_channels",
     "num_output_channels",
     "num_epochs",
+    "overfit_num_volumes",
+    "train_batches_per_epoch",
+    "val_batches_per_epoch",
     "initial_lr",
     "validation_every",
     "validation_patch_size",
@@ -114,6 +117,9 @@ class SNNConfig:
     num_input_channels: int
     num_output_channels: int
     num_epochs: int = 300
+    overfit_num_volumes: int = 0
+    train_batches_per_epoch: int = 250
+    val_batches_per_epoch: int = 50
     initial_lr: float = 0.01
     validation_every: int = 0
     validation_patch_size: tuple[int, int, int] = (128, 128, 128)
@@ -135,6 +141,11 @@ class SNNConfig:
             raise ValueError("snn_config must be a mapping")
         data = dict(data)
         data.setdefault("num_epochs", 300)
+        data.setdefault("overfit_num_volumes", 0)
+        if type(data["overfit_num_volumes"]) is not int or data["overfit_num_volumes"] < 0:
+            raise ValueError("overfit_num_volumes must be a nonnegative integer")
+        data.setdefault("train_batches_per_epoch", 250)
+        data.setdefault("val_batches_per_epoch", 50)
         data.setdefault("initial_lr", 0.01)
         data.setdefault("validation_every", 0)
         data.setdefault("validation_patch_size", (128, 128, 128))
@@ -160,6 +171,9 @@ class SNNConfig:
         if data["model_name"] == "paper_unet":
             from snn_nnunet.paper_config import paper_options
             kwargs = paper_options(kwargs)
+            from snn_nnunet.paper_config import validate_shared_soma_options
+            validate_shared_soma_options(
+                kwargs, enabled=data['bidirectional'], fusion=data['bidirectional_fusion'])
         else:
             kwargs = normalize_spiking_options(kwargs)
             output_keys = tuple(name for name in _OUTPUT_SPIKING_KEYS if name in kwargs)
@@ -225,6 +239,9 @@ class SNNConfig:
                 z_axis = plans.get('transpose_forward', [0, 1, 2]).index(0)
                 if axis != z_axis:
                     raise ValueError('bidirectional temporal_axis must match anatomical Z in the preprocessed SimpleITK plans')
+        for name in ("train_batches_per_epoch", "val_batches_per_epoch"):
+            if type(data[name]) is not int or data[name] <= 0:
+                raise ValueError(f"{name} must be a positive integer")
         if type(data["num_epochs"]) is not int or data["num_epochs"] <= 0:
             raise ValueError("num_epochs must be a positive integer")
         if type(data["validation_every"]) is not int or data["validation_every"] < 0:
@@ -268,6 +285,9 @@ class SNNConfig:
             "num_input_channels": self.num_input_channels,
             "num_output_channels": self.num_output_channels,
             "num_epochs": self.num_epochs,
+            "overfit_num_volumes": self.overfit_num_volumes,
+            "train_batches_per_epoch": self.train_batches_per_epoch,
+            "val_batches_per_epoch": self.val_batches_per_epoch,
             "initial_lr": self.initial_lr,
             "validation_every": self.validation_every,
             "validation_patch_size": list(self.validation_patch_size),
@@ -360,16 +380,25 @@ class SNNnnUNetAdapter(FP32Module):
             raise ValueError(f"expected {self.config.num_input_channels} input channels")
 
     @fp32_forward
-    def forward_window(self, window: Tensor, *, t0: int) -> Tensor:
+    def forward_window(self, window: Tensor, *, t0: int, return_auxiliary: bool = False):
         self._check_input(window)
         # fp32_forward rejects rounded inputs and disables any outer AMP context.
-        logits = self.core(to_core_layout(window, self.temporal_axis), t0=t0)
-        if logits.ndim != 5 or logits.shape[1] != self.config.num_output_channels:
-            raise ValueError(f"expected {self.config.num_output_channels} output channels")
-        return from_core_layout(logits, self.temporal_axis)
+        kwargs = {'return_auxiliary': True} if return_auxiliary else {}
+        logits = self.core(to_core_layout(window, self.temporal_axis), t0=t0, **kwargs)
+        outputs = logits if isinstance(logits, tuple) else (logits,)
+        for output in outputs:
+            if output.ndim != 5 or output.shape[1] != self.config.num_output_channels:
+                raise ValueError(f"expected {self.config.num_output_channels} output channels")
+        restored = tuple(from_core_layout(output, self.temporal_axis) for output in outputs)
+        return restored if isinstance(logits, tuple) else restored[0]
 
-    def forward(self, x: Tensor, *, t0: int = 0, chunk_size: int | None = None) -> Tensor:
+    def forward(self, x: Tensor, *, t0: int = 0, chunk_size: int | None = None,
+                return_auxiliary: bool = False):
         self._check_input(x)
+        if type(return_auxiliary) is not bool:
+            raise ValueError('return_auxiliary must be boolean')
+        if return_auxiliary and self.config.model_name != 'paper_unet':
+            raise ValueError('return_auxiliary is supported only for paper_unet')
         size = self.k if chunk_size is None else chunk_size
         if type(size) is not int or size <= 0:
             raise ValueError("chunk_size must be a positive integer")
@@ -379,13 +408,17 @@ class SNNnnUNetAdapter(FP32Module):
         if self.config.bidirectional:
             if t0 != 0 or (chunk_size is not None and size < length):
                 raise ValueError('bidirectional mode requires a whole patch, without continuation or truncated chunks')
-            return self.forward_window(x, t0=0)
+            return self.forward_window(x, t0=0, return_auxiliary=return_auxiliary)
 
         outputs = []
         for start in range(0, length, size):
             end = min(start + size, length)
             window = slice_temporal_window(x, start, end, self.temporal_axis)
-            outputs.append(self.forward_window(window, t0=t0 + start))
+            outputs.append(self.forward_window(window, t0=t0 + start,
+                                               return_auxiliary=return_auxiliary))
+        if return_auxiliary:
+            return tuple(torch.cat([output[head] for output in outputs], dim=2 + self.temporal_axis)
+                         for head in range(3))
         return torch.cat(outputs, dim=2 + self.temporal_axis)
 
     def detach_states(self) -> None:

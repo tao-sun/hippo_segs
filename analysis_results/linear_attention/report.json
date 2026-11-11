@@ -1,0 +1,1035 @@
+{
+  "torch": "2.5.1+cu124",
+  "cuda_available": false,
+  "experiment_config": "brats24_config.yaml",
+  "training_patch_zyx": [
+    128,
+    128,
+    128
+  ],
+  "primary_backbone": "orig",
+  "threads": 1,
+  "parameters": {
+    "baseline": {
+      "total": 2401586,
+      "trainable": 2401580
+    },
+    "attention": {
+      "total": 1999122,
+      "trainable": 1999116
+    }
+  },
+  "silif_blocks": [
+    {
+      "name": "conv_block1.spik_mamba.post_plif",
+      "channels": 64,
+      "shape_bzchw": [
+        1,
+        128,
+        64,
+        64,
+        64
+      ],
+      "baseline_continuous_cost": {
+        "spatial_depthwise_macs": 905969664,
+        "readout_gate_macs": 12884901888,
+        "memory_projection_macs": 2147483648,
+        "continuous_linear_macs": 15938355200,
+        "elementwise_multiplications": 503316480,
+        "elementwise_additions": 335544320,
+        "gate_bias_additions": 100663296,
+        "gate_sigmoid_elements": 100663296,
+        "ssn_spatial_update_sites": 524288
+      },
+      "attention_continuous_cost": {
+        "spatial_depthwise_macs": 905969664,
+        "readout_gate_macs": 0,
+        "memory_projection_macs": 2147483648,
+        "continuous_linear_macs": 13807648768,
+        "elementwise_multiplications": 402653184,
+        "elementwise_additions": 234881024,
+        "gate_bias_additions": 0,
+        "gate_sigmoid_elements": 0,
+        "ssn_spatial_update_sites": 524288,
+        "attention_projection_macs": 8589934592,
+        "attention_aggregation_macs": 1610612736,
+        "attention_retrieval_macs": 536870912,
+        "attention_normalization_dot_macs": 16777216,
+        "attention_kernel_elements": 67108864,
+        "attention_key_embedding_additions": 50331648,
+        "attention_key_reduction_additions_upper_bound": 50331648,
+        "attention_output_divisions": 16777216,
+        "attention_denominator_epsilon_additions": 524288
+      },
+      "readout_delta_macs": -2130706432,
+      "baseline_neuron_parameters": 30977,
+      "attention_neuron_parameters": 22689,
+      "readout_timings": {
+        "baseline": {
+          "inference": {
+            "device": "cpu",
+            "shape_bchw": [
+              1,
+              64,
+              16,
+              16
+            ],
+            "dtype": "float32",
+            "forward_backward": false,
+            "warmup": 2,
+            "repeats": 7,
+            "median_seconds": 0.000792559003457427,
+            "min_seconds": 0.0007693559891777113,
+            "max_seconds": 0.0008226350037148222,
+            "samples_per_second": 1261.73571385555,
+            "peak_gpu_allocated_bytes": null,
+            "peak_gpu_above_baseline_bytes": null,
+            "scope": "readout only; excludes memory updates, W_R, soma, backbone and optimizer; not training pipeline throughput"
+          },
+          "forward_backward": {
+            "device": "cpu",
+            "shape_bchw": [
+              1,
+              64,
+              16,
+              16
+            ],
+            "dtype": "float32",
+            "forward_backward": true,
+            "warmup": 2,
+            "repeats": 7,
+            "median_seconds": 0.002501519993529655,
+            "min_seconds": 0.0024917820119298995,
+            "max_seconds": 0.00265317500452511,
+            "samples_per_second": 399.7569488097498,
+            "peak_gpu_allocated_bytes": null,
+            "peak_gpu_above_baseline_bytes": null,
+            "scope": "readout only; excludes memory updates, W_R, soma, backbone and optimizer; not training pipeline throughput"
+          }
+        },
+        "attention": {
+          "inference": {
+            "device": "cpu",
+            "shape_bchw": [
+              1,
+              64,
+              16,
+              16
+            ],
+            "dtype": "float32",
+            "forward_backward": false,
+            "warmup": 2,
+            "repeats": 7,
+            "median_seconds": 0.0016182010003831238,
+            "min_seconds": 0.0016021800111047924,
+            "max_seconds": 0.0016752779920352623,
+            "samples_per_second": 617.9702025664556,
+            "peak_gpu_allocated_bytes": null,
+            "peak_gpu_above_baseline_bytes": null,
+            "scope": "readout only; excludes memory updates, W_R, soma, backbone and optimizer; not training pipeline throughput"
+          },
+          "forward_backward": {
+            "device": "cpu",
+            "shape_bchw": [
+              1,
+              64,
+              16,
+              16
+            ],
+            "dtype": "float32",
+            "forward_backward": true,
+            "warmup": 2,
+            "repeats": 7,
+            "median_seconds": 0.00492285899235867,
+            "min_seconds": 0.004879608997725882,
+            "max_seconds": 0.004940202008583583,
+            "samples_per_second": 203.13399216841555,
+            "peak_gpu_allocated_bytes": null,
+            "peak_gpu_above_baseline_bytes": null,
+            "scope": "readout only; excludes memory updates, W_R, soma, backbone and optimizer; not training pipeline throughput"
+          }
+        }
+      }
+    },
+    {
+      "name": "conv_block2.spik_mamba.post_plif",
+      "channels": 128,
+      "shape_bzchw": [
+        1,
+        128,
+        128,
+        32,
+        32
+      ],
+      "baseline_continuous_cost": {
+        "spatial_depthwise_macs": 452984832,
+        "readout_gate_macs": 12884901888,
+        "memory_projection_macs": 2147483648,
+        "continuous_linear_macs": 15485370368,
+        "elementwise_multiplications": 251658240,
+        "elementwise_additions": 167772160,
+        "gate_bias_additions": 50331648,
+        "gate_sigmoid_elements": 50331648,
+        "ssn_spatial_update_sites": 131072
+      },
+      "attention_continuous_cost": {
+        "spatial_depthwise_macs": 452984832,
+        "readout_gate_macs": 0,
+        "memory_projection_macs": 2147483648,
+        "continuous_linear_macs": 7436500992,
+        "elementwise_multiplications": 201326592,
+        "elementwise_additions": 117440512,
+        "gate_bias_additions": 0,
+        "gate_sigmoid_elements": 0,
+        "ssn_spatial_update_sites": 131072,
+        "attention_projection_macs": 4294967296,
+        "attention_aggregation_macs": 402653184,
+        "attention_retrieval_macs": 134217728,
+        "attention_normalization_dot_macs": 4194304,
+        "attention_kernel_elements": 16777216,
+        "attention_key_embedding_additions": 12582912,
+        "attention_key_reduction_additions_upper_bound": 12582912,
+        "attention_output_divisions": 4194304,
+        "attention_denominator_epsilon_additions": 131072
+      },
+      "readout_delta_macs": -8048869376,
+      "baseline_neuron_parameters": 119297,
+      "attention_neuron_parameters": 53473,
+      "readout_timings": {
+        "baseline": {
+          "inference": {
+            "device": "cpu",
+            "shape_bchw": [
+              1,
+              128,
+              16,
+              16
+            ],
+            "dtype": "float32",
+            "forward_backward": false,
+            "warmup": 2,
+            "repeats": 7,
+            "median_seconds": 0.0018380940018687397,
+            "min_seconds": 0.0018151010008295998,
+            "max_seconds": 0.0018595130095491186,
+            "samples_per_second": 544.0418166771271,
+            "peak_gpu_allocated_bytes": null,
+            "peak_gpu_above_baseline_bytes": null,
+            "scope": "readout only; excludes memory updates, W_R, soma, backbone and optimizer; not training pipeline throughput"
+          },
+          "forward_backward": {
+            "device": "cpu",
+            "shape_bchw": [
+              1,
+              128,
+              16,
+              16
+            ],
+            "dtype": "float32",
+            "forward_backward": true,
+            "warmup": 2,
+            "repeats": 7,
+            "median_seconds": 0.005722902991692536,
+            "min_seconds": 0.005694349994882941,
+            "max_seconds": 0.0059141120000276715,
+            "samples_per_second": 174.73649325379395,
+            "peak_gpu_allocated_bytes": null,
+            "peak_gpu_above_baseline_bytes": null,
+            "scope": "readout only; excludes memory updates, W_R, soma, backbone and optimizer; not training pipeline throughput"
+          }
+        },
+        "attention": {
+          "inference": {
+            "device": "cpu",
+            "shape_bchw": [
+              1,
+              128,
+              16,
+              16
+            ],
+            "dtype": "float32",
+            "forward_backward": false,
+            "warmup": 2,
+            "repeats": 7,
+            "median_seconds": 0.0019269999902462587,
+            "min_seconds": 0.0019223319977754727,
+            "max_seconds": 0.0019793489918811247,
+            "samples_per_second": 518.9413622530461,
+            "peak_gpu_allocated_bytes": null,
+            "peak_gpu_above_baseline_bytes": null,
+            "scope": "readout only; excludes memory updates, W_R, soma, backbone and optimizer; not training pipeline throughput"
+          },
+          "forward_backward": {
+            "device": "cpu",
+            "shape_bchw": [
+              1,
+              128,
+              16,
+              16
+            ],
+            "dtype": "float32",
+            "forward_backward": true,
+            "warmup": 2,
+            "repeats": 7,
+            "median_seconds": 0.005844081009854563,
+            "min_seconds": 0.005809285998111591,
+            "max_seconds": 0.006097277000662871,
+            "samples_per_second": 171.11330221359924,
+            "peak_gpu_allocated_bytes": null,
+            "peak_gpu_above_baseline_bytes": null,
+            "scope": "readout only; excludes memory updates, W_R, soma, backbone and optimizer; not training pipeline throughput"
+          }
+        }
+      }
+    },
+    {
+      "name": "conv_block3.spik_mamba.post_plif",
+      "channels": 256,
+      "shape_bzchw": [
+        1,
+        128,
+        256,
+        16,
+        16
+      ],
+      "baseline_continuous_cost": {
+        "spatial_depthwise_macs": 226492416,
+        "readout_gate_macs": 12884901888,
+        "memory_projection_macs": 2147483648,
+        "continuous_linear_macs": 15258877952,
+        "elementwise_multiplications": 125829120,
+        "elementwise_additions": 83886080,
+        "gate_bias_additions": 25165824,
+        "gate_sigmoid_elements": 25165824,
+        "ssn_spatial_update_sites": 32768
+      },
+      "attention_continuous_cost": {
+        "spatial_depthwise_macs": 226492416,
+        "readout_gate_macs": 0,
+        "memory_projection_macs": 2147483648,
+        "continuous_linear_macs": 4656726016,
+        "elementwise_multiplications": 100663296,
+        "elementwise_additions": 58720256,
+        "gate_bias_additions": 0,
+        "gate_sigmoid_elements": 0,
+        "ssn_spatial_update_sites": 32768,
+        "attention_projection_macs": 2147483648,
+        "attention_aggregation_macs": 100663296,
+        "attention_retrieval_macs": 33554432,
+        "attention_normalization_dot_macs": 1048576,
+        "attention_kernel_elements": 4194304,
+        "attention_key_embedding_additions": 3145728,
+        "attention_key_reduction_additions_upper_bound": 3145728,
+        "attention_output_divisions": 1048576,
+        "attention_denominator_epsilon_additions": 32768
+      },
+      "readout_delta_macs": -10602151936,
+      "baseline_neuron_parameters": 467969,
+      "attention_neuron_parameters": 139617,
+      "readout_timings": {
+        "baseline": {
+          "inference": {
+            "device": "cpu",
+            "shape_bchw": [
+              1,
+              256,
+              16,
+              16
+            ],
+            "dtype": "float32",
+            "forward_backward": false,
+            "warmup": 2,
+            "repeats": 7,
+            "median_seconds": 0.005736138002248481,
+            "min_seconds": 0.005661326998961158,
+            "max_seconds": 0.0058206660032738,
+            "samples_per_second": 174.3333231536645,
+            "peak_gpu_allocated_bytes": null,
+            "peak_gpu_above_baseline_bytes": null,
+            "scope": "readout only; excludes memory updates, W_R, soma, backbone and optimizer; not training pipeline throughput"
+          },
+          "forward_backward": {
+            "device": "cpu",
+            "shape_bchw": [
+              1,
+              256,
+              16,
+              16
+            ],
+            "dtype": "float32",
+            "forward_backward": true,
+            "warmup": 2,
+            "repeats": 7,
+            "median_seconds": 0.01732530299341306,
+            "min_seconds": 0.016831885994179174,
+            "max_seconds": 0.01900834499974735,
+            "samples_per_second": 57.71904828332248,
+            "peak_gpu_allocated_bytes": null,
+            "peak_gpu_above_baseline_bytes": null,
+            "scope": "readout only; excludes memory updates, W_R, soma, backbone and optimizer; not training pipeline throughput"
+          }
+        },
+        "attention": {
+          "inference": {
+            "device": "cpu",
+            "shape_bchw": [
+              1,
+              256,
+              16,
+              16
+            ],
+            "dtype": "float32",
+            "forward_backward": false,
+            "warmup": 2,
+            "repeats": 7,
+            "median_seconds": 0.002078605000860989,
+            "min_seconds": 0.002070610993541777,
+            "max_seconds": 0.00209897400054615,
+            "samples_per_second": 481.0918859455188,
+            "peak_gpu_allocated_bytes": null,
+            "peak_gpu_above_baseline_bytes": null,
+            "scope": "readout only; excludes memory updates, W_R, soma, backbone and optimizer; not training pipeline throughput"
+          },
+          "forward_backward": {
+            "device": "cpu",
+            "shape_bchw": [
+              1,
+              256,
+              16,
+              16
+            ],
+            "dtype": "float32",
+            "forward_backward": true,
+            "warmup": 2,
+            "repeats": 7,
+            "median_seconds": 0.009203623005305417,
+            "min_seconds": 0.008846351993270218,
+            "max_seconds": 0.017031841998687014,
+            "samples_per_second": 108.65286414095311,
+            "peak_gpu_allocated_bytes": null,
+            "peak_gpu_above_baseline_bytes": null,
+            "scope": "readout only; excludes memory updates, W_R, soma, backbone and optimizer; not training pipeline throughput"
+          }
+        }
+      }
+    }
+  ],
+  "primary_neuron_continuous_GMAC": {
+    "baseline": 46.68260352,
+    "attention": 25.900875776
+  },
+  "primary_whole_network_continuous_GMAC": "unmeasured: Mamba/SS2D and complete backbone work not estimated by this readout ledger",
+  "primary_whole_network_spike_GAC": "unmeasured: requires per-layer input activity and scaled-dropout classification; no new spike synapses added",
+  "primary_readout_spike_GAC": 0,
+  "full_volume_inference": "unmeasured: no real MRI/predictor/GPU benchmark executed",
+  "full_training_throughput": "unmeasured: readout-only forward/backward timing is reported separately",
+  "peak_full_model_gpu_memory": "unmeasured: no full-model GPU benchmark executed",
+  "auxiliary_paper_unet": {
+    "baseline": {
+      "parameters": 1302348,
+      "continuous_GMAC": 32.073449472,
+      "spike_driven_GAC_at_unit_activity": 381.696344064,
+      "scope": "auxiliary unidirectional paper_unet, B=1,Z81,H=W128, encoder SiLIF and decoder PLIF; theoretical binary event upper bound at evaluation, not measured energy",
+      "ledger": {
+        "shape_zyx": [
+          81,
+          128,
+          128
+        ],
+        "padded_shape_zyx": [
+          81,
+          128,
+          128
+        ],
+        "batch": 1,
+        "bidirectional": false,
+        "bidirectional_fusion": null,
+        "binary_or_comparisons": 0,
+        "actual_parameters": 1302348,
+        "parameter_formula": 1302348,
+        "dense_equivalent_macs": 413769793536,
+        "continuous_input_macs": 1528823808,
+        "continuous_ssn_linear_macs": 30544625664,
+        "spike_eligible_dense_macs": 381696344064,
+        "theoretical_ac_at_unit_activity": 381696344064,
+        "theoretical_ac_at_10_percent_activity": 38169634406.4,
+        "ssn_elementwise_multiplications": 1114767360,
+        "ssn_elementwise_additions": 743178240,
+        "plif_update_elements_including_continuous_head": 577290240,
+        "layers": [
+          {
+            "name": "conv_block1",
+            "kind": "continuous_input",
+            "macs": 1528823808,
+            "input_bchw": [
+              1,
+              4,
+              128,
+              128
+            ],
+            "output_hw": [
+              128,
+              128
+            ],
+            "convolution_calls": 81,
+            "neuron_calls": 81
+          },
+          {
+            "name": "conv_block2",
+            "kind": "spike_eligible",
+            "macs": 6115295232,
+            "input_bchw": [
+              1,
+              32,
+              64,
+              64
+            ],
+            "output_hw": [
+              64,
+              64
+            ],
+            "convolution_calls": 81,
+            "neuron_calls": 81
+          },
+          {
+            "name": "conv_block3",
+            "kind": "spike_eligible",
+            "macs": 6115295232,
+            "input_bchw": [
+              1,
+              64,
+              32,
+              32
+            ],
+            "output_hw": [
+              32,
+              32
+            ],
+            "convolution_calls": 81,
+            "neuron_calls": 81
+          },
+          {
+            "name": "deconv_block1",
+            "kind": "spike_eligible",
+            "macs": 1358954496,
+            "input_bchw": [
+              1,
+              128,
+              16,
+              16
+            ],
+            "output_hw": [
+              32,
+              32
+            ],
+            "convolution_calls": 81,
+            "neuron_calls": 81
+          },
+          {
+            "name": "deconv1_conv",
+            "kind": "spike_eligible",
+            "macs": 12230590464,
+            "input_bchw": [
+              1,
+              128,
+              32,
+              32
+            ],
+            "output_hw": [
+              32,
+              32
+            ],
+            "convolution_calls": 81,
+            "neuron_calls": 81
+          },
+          {
+            "name": "concat1_conv",
+            "kind": "spike_eligible",
+            "macs": 18345885696,
+            "input_bchw": [
+              1,
+              192,
+              32,
+              32
+            ],
+            "output_hw": [
+              32,
+              32
+            ],
+            "convolution_calls": 81,
+            "neuron_calls": 81
+          },
+          {
+            "name": "deconv_block2",
+            "kind": "spike_eligible",
+            "macs": 5435817984,
+            "input_bchw": [
+              1,
+              128,
+              32,
+              32
+            ],
+            "output_hw": [
+              64,
+              64
+            ],
+            "convolution_calls": 81,
+            "neuron_calls": 81
+          },
+          {
+            "name": "deconv2_conv",
+            "kind": "spike_eligible",
+            "macs": 48922361856,
+            "input_bchw": [
+              1,
+              128,
+              64,
+              64
+            ],
+            "output_hw": [
+              64,
+              64
+            ],
+            "convolution_calls": 81,
+            "neuron_calls": 81
+          },
+          {
+            "name": "concat2_conv",
+            "kind": "spike_eligible",
+            "macs": 61152952320,
+            "input_bchw": [
+              1,
+              160,
+              64,
+              64
+            ],
+            "output_hw": [
+              64,
+              64
+            ],
+            "convolution_calls": 81,
+            "neuron_calls": 81
+          },
+          {
+            "name": "deconv_block3",
+            "kind": "spike_eligible",
+            "macs": 21743271936,
+            "input_bchw": [
+              1,
+              128,
+              64,
+              64
+            ],
+            "output_hw": [
+              128,
+              128
+            ],
+            "convolution_calls": 81,
+            "neuron_calls": 81
+          },
+          {
+            "name": "deconv3_conv",
+            "kind": "spike_eligible",
+            "macs": 195689447424,
+            "input_bchw": [
+              1,
+              128,
+              128,
+              128
+            ],
+            "output_hw": [
+              128,
+              128
+            ],
+            "convolution_calls": 81,
+            "neuron_calls": 81
+          },
+          {
+            "name": "class_conv",
+            "kind": "spike_eligible",
+            "macs": 4586471424,
+            "input_bchw": [
+              1,
+              128,
+              128,
+              128
+            ],
+            "output_hw": [
+              128,
+              128
+            ],
+            "convolution_calls": 81,
+            "neuron_calls": 81
+          }
+        ],
+        "ssn": [
+          {
+            "name": "conv_block1",
+            "directional_repeats": 1,
+            "ssn_calls": 81,
+            "spatial_depthwise_macs": 1146617856,
+            "readout_gate_macs": 8153726976,
+            "memory_projection_macs": 1358954496,
+            "continuous_linear_macs": 10659299328,
+            "elementwise_multiplications": 637009920,
+            "elementwise_additions": 424673280,
+            "gate_bias_additions": 127401984,
+            "gate_sigmoid_elements": 127401984,
+            "ssn_spatial_update_sites": 1327104
+          },
+          {
+            "name": "conv_block2",
+            "directional_repeats": 1,
+            "ssn_calls": 81,
+            "spatial_depthwise_macs": 573308928,
+            "readout_gate_macs": 8153726976,
+            "memory_projection_macs": 1358954496,
+            "continuous_linear_macs": 10085990400,
+            "elementwise_multiplications": 318504960,
+            "elementwise_additions": 212336640,
+            "gate_bias_additions": 63700992,
+            "gate_sigmoid_elements": 63700992,
+            "ssn_spatial_update_sites": 331776
+          },
+          {
+            "name": "conv_block3",
+            "directional_repeats": 1,
+            "ssn_calls": 81,
+            "spatial_depthwise_macs": 286654464,
+            "readout_gate_macs": 8153726976,
+            "memory_projection_macs": 1358954496,
+            "continuous_linear_macs": 9799335936,
+            "elementwise_multiplications": 159252480,
+            "elementwise_additions": 106168320,
+            "gate_bias_additions": 31850496,
+            "gate_sigmoid_elements": 31850496,
+            "ssn_spatial_update_sites": 82944
+          }
+        ],
+        "scope": "forward only; batch=2 is training forward, excludes backward/optimizer"
+      }
+    },
+    "attention": {
+      "parameters": 1230284,
+      "continuous_GMAC": 33.82788096,
+      "spike_driven_GAC_at_unit_activity": 381.696344064,
+      "scope": "auxiliary unidirectional paper_unet, B=1,Z81,H=W128, encoder SiLIF and decoder PLIF; theoretical binary event upper bound at evaluation, not measured energy",
+      "ledger": {
+        "shape_zyx": [
+          81,
+          128,
+          128
+        ],
+        "padded_shape_zyx": [
+          81,
+          128,
+          128
+        ],
+        "batch": 1,
+        "bidirectional": false,
+        "bidirectional_fusion": null,
+        "binary_or_comparisons": 0,
+        "actual_parameters": 1230284,
+        "parameter_formula": 1230284,
+        "dense_equivalent_macs": 415524225024,
+        "continuous_input_macs": 1528823808,
+        "continuous_ssn_linear_macs": 32299057152,
+        "spike_eligible_dense_macs": 381696344064,
+        "theoretical_ac_at_unit_activity": 381696344064,
+        "theoretical_ac_at_10_percent_activity": 38169634406.4,
+        "ssn_elementwise_multiplications": 891813888,
+        "ssn_elementwise_additions": 520224768,
+        "plif_update_elements_including_continuous_head": 577290240,
+        "layers": [
+          {
+            "name": "conv_block1",
+            "kind": "continuous_input",
+            "macs": 1528823808,
+            "input_bchw": [
+              1,
+              4,
+              128,
+              128
+            ],
+            "output_hw": [
+              128,
+              128
+            ],
+            "convolution_calls": 81,
+            "neuron_calls": 81
+          },
+          {
+            "name": "conv_block2",
+            "kind": "spike_eligible",
+            "macs": 6115295232,
+            "input_bchw": [
+              1,
+              32,
+              64,
+              64
+            ],
+            "output_hw": [
+              64,
+              64
+            ],
+            "convolution_calls": 81,
+            "neuron_calls": 81
+          },
+          {
+            "name": "conv_block3",
+            "kind": "spike_eligible",
+            "macs": 6115295232,
+            "input_bchw": [
+              1,
+              64,
+              32,
+              32
+            ],
+            "output_hw": [
+              32,
+              32
+            ],
+            "convolution_calls": 81,
+            "neuron_calls": 81
+          },
+          {
+            "name": "deconv_block1",
+            "kind": "spike_eligible",
+            "macs": 1358954496,
+            "input_bchw": [
+              1,
+              128,
+              16,
+              16
+            ],
+            "output_hw": [
+              32,
+              32
+            ],
+            "convolution_calls": 81,
+            "neuron_calls": 81
+          },
+          {
+            "name": "deconv1_conv",
+            "kind": "spike_eligible",
+            "macs": 12230590464,
+            "input_bchw": [
+              1,
+              128,
+              32,
+              32
+            ],
+            "output_hw": [
+              32,
+              32
+            ],
+            "convolution_calls": 81,
+            "neuron_calls": 81
+          },
+          {
+            "name": "concat1_conv",
+            "kind": "spike_eligible",
+            "macs": 18345885696,
+            "input_bchw": [
+              1,
+              192,
+              32,
+              32
+            ],
+            "output_hw": [
+              32,
+              32
+            ],
+            "convolution_calls": 81,
+            "neuron_calls": 81
+          },
+          {
+            "name": "deconv_block2",
+            "kind": "spike_eligible",
+            "macs": 5435817984,
+            "input_bchw": [
+              1,
+              128,
+              32,
+              32
+            ],
+            "output_hw": [
+              64,
+              64
+            ],
+            "convolution_calls": 81,
+            "neuron_calls": 81
+          },
+          {
+            "name": "deconv2_conv",
+            "kind": "spike_eligible",
+            "macs": 48922361856,
+            "input_bchw": [
+              1,
+              128,
+              64,
+              64
+            ],
+            "output_hw": [
+              64,
+              64
+            ],
+            "convolution_calls": 81,
+            "neuron_calls": 81
+          },
+          {
+            "name": "concat2_conv",
+            "kind": "spike_eligible",
+            "macs": 61152952320,
+            "input_bchw": [
+              1,
+              160,
+              64,
+              64
+            ],
+            "output_hw": [
+              64,
+              64
+            ],
+            "convolution_calls": 81,
+            "neuron_calls": 81
+          },
+          {
+            "name": "deconv_block3",
+            "kind": "spike_eligible",
+            "macs": 21743271936,
+            "input_bchw": [
+              1,
+              128,
+              64,
+              64
+            ],
+            "output_hw": [
+              128,
+              128
+            ],
+            "convolution_calls": 81,
+            "neuron_calls": 81
+          },
+          {
+            "name": "deconv3_conv",
+            "kind": "spike_eligible",
+            "macs": 195689447424,
+            "input_bchw": [
+              1,
+              128,
+              128,
+              128
+            ],
+            "output_hw": [
+              128,
+              128
+            ],
+            "convolution_calls": 81,
+            "neuron_calls": 81
+          },
+          {
+            "name": "class_conv",
+            "kind": "spike_eligible",
+            "macs": 4586471424,
+            "input_bchw": [
+              1,
+              128,
+              128,
+              128
+            ],
+            "output_hw": [
+              128,
+              128
+            ],
+            "convolution_calls": 81,
+            "neuron_calls": 81
+          }
+        ],
+        "ssn": [
+          {
+            "name": "conv_block1",
+            "directional_repeats": 1,
+            "ssn_calls": 81,
+            "spatial_depthwise_macs": 1146617856,
+            "readout_gate_macs": 0,
+            "memory_projection_macs": 1358954496,
+            "continuous_linear_macs": 18855493632,
+            "elementwise_multiplications": 509607936,
+            "elementwise_additions": 297271296,
+            "gate_bias_additions": 0,
+            "gate_sigmoid_elements": 0,
+            "ssn_spatial_update_sites": 1327104,
+            "attention_projection_macs": 10871635968,
+            "attention_aggregation_macs": 4076863488,
+            "attention_retrieval_macs": 1358954496,
+            "attention_normalization_dot_macs": 42467328,
+            "attention_kernel_elements": 169869312,
+            "attention_key_embedding_additions": 127401984,
+            "attention_key_reduction_additions_upper_bound": 127401984,
+            "attention_output_divisions": 42467328,
+            "attention_denominator_epsilon_additions": 1327104
+          },
+          {
+            "name": "conv_block2",
+            "directional_repeats": 1,
+            "ssn_calls": 81,
+            "spatial_depthwise_macs": 573308928,
+            "readout_gate_macs": 0,
+            "memory_projection_macs": 1358954496,
+            "continuous_linear_macs": 8737652736,
+            "elementwise_multiplications": 254803968,
+            "elementwise_additions": 148635648,
+            "gate_bias_additions": 0,
+            "gate_sigmoid_elements": 0,
+            "ssn_spatial_update_sites": 331776,
+            "attention_projection_macs": 5435817984,
+            "attention_aggregation_macs": 1019215872,
+            "attention_retrieval_macs": 339738624,
+            "attention_normalization_dot_macs": 10616832,
+            "attention_kernel_elements": 42467328,
+            "attention_key_embedding_additions": 31850496,
+            "attention_key_reduction_additions_upper_bound": 31850496,
+            "attention_output_divisions": 10616832,
+            "attention_denominator_epsilon_additions": 331776
+          },
+          {
+            "name": "conv_block3",
+            "directional_repeats": 1,
+            "ssn_calls": 81,
+            "spatial_depthwise_macs": 286654464,
+            "readout_gate_macs": 0,
+            "memory_projection_macs": 1358954496,
+            "continuous_linear_macs": 4705910784,
+            "elementwise_multiplications": 127401984,
+            "elementwise_additions": 74317824,
+            "gate_bias_additions": 0,
+            "gate_sigmoid_elements": 0,
+            "ssn_spatial_update_sites": 82944,
+            "attention_projection_macs": 2717908992,
+            "attention_aggregation_macs": 254803968,
+            "attention_retrieval_macs": 84934656,
+            "attention_normalization_dot_macs": 2654208,
+            "attention_kernel_elements": 10616832,
+            "attention_key_embedding_additions": 7962624,
+            "attention_key_reduction_additions_upper_bound": 7962624,
+            "attention_output_divisions": 2654208,
+            "attention_denominator_epsilon_additions": 82944
+          }
+        ],
+        "scope": "forward only; batch=2 is training forward, excludes backward/optimizer"
+      }
+    }
+  },
+  "count_convention": "one MAC=one multiply-accumulate; Q/K/V/O and attention statistics/retrieval/normalizer, spatial mixing and W_R are continuous MACs; binary-input synapses are potential ACs at evaluation; inverted dropout-scaled inputs require continuous/scaled arithmetic",
+  "elementwise_scope": "partial tensor-site counts, not complete scalar FLOPs; cross-memory statistic/vector additions and the internal ELU+1 arithmetic are not individually itemized",
+  "exclusions": [
+    "normalization",
+    "PLIF threshold/reset/surrogate",
+    "coefficient functions",
+    "kernel normalization",
+    "biases and scalar arithmetic (separate fields where available)",
+    "backward/optimizer in forward MAC tables"
+  ],
+  "accuracy": "No new training or accuracy experiment performed."
+}

@@ -1,0 +1,333 @@
+{
+  "date": "2026-11-11",
+  "scope": "Model and pipeline read-only; analysis artifacts only",
+  "reference_branch": "nnUnet_alignment",
+  "reference_commit": "e58768c64c51e73924dc1083b4ab5407ca0e1769",
+  "paper": {
+    "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC12808724/",
+    "confirmed_by_user": true,
+    "brats2024_mean": 0.8534,
+    "protocol": "Patient-level five-fold CV; 128^3 training crops; reported experiments batch 4 and 300 epochs; inference 96^3, overlap 50%, Gaussian blending, CCA and closing.",
+    "unreported_details": [
+      "Exact fold identifiers",
+      "Baseline-specific saved plans",
+      "Empty-region averaging policy",
+      "Exact TC mask (prose ambiguous)",
+      "CCA thresholds and morphology kernel"
+    ]
+  },
+  "historical_run": {
+    "raw_mean": 0.784477,
+    "postprocessed_mean": 0.815342,
+    "gap_to_paper": 0.038058000000000036,
+    "postprocessing_gain": 0.03086500000000003,
+    "fold": 0,
+    "n_cases": 270,
+    "configuration": {
+      "data_identifier": "nnUNetPlans_3d_fullres",
+      "preprocessor_name": "DefaultPreprocessor",
+      "batch_size": 2,
+      "patch_size": [
+        128,
+        160,
+        112
+      ],
+      "median_image_size_in_voxels": [
+        142.0,
+        175.0,
+        136.0
+      ],
+      "spacing": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "normalization_schemes": [
+        "ZScoreNormalization",
+        "ZScoreNormalization",
+        "ZScoreNormalization",
+        "ZScoreNormalization"
+      ],
+      "use_mask_for_norm": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "resampling_fn_data": "resample_data_or_seg_to_shape",
+      "resampling_fn_seg": "resample_data_or_seg_to_shape",
+      "resampling_fn_data_kwargs": {
+        "is_seg": false,
+        "order": 3,
+        "order_z": 0,
+        "force_separate_z": null
+      },
+      "resampling_fn_seg_kwargs": {
+        "is_seg": true,
+        "order": 1,
+        "order_z": 0,
+        "force_separate_z": null
+      },
+      "resampling_fn_probabilities": "resample_data_or_seg_to_shape",
+      "resampling_fn_probabilities_kwargs": {
+        "is_seg": false,
+        "order": 1,
+        "order_z": 0,
+        "force_separate_z": null
+      },
+      "architecture": {
+        "network_class_name": "dynamic_network_architectures.architectures.unet.PlainConvUNet",
+        "arch_kwargs": {
+          "n_stages": 6,
+          "features_per_stage": [
+            32,
+            64,
+            128,
+            256,
+            320,
+            320
+          ],
+          "conv_op": "torch.nn.modules.conv.Conv3d",
+          "kernel_sizes": [
+            [
+              3,
+              3,
+              3
+            ],
+            [
+              3,
+              3,
+              3
+            ],
+            [
+              3,
+              3,
+              3
+            ],
+            [
+              3,
+              3,
+              3
+            ],
+            [
+              3,
+              3,
+              3
+            ],
+            [
+              3,
+              3,
+              3
+            ]
+          ],
+          "strides": [
+            [
+              1,
+              1,
+              1
+            ],
+            [
+              2,
+              2,
+              2
+            ],
+            [
+              2,
+              2,
+              2
+            ],
+            [
+              2,
+              2,
+              2
+            ],
+            [
+              2,
+              2,
+              2
+            ],
+            [
+              2,
+              2,
+              1
+            ]
+          ],
+          "n_conv_per_stage": [
+            2,
+            2,
+            2,
+            2,
+            2,
+            2
+          ],
+          "n_conv_per_stage_decoder": [
+            2,
+            2,
+            2,
+            2,
+            2
+          ],
+          "conv_bias": true,
+          "norm_op": "torch.nn.modules.instancenorm.InstanceNorm3d",
+          "norm_op_kwargs": {
+            "eps": 1e-05,
+            "affine": true
+          },
+          "dropout_op": null,
+          "dropout_op_kwargs": null,
+          "nonlin": "torch.nn.LeakyReLU",
+          "nonlin_kwargs": {
+            "inplace": true
+          }
+        },
+        "_kw_requires_import": [
+          "conv_op",
+          "norm_op",
+          "dropout_op",
+          "nonlin"
+        ]
+      },
+      "batch_dice": false
+    },
+    "archived_completed_epochs": 643,
+    "last_epoch": {
+      "epoch_index": 642,
+      "completed_epoch": 643,
+      "lr": 0.00397,
+      "train_loss": -0.6872,
+      "val_loss": -0.6915,
+      "pseudo_dice": [
+        0.92,
+        0.8931,
+        0.906
+      ],
+      "pseudo_mean": 0.9063666666666667,
+      "seconds": 25.64
+    },
+    "scheduler_1000epoch_poly09_max_lr_error": 4.993610101651502e-06,
+    "checkpoint": "checkpoint_best.pth, exact epoch unavailable",
+    "inference_patch": [
+      96,
+      96,
+      96
+    ]
+  },
+  "split_audit": {
+    "train": 1080,
+    "validation": 270,
+    "matches_historical_validation_cases": true,
+    "reproduced_casewise_kfold_seed12345": true,
+    "shared_prefix_groups": 188,
+    "validation_cases_with_train_prefix": 209,
+    "interpretation": "If BraTS-GLI-xxxxx is patient ID, this split is not patient-disjoint; expected bias is optimistic."
+  },
+  "branch_comparison": {
+    "dataset_conversion_identical": true,
+    "morphology_identical": true,
+    "function_identity": {
+      "labelmap_to_regions": true,
+      "threshold_probabilities": true,
+      "dice_metrics": true,
+      "postprocess_regions": true,
+      "_canonicalize_regions": true
+    },
+    "training": "Both call stock nnUNetTrainer / nnUNetPlans / 3d_fullres. New empty-region wrapper changes evaluation only.",
+    "reference_eval_loader": "Uses shared preprocessed plans; --results-root is checked but actual model folder depends on environment. The historical checkpoint path matches the requested run.",
+    "current_eval_loader": "Uses saved model plans/dataset and explicitly sets result root."
+  },
+  "metric_checks": {
+    "empty_empty_one": true,
+    "empty_with_fp_zero": true,
+    "perfect_one": true
+  },
+  "parser_error": {
+    "exit_code": 2,
+    "stderr": "usage: analyze.py [-h] --input-dir INPUT_DIR --reference-dir REFERENCE_DIR\n                  --output-dir OUTPUT_DIR --plans-json PLANS_JSON\n                  --dataset-json DATASET_JSON [--min-component-sizes ET TC WT]\n                  [--closing-radius CLOSING_RADIUS]\nanalyze.py: error: argument --min-component-sizes: invalid int value: '20,'\n"
+  },
+  "parser_error_causality": "Not a demonstrated cause of 0.815342: successful validation uses valid thresholds 161 166 50.",
+  "original_model_files": {
+    "plans": {
+      "path": "/gpfs/scratch1/shared/apiaghiardelli/nnUNet_results/unet3d_fold0_baseline/Dataset001_BraTS24GLI/nnUNetTrainer__nnUNetPlans__3d_fullres/plans.json",
+      "exists": false
+    },
+    "dataset": {
+      "path": "/gpfs/scratch1/shared/apiaghiardelli/nnUNet_results/unet3d_fold0_baseline/Dataset001_BraTS24GLI/nnUNetTrainer__nnUNetPlans__3d_fullres/dataset.json",
+      "exists": false
+    },
+    "checkpoint_best": {
+      "path": "/gpfs/scratch1/shared/apiaghiardelli/nnUNet_results/unet3d_fold0_baseline/Dataset001_BraTS24GLI/nnUNetTrainer__nnUNetPlans__3d_fullres/fold_0/checkpoint_best.pth",
+      "exists": false
+    },
+    "custom_summary": {
+      "path": "/gpfs/scratch1/shared/apiaghiardelli/nnUNet_results/unet3d_fold0_baseline/Dataset001_BraTS24GLI/nnUNetTrainer__nnUNetPlans__3d_fullres/fold_0/validation_96patch_postprocessed/summary.json",
+      "exists": false
+    },
+    "native_summary": {
+      "path": "/gpfs/scratch1/shared/apiaghiardelli/nnUNet_results/unet3d_fold0_baseline/Dataset001_BraTS24GLI/nnUNetTrainer__nnUNetPlans__3d_fullres/fold_0/validation/summary.json",
+      "exists": false
+    }
+  },
+  "provenance": {
+    "/gpfs/home6/apiaghiardelli/hippo_segs/logs24/nnUNET3D_training.out": {
+      "snapshot": "logs24__nnUNET3D_training.out",
+      "sha256": "80719827e3b9a0e1df9f34b7e234bd1c57303da50f556b0941783d6e2b4b2d25"
+    },
+    "/gpfs/home6/apiaghiardelli/hippo_segs/logs24/nnUNET3D_results.out": {
+      "snapshot": "logs24__nnUNET3D_results.out",
+      "sha256": "9ec49f93054bfa266c9d74a46edbe25bda7119b35461b41bc70fa925d7e4bf9f"
+    },
+    "/gpfs/home6/apiaghiardelli/hippo_segs/snn_nnunet/custom_full_validation.py": {
+      "snapshot": "snn_nnunet__custom_full_validation.py",
+      "sha256": "068b36417bc9f84d444db9268b5b7e0d38f7b3075ab5c46f9e6263aca919aaa3"
+    },
+    "/gpfs/home6/apiaghiardelli/hippo_segs/snn_nnunet/run_model.py": {
+      "snapshot": "snn_nnunet__run_model.py",
+      "sha256": "96ccfa97f3604262da94aa135e1372533b21851be8353b1927dab1b4e7cedf36"
+    },
+    "/gpfs/home6/apiaghiardelli/hippo_segs/snn_nnunet/dataset_conversion.py": {
+      "snapshot": "snn_nnunet__dataset_conversion.py",
+      "sha256": "792c65e67082b1116baea0998f5848522f86f7342e0d4fcd349e904df1281987"
+    },
+    "/gpfs/home6/apiaghiardelli/hippo_segs/snn_nnunet/empty_dice_evaluation.py": {
+      "snapshot": "snn_nnunet__empty_dice_evaluation.py",
+      "sha256": "678c4f97d61d3affb2e58a123b64e2d192fa142a50e5b1d6ab8f0750145be2ed"
+    },
+    "/gpfs/home6/apiaghiardelli/hippo_segs/snn_nnunet/postprocess_saved_volumes.py": {
+      "snapshot": "snn_nnunet__postprocess_saved_volumes.py",
+      "sha256": "18e0431181e003d3743b9e0e0d16ec9ae07606a913437d3b38e61086f2412794"
+    },
+    "/gpfs/home6/apiaghiardelli/hippo_segs/postprocessing.py": {
+      "snapshot": "postprocessing.py",
+      "sha256": "4789f68e613dd4b8e339fd1eaee45b3b3953e82ea7a6de55cf21b8a6083ee560"
+    },
+    "/gpfs/home6/apiaghiardelli/hippo_segs/validate_unet3d_brats24_fold0_best.sbatch": {
+      "snapshot": "validate_unet3d_brats24_fold0_best.sbatch",
+      "sha256": "ee125a208604aafb58ed4bff576c12c9be16a16b6e3b652500f3770dad47a167"
+    },
+    "/gpfs/home6/apiaghiardelli/hippo_segs/postprocess_nnunet.sbatch": {
+      "snapshot": "postprocess_nnunet.sbatch",
+      "sha256": "84ab628e63e45830fcaf8914671e821bc7af0342111a03cb8a9a2737ad12d1df"
+    },
+    "/gpfs/scratch1/shared/apiaghiardelli/nnUNet_preprocessed/Dataset001_BraTS24GLI/splits_final.json": {
+      "snapshot": "splits_final.json",
+      "sha256": "7e5f8f9043a4e7e37a712b257fb452243e9ec5fd318e3ed5f72d663e4d8eaea8"
+    },
+    "/gpfs/scratch1/shared/apiaghiardelli/nnUNet_preprocessed/Dataset001_BraTS24GLI/dataset.json": {
+      "snapshot": "dataset.json",
+      "sha256": "94230ef50886ded7426491e0a26283a9a508e69cd35d1b383adc864fdadfd5c6"
+    }
+  },
+  "cached_ground_truth_presence": {
+    "source": "class_locations in 270 preprocessed .pkl files, read with the project .venv",
+    "missing_files": 0,
+    "TC_absent": 77,
+    "ET_absent": 78,
+    "WT_absent": 0
+  },
+  "metric_direction": {
+    "custom": "empty GT and prediction gives Dice=1; empty GT with FP gives 0",
+    "stock_nnunet": "empty GT and prediction gives NaN, excluded from regional nanmean",
+    "direction_same_predictions": "Replacing excluded empty-empty cases with ones raises or preserves Dice; cannot alone explain a lower score relative to native evaluation",
+    "paper_empty_policy": "Not specified"
+  }
+}

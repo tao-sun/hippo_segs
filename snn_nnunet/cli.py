@@ -83,6 +83,8 @@ def _add_dataset_id(parser: argparse.ArgumentParser) -> None:
 
 def _add_training_config(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--seed', type=_nonnegative_int)
+    parser.add_argument("--overfit-num-volumes", type=_nonnegative_int,
+                        help="memorization diagnostic: same N labeled training volumes in all splits; 0 disables")
     parser.add_argument('--augmentation-workers', type=_positive_int)
     deterministic = parser.add_mutually_exclusive_group()
     deterministic.add_argument('--deterministic', dest='deterministic', action='store_true')
@@ -92,8 +94,8 @@ def _add_training_config(parser: argparse.ArgumentParser) -> None:
     bidirectional.add_argument('--bidirectional', dest='bidirectional', action='store_true')
     bidirectional.add_argument('--no-bidirectional', dest='bidirectional', action='store_false')
     parser.set_defaults(bidirectional=None)
-    parser.add_argument('--bidirectional-fusion', metavar='{conv_plif,or}',
-                        help='encoder fusion method; ignored when bidirectional is disabled')
+    parser.add_argument('--bidirectional-fusion', metavar='{OR,conv_PLIF,Shared_SOMA}',
+                        help='plain SiLIF encoder fusion; PLIF/attention stay forward-only; ignored when bidirectional is disabled')
     parser.add_argument("--model", choices=("orig", "shallow", "medium", "deep", "paper_unet"), default="orig")
     parser.add_argument("--paper-unet", type=json.loads, help="Paper U-Net options; normally supplied by unet_config.yaml")
     for key in ("fptt_alpha", "fptt_beta", "fptt_rho", "fptt_lambda"):
@@ -101,7 +103,13 @@ def _add_training_config(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--temporal-axis", type=int, choices=(0, 1, 2), default=0)
     parser.add_argument("--k", type=_positive_int, default=16)
     parser.add_argument("--epochs", type=_positive_int, help="total SNN training epochs; defaults to saved plans")
+    parser.add_argument("--train-batches-per-epoch", type=_positive_int,
+                        help="training minibatches per epoch per process; defaults to saved plans or 250")
+    parser.add_argument("--val-batches-per-epoch", type=_positive_int,
+                        help="online validation minibatches per epoch per process; defaults to saved plans or 50")
     parser.add_argument("--lr", type=_positive_float, help="initial learning rate; defaults to saved plans or 0.01")
+    parser.add_argument("--skip-final-validation", action="store_true",
+                        help="skip both full-volume validation passes after training; online validation still runs")
     parser.add_argument("--training-patch-size", nargs=3, type=_positive_int,
                         help="training patch in preprocessed axis order; defaults to saved plans")
     parser.add_argument("--validation-every", type=_nonnegative_int,
@@ -349,10 +357,13 @@ def _requested_config(args: argparse.Namespace, plans_path: Path) -> dict:
     learning_rate = getattr(args, "lr", None)
     if learning_rate is not None:
         config["initial_lr"] = learning_rate
-    for key in ("validation_every", "validation_patch_size", 'seed', 'deterministic', 'augmentation_workers', 'bidirectional', 'bidirectional_fusion'):
+    for key in ("overfit_num_volumes", "train_batches_per_epoch", "val_batches_per_epoch", "validation_every", "validation_patch_size", 'seed', 'deterministic', 'augmentation_workers', 'bidirectional', 'bidirectional_fusion'):
         value = getattr(args, key, None)
         if value is not None:
             config[key] = value
+    if (getattr(args, 'command', None) == 'full-cv' and getattr(args, 'select_best', False)
+            and config.get('overfit_num_volumes', 0)):
+        raise ValueError('--select-best is unavailable for the overfit memorization diagnostic')
     for key in ("fptt_alpha", "fptt_beta", "fptt_rho", "fptt_lambda"):
         value = getattr(args, key, None)
         if value is not None:
@@ -491,6 +502,9 @@ def _run_training(args: argparse.Namespace, fold: int, *, validation: bool) -> N
     from snn_nnunet.empty_dice_evaluation import finalize_fold_summary
 
     if validation:
+        if (Path(args.run_dir) / 'data_partition.json').is_file():
+            _run_custom_full_validation(args, fold)
+            return
         run_training(dataset_name_or_id=str(args.dataset_id), configuration=CONFIGURATION, fold=fold,
                      trainer_class_name=TRAINER, plans_identifier=PLANS, num_gpus=args.gpus,
                      continue_training=False, only_run_validation=True, val_with_best=args.best,
@@ -507,11 +521,22 @@ def _run_training(args: argparse.Namespace, fold: int, *, validation: bool) -> N
             command.append("--continue-training")
         if args.save_probabilities:
             command.append("--save-probabilities")
+        if (getattr(args, "skip_final_validation", False)
+                or (Path(args.run_dir) / 'data_partition.json').is_file()):
+            # The parent runs custom full-volume validation from preprocessed
+            # labels; avoid a duplicate native pass requiring raw GT NIfTIs.
+            command.append("--skip-final-validation")
         print(f"Accelerate: {args.gpus} process(es), one per GPU, FP32", flush=True)
         from snn_nnunet.network_adapter import SNNConfig
         from snn_nnunet.reproducibility import training_environment
         policy = SNNConfig.from_plans(json.loads(_plans_path(args.dataset_id).read_text()))
         subprocess.run(command, check=True, env=training_environment(policy.seed, policy.deterministic))
+        if getattr(args, "skip_final_validation", False):
+            print("Final full-volume validation skipped; online patch validation completed during training.", flush=True)
+            return
+        if policy.overfit_num_volumes:
+            print("Overfit diagnostic: complete-volume train/validation/test Dice saved in overfit_validation; no postprocessing.", flush=True)
+            return
         _run_custom_full_validation(args, fold)
 
     model_folder = _results_folder(args.dataset_id)
@@ -536,12 +561,13 @@ def _run_custom_full_validation(args: argparse.Namespace, fold: int) -> None:
         / "validation_128patch_postprocessed"
     )
     patch_args = []
-    if getattr(args, "model", None) == "paper_unet":
+    from snn_nnunet.network_adapter import SNNConfig
+    saved = json.loads(_plans_path(args.dataset_id).read_text())
+    policy = SNNConfig.from_plans(saved)
+    if policy.model_name == "paper_unet":
         patch = getattr(args, "validation_patch_size", None)
         if patch is None:
-            from snn_nnunet.network_adapter import SNNConfig
-            saved = json.loads(_plans_path(args.dataset_id).read_text())
-            patch = SNNConfig.from_plans(saved).validation_patch_size
+            patch = policy.validation_patch_size
         patch_args = ["--patch-size", *map(str, patch)]
     run_custom_validation([
         "--dataset-id", str(args.dataset_id),
@@ -551,7 +577,7 @@ def _run_custom_full_validation(args: argparse.Namespace, fold: int) -> None:
         "--configuration", CONFIGURATION,
         "--trainer", TRAINER,
         "--plans", PLANS,
-        "--checkpoint-name", "checkpoint_final.pth",
+        "--checkpoint-name", "checkpoint_best.pth" if getattr(args, 'best', False) else "checkpoint_final.pth",
         *patch_args,
     ])
 
@@ -585,8 +611,17 @@ def _postprocess(dataset_id: int, output: str) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     """Run a user command and return a process-style success code."""
 
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if (args.command == "full-cv" and args.skip_final_validation and args.select_best):
+        parser.error("--select-best requires final validation; remove --skip-final-validation")
+    if (args.command == 'full-cv' and args.select_best
+            and getattr(args, 'overfit_num_volumes', 0)):
+        parser.error('--select-best is unavailable for the overfit memorization diagnostic')
     configure_runtime()
+    if getattr(args, 'run_dir', None) is not None:
+        from snn_nnunet.partition_runtime import restore_run_partition
+        restore_run_partition(args.run_dir)
     _require_native_paths()
     _configure_run_directory(args)
 

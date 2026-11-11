@@ -4,6 +4,13 @@ from copy import deepcopy
 import math
 
 
+ATTENTION_MODEL = 'MultiMemoryLinearAttentionLIF'
+
+
+def normalize_recurrent_model(value):
+    return ATTENTION_MODEL if value == 'SiLIF_LinearAttention' else value
+
+
 RECURRENT_DEFAULTS = {
     'model': 'selective_multitimescale_lif', 'compartments': 3,
     'lambda_init': [.50, .80, .95],
@@ -19,6 +26,10 @@ RECURRENT_DEFAULTS = {
         'gate_init': 'zeros', 'static_gate_init': .5, 'fusion': 'weighted_sum',
     },
     'memory_projection': {'kernel_size': 1, 'bias': False, 'init': 'xavier_uniform'},
+    # Missing values in legacy saved plans retain the original unit residual.
+    'attention_gamma': 1.,
+    'attention_gamma_mode': 'fixed',
+    'attention_gamma_init': .1,
     'memory_dtype': 'float32', 'direction': 'forward',
     'diagnostics': {'every_n_windows': 100, 'near_lambda_gap': .001,
                     'growth_ratio_threshold': 100.},
@@ -57,9 +68,15 @@ def recurrent_options(value):
     if not isinstance(value, Mapping):
         raise ValueError('recurrent_neuron must be a mapping')
     result = deepcopy(RECURRENT_DEFAULTS)
+    result['model'] = normalize_recurrent_model(value.get('model', result['model']))
     if value.keys() - result.keys():
         raise ValueError('recurrent_neuron contains unknown options')
     for key, item in value.items():
+        if key == 'model':
+            continue
+        if key == 'selective_readout' and result['model'] == ATTENTION_MODEL:
+            # Local gates are not part of the attention architecture.
+            continue
         if isinstance(result[key], dict):
             if not isinstance(item, Mapping) or item.keys() - result[key].keys():
                 raise ValueError(f'recurrent_neuron.{key} contains unsupported options')
@@ -77,7 +94,21 @@ def recurrent_options(value):
                 or (v > high if inclusive_high else v >= high)):
             raise ValueError(f'recurrent_neuron.{key} is outside its supported range')
 
-    for key in ('model', 'compartments', 'memory_dtype', 'direction'):
+    if result['model'] not in ('selective_multitimescale_lif', ATTENTION_MODEL):
+        raise ValueError('Unsupported recurrent neuron model')
+    gamma = result['attention_gamma']
+    if type(gamma) not in (int, float) or not math.isfinite(gamma) or gamma < 0:
+        raise ValueError('recurrent_neuron.attention_gamma must be a finite nonnegative number')
+    result['attention_gamma'] = float(gamma)
+    if result['attention_gamma_mode'] not in ('fixed', 'learnable_per_channel'):
+        raise ValueError('recurrent_neuron.attention_gamma_mode must be fixed or learnable_per_channel')
+    init = result['attention_gamma_init']
+    if type(init) not in (int, float) or not math.isfinite(init):
+        raise ValueError('recurrent_neuron.attention_gamma_init must be a finite number')
+    if result['attention_gamma_mode'] == 'learnable_per_channel' and not 0 <= init <= 1:
+        raise ValueError('recurrent_neuron.attention_gamma_init must be in [0, 1]')
+    result['attention_gamma_init'] = float(init)
+    for key in ('compartments', 'memory_dtype', 'direction'):
         fixed(result, key, RECURRENT_DEFAULTS[key])
     init = result['lambda_init']
     if (not isinstance(init, (list, tuple)) or len(init) != 3
@@ -115,4 +146,6 @@ def recurrent_options(value):
         raise ValueError('diagnostics.every_n_windows must be a nonnegative integer (0 disables)')
     number(diagnostics, 'near_lambda_gap', 0, 1)
     number(diagnostics, 'growth_ratio_threshold', 0, float('inf'))
+    if result['model'] == ATTENTION_MODEL:
+        result.pop('selective_readout')
     return result

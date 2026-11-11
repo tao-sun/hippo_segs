@@ -88,6 +88,32 @@ a final shorter temporal chunk is supported. Existing runs keep their saved
 geometry and reject incompatible overrides. This spatial patch size is
 separate from the internal 2D patch-embedding factor.
 
+For quick SNN experiments, set independent minibatch budgets under `snn`:
+
+```yaml
+snn:
+  train_batches_per_epoch: 5
+  val_batches_per_epoch: 2
+  validation_every: 0
+  skip_final_validation: true
+```
+
+The defaults are 250 training and 50 online validation minibatches per epoch,
+per process/GPU. Both budgets must be positive integers. They count complete
+minibatches, independently of batch size and temporal window `k`, and apply to
+all SNN variants. The CLI equivalents are `--train-batches-per-epoch 5` and
+`--val-batches-per-epoch 2`; settings are saved in plans and checkpoints.
+With fewer batches, each epoch contains fewer optimizer updates, while the
+learning rate schedule still advances by epoch. Use a new `run_dir` for each
+quick experiment. `validation_every: 0` disables periodic full-fold validation;
+the batch budget only controls online patch validation.
+Set `skip_final_validation: true` (CLI: `--skip-final-validation`) to also skip
+both full-volume validation passes after training completes. The default is
+false; checkpoints are still saved when validation is skipped.
+For a quick three-epoch experiment, set `snn.epochs: 3` in `unet_config.yaml`
+with the 5/2 batch budgets and validation controls above, keeping the desired
+architecture and patch size. Choose a fresh `run_dir`.
+
 Set `snn.validation_every: 50` to evaluate the selected fold on complete
 validation volumes at completed epochs 50, 100, 150, etc., using the exact
 current weights and the existing BraTS component filtering and closing.
@@ -117,6 +143,20 @@ checkpoint and plans directly (the YAML launcher only starts fresh runs):
   --run-dir /path/to/existing/run --epochs 300 --check-only
 ~~~
 
+The SNN trainer updates `checkpoint_latest.pth` after every completed epoch,
+overwrites `checkpoint_best.pth` only when the EMA pseudo Dice improves, and
+writes `checkpoint_final.pth` when training finishes (native nnU-Net then removes
+`latest`). These are complete resume checkpoints: weights (including learned
+gamma), optimizer momentum, epoch, logging history, best score, saved model
+configuration, reproducibility metadata and FPTT state when enabled. Continuous
+resume schedules are included by the resume scheduler. A checkpoint replaces its
+predecessor only after the complete payload has been written successfully.
+Periodic full-volume validation may retain separate numbered checkpoints. Resume
+also considers a complete best checkpoint if it is newer than latest, for example
+when an interruption happened between the two saves.
+Changes to this policy take effect in newly started or resumed processes;
+already running jobs keep the code they loaded at startup.
+
 `--check-only` verifies restoration on CPU using temporary output files.
 Omit it to train on one GPU. `--epochs` is the total, including completed
 epochs. Weights, optimizer momentum, epoch counter and history are restored;
@@ -124,7 +164,7 @@ epochs. Weights, optimizer momentum, epoch counter and history are restored;
 and the saved global epoch (also the default for runs without a saved
 continuation schedule). Extending 100 completed epochs to 300 therefore starts at human
 epoch 101 with LR `0.0069425316` (initial LR `0.01`), while the first 100
-epochs retain their original schedule. Final/latest and periodic checkpoints are compared
+epochs retain their original schedule. Final/latest/best and periodic checkpoints are compared
 by epoch, so an old final checkpoint cannot hide newer interrupted progress.
 Before changing run metadata or results, the command copies the original
 model folder and experiment configs into `run_dir/resume_backups/`.
@@ -519,3 +559,43 @@ thresholding. No reduced-precision or quantized model conversion is applied.
 ## Original paper U-Net
 
 Use `snn.variant: paper_unet` in [`unet_config.yaml`](unet_config.yaml) to run the original `main:model.py:SNNBraTS` graph through the existing nnU-Net pipeline, with PLIF or SelectiveMultiTimescaleLIF activations. See [configuration, commands and verification](PAPER_UNET.md).
+
+
+## One config with independent neuron and fusion controls
+
+`unet_config.yaml` is a single `paper_unet` experiment with no `mode` selector.
+Choose neurons per block and control bidirectionality separately:
+
+```yaml
+snn:
+  bidirectional: true
+  bidirectional_fusion: Shared_SOMA  # OR, conv_PLIF, or Shared_SOMA
+  paper_unet:
+    neurons:
+      model: plif
+      overrides:
+        conv_block1: selective_multitimescale_lif
+        conv_block2: MultiMemoryLinearAttentionLIF
+        conv_block3: selective_multitimescale_lif
+```
+
+With `bidirectional: true`, only encoder blocks using plain
+`selective_multitimescale_lif` use the chosen fusion. PLIF and
+`MultiMemoryLinearAttentionLIF` blocks always scan forward; decoder blocks also remain
+forward-only. With `bidirectional: false`, every block scans forward and the
+fusion setting is inactive. The file uses one training protocol: 400 epochs and 81×128×128 patches. Change individual overrides to enable
+attention without selecting another architecture or training protocol.
+
+```bash
+.venv/bin/python -m snn_nnunet.run_model --config unet_config.yaml
+```
+
+Shared memory settings live in `snn.paper_unet.neurons.multi_memory`. Gate settings
+under `neurons.selective_readout` apply only to the plain selective neuron; attention
+ignores them. The old `selective` section and `SiLIF_LinearAttention` name remain
+readable as compatibility aliases. Explicit
+block overrides take priority over the legacy global attention selector.
+`experiment.yaml`, plans and checkpoints save the chosen settings for resume
+and inference. Choose a fresh run directory after changing neuron types or
+fusion architecture. Existing flat configs and earlier selectable configs
+remain readable.

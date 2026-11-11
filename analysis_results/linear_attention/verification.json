@@ -1,0 +1,97 @@
+{
+  "test_command": ".venv/bin/python -m pytest -q",
+  "passed": 102,
+  "failed": 0,
+  "baseline_passed": 70,
+  "warnings": 4,
+  "warning_origin": "existing SciPy deprecations in batchgenerators",
+  "suite_summary": "102 passed, 4 warnings in 52.27s",
+  "attention_oracle": {
+    "output_rtol": 2e-05,
+    "output_atol": 2e-06,
+    "gradient_rtol": 0.0001,
+    "gradient_atol": 3e-06,
+    "measurements": [
+      {
+        "shape_bchw": [
+          1,
+          4,
+          2,
+          3
+        ],
+        "max_output_abs_error": 5.21540641784668e-08,
+        "max_gradient_abs_error": 7.450580596923828e-08
+      },
+      {
+        "shape_bchw": [
+          2,
+          4,
+          1,
+          1
+        ],
+        "max_output_abs_error": 5.960464477539063e-08,
+        "max_gradient_abs_error": 1.7881393432617188e-07
+      }
+    ]
+  },
+  "legacy_bitwise_cases": 16,
+  "legacy_rtol": 0,
+  "legacy_atol": 0,
+  "legacy_reference_files": [
+    "analysis_results/shared_soma/legacy_reference.json",
+    "analysis_results/linear_attention/legacy_reference.json"
+  ],
+  "review": {
+    "remaining_critical": 0,
+    "remaining_important": 0,
+    "resolved": [
+      "CPU VSS test passed scan explicitly to actual SNNBraTS constructor (RED->GREEN)",
+      "elementwise counts documented as partial, with omitted reductions explicit"
+    ],
+    "production_correctness_blockers_found": 0
+  },
+  "features_verified": [
+    "associative vs explicit kernel output and gradients",
+    "no quadratic production matrices",
+    "three independent K/V projections and learnable embeddings",
+    "global spatial and all-scale influence",
+    "FP32 and outer-autocast stability",
+    "continuous Query object provenance in real VSS adapter",
+    "original direct soma input",
+    "read-after-write and identical memory trajectories",
+    "original soma settings and common seeded initialization",
+    "causality, subject reset and detachment",
+    "all configured SiLIF stages/depths",
+    "native FPTT and TBPTT updates and checkpoint roundtrips",
+    "all original fusion modes and strict original checkpoints",
+    "actual geometry/MAC/parameter accounting"
+  ],
+  "modified_files_for_this_task": [
+    "snn_nnunet/recurrent_neuron.py",
+    "snn_nnunet/recurrent_config.py",
+    "snn_nnunet/model.py",
+    "snn_nnunet/paper_unet.py",
+    "snn_nnunet/paper_config.py",
+    "snn_nnunet/profile_paper_unet.py"
+  ],
+  "new_files_for_this_task": [
+    "snn_nnunet/linear_attention_neuron.py",
+    "snn_nnunet/profile_linear_attention.py",
+    "test_linear_attention.py",
+    "test_linear_attention_legacy.py",
+    "brats24_linear_attention.yaml",
+    "SILIF_LINEAR_ATTENTION.md",
+    "analysis_results/linear_attention/legacy_reference.json",
+    "analysis_results/linear_attention/report.json",
+    "analysis_results/linear_attention/verification.json"
+  ],
+  "local_ignored_plan": "docs/superpowers/plans/2026-11-05-silif-linear-attention.md",
+  "existing_shared_soma_work_preserved": true,
+  "full_training_started": false,
+  "segmentation_accuracy_measured": false,
+  "gpu_available": false,
+  "full_model_gpu_memory": "unmeasured",
+  "full_volume_latency": "unmeasured",
+  "timing_scope": "readout only on identical CPU FP32 B1,HW16x16 features; baseline and attention channels64/128/256; no backbone or optimizer",
+  "primary_operation_scope": "exact SiLIF continuous work and its readout delta; whole Mamba backbone GMAC/GAC not claimed"
+}

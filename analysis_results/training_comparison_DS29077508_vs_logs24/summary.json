@@ -1,0 +1,1287 @@
+{
+  "generated_at_utc": "2026-11-11T11:33:28.344965+00:00",
+  "epoch_convention": "Report uses 1-based completed epochs; original Epoch index is 0-based.",
+  "provenance": {
+    "baseline": {
+      "log": "/gpfs/home6/apiaghiardelli/hippo_segs/logs24/SMMLIF_training.out",
+      "snapshot_sha256": "dc4a26ba65c2e9d25cd778fbca4919a0607a10a4998d4b481b3245228ec449b6",
+      "bytes": 908563,
+      "completed_epochs": 198,
+      "last_metric_timestamp_log_timezone_unspecified": "2026-11-04 20:24:46.329674"
+    },
+    "ds": {
+      "log": "/gpfs/home6/apiaghiardelli/hippo_segs/SMMLIF_training_DS_01_29077508.out",
+      "snapshot_sha256": "ca050bf3ca2b248b101d25041b6968104c4a8b2a40e24f790d16abc29c5d1239",
+      "bytes": 156844,
+      "completed_epochs": 39,
+      "last_metric_timestamp_log_timezone_unspecified": "2026-11-11 12:33:08.478286"
+    }
+  },
+  "common_completed_epochs": 39,
+  "snn_config_differences": [
+    {
+      "path": ".bidirectional_fusion",
+      "baseline": null,
+      "ds": "conv_plif"
+    },
+    {
+      "path": ".initial_lr",
+      "baseline": 0.001,
+      "ds": 0.01
+    },
+    {
+      "path": ".model_kwargs.decoder_spiking",
+      "baseline": null,
+      "ds": true
+    },
+    {
+      "path": ".model_kwargs.deep_supervision",
+      "baseline": null,
+      "ds": {
+        "enabled": true,
+        "weights": [
+          1.0,
+          0.5,
+          0.25
+        ],
+        "resolution": "native"
+      }
+    },
+    {
+      "path": ".model_kwargs.encoder_spiking",
+      "baseline": null,
+      "ds": true
+    },
+    {
+      "path": ".model_kwargs.neurons.multi_memory",
+      "baseline": null,
+      "ds": {
+        "model": "selective_multitimescale_lif",
+        "compartments": 3,
+        "lambda_init": [
+          0.5,
+          0.8,
+          0.95
+        ],
+        "temporal_weight_decay": false,
+        "temporal_fptt_regularization": true,
+        "spatial_mixing": {
+          "enabled": true,
+          "kernel_size": 3,
+          "padding": "zeros",
+          "eta_init": 0.1,
+          "kernel_init": "near_identity",
+          "kernel_center_init": 0.95,
+          "kernel_surround_init": 0.001,
+          "max_kernel_l1_norm": 1.0
+        },
+        "memory_projection": {
+          "kernel_size": 1,
+          "bias": false,
+          "init": "xavier_uniform"
+        },
+        "attention_gamma": 0.05,
+        "attention_gamma_mode": "learnable_per_channel",
+        "attention_gamma_init": 0.05,
+        "memory_dtype": "float32",
+        "direction": "forward",
+        "diagnostics": {
+          "every_n_windows": 100,
+          "near_lambda_gap": 0.001,
+          "growth_ratio_threshold": 100.0
+        }
+      }
+    },
+    {
+      "path": ".model_kwargs.neurons.selective",
+      "baseline": {
+        "model": "selective_multitimescale_lif",
+        "compartments": 3,
+        "lambda_init": [
+          0.5,
+          0.8,
+          0.95
+        ],
+        "temporal_weight_decay": false,
+        "temporal_fptt_regularization": true,
+        "spatial_mixing": {
+          "enabled": true,
+          "kernel_size": 3,
+          "padding": "zeros",
+          "eta_init": 0.1,
+          "kernel_init": "near_identity",
+          "kernel_center_init": 0.95,
+          "kernel_surround_init": 0.001,
+          "max_kernel_l1_norm": 1.0
+        },
+        "selective_readout": {
+          "enabled": true,
+          "gate": "sigmoid",
+          "gate_kernel_size": 1,
+          "gate_init": "zeros",
+          "static_gate_init": 0.5,
+          "fusion": "weighted_sum"
+        },
+        "memory_projection": {
+          "kernel_size": 1,
+          "bias": false,
+          "init": "xavier_uniform"
+        },
+        "memory_dtype": "float32",
+        "direction": "forward",
+        "diagnostics": {
+          "every_n_windows": 100,
+          "near_lambda_gap": 0.001,
+          "growth_ratio_threshold": 100.0
+        }
+      },
+      "ds": null
+    },
+    {
+      "path": ".model_kwargs.neurons.selective_readout",
+      "baseline": null,
+      "ds": {
+        "enabled": true,
+        "gate": "sigmoid",
+        "gate_kernel_size": 1,
+        "gate_init": "zeros",
+        "static_gate_init": 0.5,
+        "fusion": "weighted_sum"
+      }
+    },
+    {
+      "path": ".num_epochs",
+      "baseline": 200,
+      "ds": 400
+    },
+    {
+      "path": ".overfit_num_volumes",
+      "baseline": null,
+      "ds": 0
+    },
+    {
+      "path": ".train_batches_per_epoch",
+      "baseline": null,
+      "ds": 250
+    },
+    {
+      "path": ".val_batches_per_epoch",
+      "baseline": null,
+      "ds": 50
+    }
+  ],
+  "saved_config_differences": [
+    {
+      "path": ".arguments.bidirectional_fusion",
+      "baseline": null,
+      "ds": "conv_plif"
+    },
+    {
+      "path": ".arguments.epochs",
+      "baseline": 200,
+      "ds": 400
+    },
+    {
+      "path": ".arguments.lr",
+      "baseline": 0.001,
+      "ds": 0.01
+    },
+    {
+      "path": ".arguments.overfit_num_volumes",
+      "baseline": null,
+      "ds": 0
+    },
+    {
+      "path": ".arguments.paper_unet.decoder_spiking",
+      "baseline": null,
+      "ds": true
+    },
+    {
+      "path": ".arguments.paper_unet.deep_supervision",
+      "baseline": null,
+      "ds": {
+        "enabled": true,
+        "weights": [
+          1.0,
+          0.5,
+          0.25
+        ],
+        "resolution": "native"
+      }
+    },
+    {
+      "path": ".arguments.paper_unet.encoder_spiking",
+      "baseline": null,
+      "ds": true
+    },
+    {
+      "path": ".arguments.paper_unet.neurons.multi_memory",
+      "baseline": null,
+      "ds": {
+        "model": "selective_multitimescale_lif",
+        "compartments": 3,
+        "lambda_init": [
+          0.5,
+          0.8,
+          0.95
+        ],
+        "temporal_weight_decay": false,
+        "temporal_fptt_regularization": true,
+        "spatial_mixing": {
+          "enabled": true,
+          "kernel_size": 3,
+          "padding": "zeros",
+          "eta_init": 0.1,
+          "kernel_init": "near_identity",
+          "kernel_center_init": 0.95,
+          "kernel_surround_init": 0.001,
+          "max_kernel_l1_norm": 1.0
+        },
+        "memory_projection": {
+          "kernel_size": 1,
+          "bias": false,
+          "init": "xavier_uniform"
+        },
+        "attention_gamma": 0.05,
+        "attention_gamma_mode": "learnable_per_channel",
+        "attention_gamma_init": 0.05,
+        "memory_dtype": "float32",
+        "direction": "forward",
+        "diagnostics": {
+          "every_n_windows": 100,
+          "near_lambda_gap": 0.001,
+          "growth_ratio_threshold": 100.0
+        }
+      }
+    },
+    {
+      "path": ".arguments.paper_unet.neurons.selective",
+      "baseline": {
+        "model": "selective_multitimescale_lif",
+        "compartments": 3,
+        "lambda_init": [
+          0.5,
+          0.8,
+          0.95
+        ],
+        "temporal_weight_decay": false,
+        "temporal_fptt_regularization": true,
+        "spatial_mixing": {
+          "enabled": true,
+          "kernel_size": 3,
+          "padding": "zeros",
+          "eta_init": 0.1,
+          "kernel_init": "near_identity",
+          "kernel_center_init": 0.95,
+          "kernel_surround_init": 0.001,
+          "max_kernel_l1_norm": 1.0
+        },
+        "selective_readout": {
+          "enabled": true,
+          "gate": "sigmoid",
+          "gate_kernel_size": 1,
+          "gate_init": "zeros",
+          "static_gate_init": 0.5,
+          "fusion": "weighted_sum"
+        },
+        "memory_projection": {
+          "kernel_size": 1,
+          "bias": false,
+          "init": "xavier_uniform"
+        },
+        "memory_dtype": "float32",
+        "direction": "forward",
+        "diagnostics": {
+          "every_n_windows": 100,
+          "near_lambda_gap": 0.001,
+          "growth_ratio_threshold": 100.0
+        }
+      },
+      "ds": null
+    },
+    {
+      "path": ".arguments.paper_unet.neurons.selective_readout",
+      "baseline": null,
+      "ds": {
+        "enabled": true,
+        "gate": "sigmoid",
+        "gate_kernel_size": 1,
+        "gate_init": "zeros",
+        "static_gate_init": 0.5,
+        "fusion": "weighted_sum"
+      }
+    },
+    {
+      "path": ".arguments.run_dir",
+      "baseline": "/gpfs/scratch1/shared/apiaghiardelli/SNN_paper_unet_sel3_fold0",
+      "ds": "/gpfs/scratch1/shared/apiaghiardelli/SNN_2D_Unet_SMMLif_DS_01"
+    },
+    {
+      "path": ".arguments.skip_final_validation",
+      "baseline": null,
+      "ds": false
+    },
+    {
+      "path": ".arguments.train_batches_per_epoch",
+      "baseline": null,
+      "ds": 250
+    },
+    {
+      "path": ".arguments.val_batches_per_epoch",
+      "baseline": null,
+      "ds": 50
+    },
+    {
+      "path": ".created_at",
+      "baseline": "2026-11-02T20:28:47",
+      "ds": "2026-11-11T07:33:01"
+    },
+    {
+      "path": ".plans.snn_config.bidirectional_fusion",
+      "baseline": null,
+      "ds": "conv_plif"
+    },
+    {
+      "path": ".plans.snn_config.initial_lr",
+      "baseline": 0.001,
+      "ds": 0.01
+    },
+    {
+      "path": ".plans.snn_config.model_kwargs.decoder_spiking",
+      "baseline": null,
+      "ds": true
+    },
+    {
+      "path": ".plans.snn_config.model_kwargs.deep_supervision",
+      "baseline": null,
+      "ds": {
+        "enabled": true,
+        "weights": [
+          1.0,
+          0.5,
+          0.25
+        ],
+        "resolution": "native"
+      }
+    },
+    {
+      "path": ".plans.snn_config.model_kwargs.encoder_spiking",
+      "baseline": null,
+      "ds": true
+    },
+    {
+      "path": ".plans.snn_config.model_kwargs.neurons.multi_memory",
+      "baseline": null,
+      "ds": {
+        "model": "selective_multitimescale_lif",
+        "compartments": 3,
+        "lambda_init": [
+          0.5,
+          0.8,
+          0.95
+        ],
+        "temporal_weight_decay": false,
+        "temporal_fptt_regularization": true,
+        "spatial_mixing": {
+          "enabled": true,
+          "kernel_size": 3,
+          "padding": "zeros",
+          "eta_init": 0.1,
+          "kernel_init": "near_identity",
+          "kernel_center_init": 0.95,
+          "kernel_surround_init": 0.001,
+          "max_kernel_l1_norm": 1.0
+        },
+        "memory_projection": {
+          "kernel_size": 1,
+          "bias": false,
+          "init": "xavier_uniform"
+        },
+        "attention_gamma": 0.05,
+        "attention_gamma_mode": "learnable_per_channel",
+        "attention_gamma_init": 0.05,
+        "memory_dtype": "float32",
+        "direction": "forward",
+        "diagnostics": {
+          "every_n_windows": 100,
+          "near_lambda_gap": 0.001,
+          "growth_ratio_threshold": 100.0
+        }
+      }
+    },
+    {
+      "path": ".plans.snn_config.model_kwargs.neurons.selective",
+      "baseline": {
+        "model": "selective_multitimescale_lif",
+        "compartments": 3,
+        "lambda_init": [
+          0.5,
+          0.8,
+          0.95
+        ],
+        "temporal_weight_decay": false,
+        "temporal_fptt_regularization": true,
+        "spatial_mixing": {
+          "enabled": true,
+          "kernel_size": 3,
+          "padding": "zeros",
+          "eta_init": 0.1,
+          "kernel_init": "near_identity",
+          "kernel_center_init": 0.95,
+          "kernel_surround_init": 0.001,
+          "max_kernel_l1_norm": 1.0
+        },
+        "selective_readout": {
+          "enabled": true,
+          "gate": "sigmoid",
+          "gate_kernel_size": 1,
+          "gate_init": "zeros",
+          "static_gate_init": 0.5,
+          "fusion": "weighted_sum"
+        },
+        "memory_projection": {
+          "kernel_size": 1,
+          "bias": false,
+          "init": "xavier_uniform"
+        },
+        "memory_dtype": "float32",
+        "direction": "forward",
+        "diagnostics": {
+          "every_n_windows": 100,
+          "near_lambda_gap": 0.001,
+          "growth_ratio_threshold": 100.0
+        }
+      },
+      "ds": null
+    },
+    {
+      "path": ".plans.snn_config.model_kwargs.neurons.selective_readout",
+      "baseline": null,
+      "ds": {
+        "enabled": true,
+        "gate": "sigmoid",
+        "gate_kernel_size": 1,
+        "gate_init": "zeros",
+        "static_gate_init": 0.5,
+        "fusion": "weighted_sum"
+      }
+    },
+    {
+      "path": ".plans.snn_config.num_epochs",
+      "baseline": 200,
+      "ds": 400
+    },
+    {
+      "path": ".plans.snn_config.overfit_num_volumes",
+      "baseline": null,
+      "ds": 0
+    },
+    {
+      "path": ".plans.snn_config.train_batches_per_epoch",
+      "baseline": null,
+      "ds": 250
+    },
+    {
+      "path": ".plans.snn_config.val_batches_per_epoch",
+      "baseline": null,
+      "ds": 50
+    },
+    {
+      "path": ".run_dir",
+      "baseline": "/gpfs/scratch1/shared/apiaghiardelli/SNN_paper_unet_sel3_fold0",
+      "ds": "/gpfs/scratch1/shared/apiaghiardelli/SNN_2D_Unet_SMMLif_DS_01"
+    },
+    {
+      "path": ".snn_config.bidirectional_fusion",
+      "baseline": null,
+      "ds": "conv_plif"
+    },
+    {
+      "path": ".snn_config.initial_lr",
+      "baseline": 0.001,
+      "ds": 0.01
+    },
+    {
+      "path": ".snn_config.model_kwargs.decoder_spiking",
+      "baseline": null,
+      "ds": true
+    },
+    {
+      "path": ".snn_config.model_kwargs.deep_supervision",
+      "baseline": null,
+      "ds": {
+        "enabled": true,
+        "weights": [
+          1.0,
+          0.5,
+          0.25
+        ],
+        "resolution": "native"
+      }
+    },
+    {
+      "path": ".snn_config.model_kwargs.encoder_spiking",
+      "baseline": null,
+      "ds": true
+    },
+    {
+      "path": ".snn_config.model_kwargs.neurons.multi_memory",
+      "baseline": null,
+      "ds": {
+        "model": "selective_multitimescale_lif",
+        "compartments": 3,
+        "lambda_init": [
+          0.5,
+          0.8,
+          0.95
+        ],
+        "temporal_weight_decay": false,
+        "temporal_fptt_regularization": true,
+        "spatial_mixing": {
+          "enabled": true,
+          "kernel_size": 3,
+          "padding": "zeros",
+          "eta_init": 0.1,
+          "kernel_init": "near_identity",
+          "kernel_center_init": 0.95,
+          "kernel_surround_init": 0.001,
+          "max_kernel_l1_norm": 1.0
+        },
+        "memory_projection": {
+          "kernel_size": 1,
+          "bias": false,
+          "init": "xavier_uniform"
+        },
+        "attention_gamma": 0.05,
+        "attention_gamma_mode": "learnable_per_channel",
+        "attention_gamma_init": 0.05,
+        "memory_dtype": "float32",
+        "direction": "forward",
+        "diagnostics": {
+          "every_n_windows": 100,
+          "near_lambda_gap": 0.001,
+          "growth_ratio_threshold": 100.0
+        }
+      }
+    },
+    {
+      "path": ".snn_config.model_kwargs.neurons.selective",
+      "baseline": {
+        "model": "selective_multitimescale_lif",
+        "compartments": 3,
+        "lambda_init": [
+          0.5,
+          0.8,
+          0.95
+        ],
+        "temporal_weight_decay": false,
+        "temporal_fptt_regularization": true,
+        "spatial_mixing": {
+          "enabled": true,
+          "kernel_size": 3,
+          "padding": "zeros",
+          "eta_init": 0.1,
+          "kernel_init": "near_identity",
+          "kernel_center_init": 0.95,
+          "kernel_surround_init": 0.001,
+          "max_kernel_l1_norm": 1.0
+        },
+        "selective_readout": {
+          "enabled": true,
+          "gate": "sigmoid",
+          "gate_kernel_size": 1,
+          "gate_init": "zeros",
+          "static_gate_init": 0.5,
+          "fusion": "weighted_sum"
+        },
+        "memory_projection": {
+          "kernel_size": 1,
+          "bias": false,
+          "init": "xavier_uniform"
+        },
+        "memory_dtype": "float32",
+        "direction": "forward",
+        "diagnostics": {
+          "every_n_windows": 100,
+          "near_lambda_gap": 0.001,
+          "growth_ratio_threshold": 100.0
+        }
+      },
+      "ds": null
+    },
+    {
+      "path": ".snn_config.model_kwargs.neurons.selective_readout",
+      "baseline": null,
+      "ds": {
+        "enabled": true,
+        "gate": "sigmoid",
+        "gate_kernel_size": 1,
+        "gate_init": "zeros",
+        "static_gate_init": 0.5,
+        "fusion": "weighted_sum"
+      }
+    },
+    {
+      "path": ".snn_config.num_epochs",
+      "baseline": 200,
+      "ds": 400
+    },
+    {
+      "path": ".snn_config.overfit_num_volumes",
+      "baseline": null,
+      "ds": 0
+    },
+    {
+      "path": ".snn_config.train_batches_per_epoch",
+      "baseline": null,
+      "ds": 250
+    },
+    {
+      "path": ".snn_config.val_batches_per_epoch",
+      "baseline": null,
+      "ds": 50
+    }
+  ],
+  "first25": {
+    "baseline": {
+      "WT": 0.62214,
+      "TC": 0.00078,
+      "ET": 0.001032,
+      "mean_dice": 0.207984,
+      "train_loss": -0.30386,
+      "val_loss": -0.332184,
+      "seconds": 724.6936000000001
+    },
+    "ds": {
+      "WT": 0.68762,
+      "TC": 0.034268,
+      "ET": 0.003104,
+      "mean_dice": 0.241664,
+      "train_loss": -0.35584,
+      "val_loss": -0.349932,
+      "seconds": 460.9224
+    }
+  },
+  "epochs21_25": {
+    "baseline": {
+      "WT": 0.8011,
+      "TC": 0.00342,
+      "ET": 0.00484,
+      "mean_dice": 0.2697866666666667,
+      "train_loss": -0.38839999999999997,
+      "val_loss": -0.3983,
+      "seconds": 722.032
+    },
+    "ds": {
+      "WT": 0.78982,
+      "TC": 0.15078,
+      "ET": 0.015519999999999999,
+      "mean_dice": 0.31870666666666664,
+      "train_loss": -0.41986,
+      "val_loss": -0.39744,
+      "seconds": 460.874
+    }
+  },
+  "common_last5": {
+    "baseline": {
+      "WT": 0.8491000000000001,
+      "TC": 0.78292,
+      "ET": 0.8023,
+      "mean_dice": 0.8114399999999999,
+      "train_loss": -0.5062800000000001,
+      "val_loss": -0.51486,
+      "seconds": 720.2180000000001
+    },
+    "ds": {
+      "WT": 0.84022,
+      "TC": 0.78878,
+      "ET": 0.81612,
+      "mean_dice": 0.81504,
+      "train_loss": -0.49576000000000003,
+      "val_loss": -0.5172,
+      "seconds": 457.396
+    }
+  },
+  "last": {
+    "baseline": {
+      "epoch_index": 197,
+      "epoch": 198,
+      "start_line": 6799,
+      "lr": 2e-05,
+      "diagnostics": {
+        "recurrent/core.conv_block1.spike_neurons/soma/firing_rate": 0.191086,
+        "recurrent/core.conv_block1.spike_neurons/projection/input_ratio": 0.920358,
+        "recurrent/core.conv_block1.spike_neurons/lambda/min_gap": 0.149373,
+        "recurrent/core.conv_block2.spike_neurons/soma/firing_rate": 0.048791,
+        "recurrent/core.conv_block2.spike_neurons/projection/input_ratio": 1.472908,
+        "recurrent/core.conv_block2.spike_neurons/lambda/min_gap": 0.148799,
+        "recurrent/core.conv_block3.spike_neurons/soma/firing_rate": 0.071016,
+        "recurrent/core.conv_block3.spike_neurons/projection/input_ratio": 1.549592,
+        "recurrent/core.conv_block3.spike_neurons/lambda/min_gap": 0.147835
+      },
+      "train_loss": -0.5858,
+      "val_loss": -0.5875,
+      "WT": 0.8856,
+      "TC": 0.8389,
+      "ET": 0.8628,
+      "mean_dice": 0.8624333333333334,
+      "metric_line": 6813,
+      "timestamp": "2026-11-04 20:24:46.329674",
+      "seconds": 718.45
+    },
+    "ds": {
+      "epoch_index": 38,
+      "epoch": 39,
+      "start_line": 776,
+      "lr": 0.00914,
+      "diagnostics": {
+        "recurrent/core.conv_block1.spike_neurons/soma/firing_rate": 0.26058,
+        "recurrent/core.conv_block1.spike_neurons/projection/input_ratio": 5.172129,
+        "recurrent/core.conv_block1.spike_neurons/lambda/min_gap": 0.144397,
+        "recurrent/core.conv_block2.spike_neurons/soma/firing_rate": 0.092705,
+        "recurrent/core.conv_block2.spike_neurons/projection/input_ratio": 0.806181,
+        "recurrent/core.conv_block2.spike_neurons/lambda/min_gap": 0.147391,
+        "recurrent/core.conv_block3.spike_neurons/soma/firing_rate": 0.160861,
+        "recurrent/core.conv_block3.spike_neurons/projection/input_ratio": 2.22806,
+        "recurrent/core.conv_block3.spike_neurons/lambda/min_gap": 0.142157
+      },
+      "train_loss": -0.5041,
+      "val_loss": -0.5402,
+      "WT": 0.8332,
+      "TC": 0.7919,
+      "ET": 0.818,
+      "mean_dice": 0.8143666666666667,
+      "metric_line": 790,
+      "timestamp": "2026-11-11 12:33:08.478286",
+      "seconds": 457.34
+    }
+  },
+  "best_pseudo": {
+    "baseline": {
+      "epoch_index": 194,
+      "epoch": 195,
+      "start_line": 6748,
+      "lr": 4e-05,
+      "diagnostics": {
+        "recurrent/core.conv_block1.spike_neurons/soma/firing_rate": 0.198522,
+        "recurrent/core.conv_block1.spike_neurons/projection/input_ratio": 1.077946,
+        "recurrent/core.conv_block1.spike_neurons/lambda/min_gap": 0.149373,
+        "recurrent/core.conv_block2.spike_neurons/soma/firing_rate": 0.050041,
+        "recurrent/core.conv_block2.spike_neurons/projection/input_ratio": 1.4167,
+        "recurrent/core.conv_block2.spike_neurons/lambda/min_gap": 0.148799,
+        "recurrent/core.conv_block3.spike_neurons/soma/firing_rate": 0.068816,
+        "recurrent/core.conv_block3.spike_neurons/projection/input_ratio": 1.551055,
+        "recurrent/core.conv_block3.spike_neurons/lambda/min_gap": 0.147835
+      },
+      "train_loss": -0.5695,
+      "val_loss": -0.5675,
+      "WT": 0.8965,
+      "TC": 0.8777,
+      "ET": 0.8818,
+      "mean_dice": 0.8853333333333333,
+      "metric_line": 6762,
+      "timestamp": "2026-11-04 19:48:46.948825",
+      "seconds": 719.52
+    },
+    "ds": {
+      "epoch_index": 36,
+      "epoch": 37,
+      "start_line": 740,
+      "lr": 0.00919,
+      "diagnostics": {
+        "recurrent/core.conv_block1.spike_neurons/soma/firing_rate": 0.26003,
+        "recurrent/core.conv_block1.spike_neurons/projection/input_ratio": 5.851506,
+        "recurrent/core.conv_block1.spike_neurons/lambda/min_gap": 0.144499,
+        "recurrent/core.conv_block2.spike_neurons/soma/firing_rate": 0.088938,
+        "recurrent/core.conv_block2.spike_neurons/projection/input_ratio": 0.79869,
+        "recurrent/core.conv_block2.spike_neurons/lambda/min_gap": 0.147611,
+        "recurrent/core.conv_block3.spike_neurons/soma/firing_rate": 0.172112,
+        "recurrent/core.conv_block3.spike_neurons/projection/input_ratio": 2.248273,
+        "recurrent/core.conv_block3.spike_neurons/lambda/min_gap": 0.142499
+      },
+      "train_loss": -0.5079,
+      "val_loss": -0.546,
+      "WT": 0.8459,
+      "TC": 0.8105,
+      "ET": 0.8276,
+      "mean_dice": 0.828,
+      "metric_line": 754,
+      "timestamp": "2026-11-11 12:17:52.167573",
+      "seconds": 457.75
+    }
+  },
+  "median_epoch_seconds": {
+    "baseline": 719.305,
+    "ds": 460.51
+  },
+  "onset": {
+    "baseline": {
+      "WT": {
+        "0": 5,
+        "0.01": 6,
+        "0.05": 6,
+        "0.1": 6,
+        "0.5": 6,
+        "0.7": 6,
+        "0.8": 21
+      },
+      "TC": {
+        "0": 16,
+        "0.01": 26,
+        "0.05": 27,
+        "0.1": 28,
+        "0.5": 28,
+        "0.7": 28,
+        "0.8": 35
+      },
+      "ET": {
+        "0": 16,
+        "0.01": 25,
+        "0.05": 27,
+        "0.1": 28,
+        "0.5": 28,
+        "0.7": 28,
+        "0.8": 29
+      }
+    },
+    "ds": {
+      "WT": {
+        "0": 2,
+        "0.01": 2,
+        "0.05": 2,
+        "0.1": 3,
+        "0.5": 3,
+        "0.7": 7,
+        "0.8": 21
+      },
+      "TC": {
+        "0": 19,
+        "0.01": 19,
+        "0.05": 20,
+        "0.1": 22,
+        "0.5": 29,
+        "0.7": 29,
+        "0.8": 37
+      },
+      "ET": {
+        "0": 24,
+        "0.01": 24,
+        "0.05": 25,
+        "0.1": 27,
+        "0.5": 29,
+        "0.7": 29,
+        "0.8": 30
+      }
+    }
+  },
+  "full_validation_epoch50": {
+    "mean": {
+      "raw": {
+        "WT": 0.8089578315471023,
+        "TC": 0.5249000639861106,
+        "ET": 0.5439594495338597,
+        "mean": 0.6259391150223576
+      },
+      "postprocessed": {
+        "WT": 0.8101260864353694,
+        "TC": 0.6557728035607496,
+        "ET": 0.6675644693154316,
+        "mean": 0.7111544531038502
+      }
+    },
+    "delta": {
+      "WT": 0.0011682548882671062,
+      "TC": 0.13087273957463907,
+      "ET": 0.1236050197815719,
+      "mean": 0.08521533808149262
+    },
+    "dice_convention": {
+      "empty_reference_and_prediction": 1.0,
+      "empty_reference_with_false_positives": 0.0
+    },
+    "settings": {
+      "precision": "float32",
+      "patch_size": [
+        81,
+        128,
+        128
+      ],
+      "tile_step_size": 0.5,
+      "gaussian_blending": true,
+      "mirroring": true,
+      "mirroring_axes": [
+        1,
+        2
+      ],
+      "probability_threshold": 0.5,
+      "min_component_sizes_et_tc_wt": [
+        161,
+        166,
+        50
+      ],
+      "closing_radius": 1
+    },
+    "epoch": 50,
+    "checkpoint": "/gpfs/scratch1/shared/apiaghiardelli/SNN_paper_unet_sel3_fold0/Dataset001_BraTS24GLI/nnUNetTrainerSNNFPTT__SNNPlans__3d_fullres/fold_0/checkpoint_epoch_0050.pth"
+  },
+  "full_validation_groups": {
+    "WT": {
+      "present_cases": 270,
+      "empty_cases": 0,
+      "raw": {
+        "present_mean_dice": 0.8089578315471023,
+        "empty_mean_dice": null,
+        "empty_cases_with_false_positives": 0
+      },
+      "postprocessed": {
+        "present_mean_dice": 0.8101260864353694,
+        "empty_mean_dice": null,
+        "empty_cases_with_false_positives": 0
+      }
+    },
+    "TC": {
+      "present_cases": 193,
+      "empty_cases": 77,
+      "raw": {
+        "present_mean_dice": 0.6410519029857507,
+        "empty_mean_dice": 0.23376623376623376,
+        "empty_cases_with_false_positives": 59
+      },
+      "postprocessed": {
+        "present_mean_dice": 0.6220655801108931,
+        "empty_mean_dice": 0.7402597402597403,
+        "empty_cases_with_false_positives": 20
+      }
+    },
+    "ET": {
+      "present_cases": 192,
+      "empty_cases": 78,
+      "raw": {
+        "present_mean_dice": 0.6607763092403235,
+        "empty_mean_dice": 0.2564102564102564,
+        "empty_cases_with_false_positives": 58
+      },
+      "postprocessed": {
+        "present_mean_dice": 0.6314708683081589,
+        "empty_mean_dice": 0.7564102564102564,
+        "empty_cases_with_false_positives": 19
+      }
+    }
+  },
+  "full_validation_case_count": 270,
+  "common_last10": {
+    "baseline": {
+      "WT": 0.84685,
+      "TC": 0.76755,
+      "ET": 0.7899,
+      "mean_dice": 0.8014333333333333,
+      "train_loss": -0.50487,
+      "val_loss": -0.5113,
+      "seconds": 719.785
+    },
+    "ds": {
+      "WT": 0.83705,
+      "TC": 0.7723599999999999,
+      "ET": 0.79848,
+      "mean_dice": 0.80263,
+      "train_loss": -0.49712,
+      "val_loss": -0.51241,
+      "seconds": 458.354
+    }
+  },
+  "windows": {
+    "1_10": {
+      "baseline": {
+        "WT": 0.3758,
+        "TC": 0.0,
+        "ET": 0.0,
+        "mean_dice": 0.12526666666666667,
+        "train_loss": -0.19373,
+        "val_loss": -0.24473999999999999,
+        "seconds": 729.111
+      },
+      "ds": {
+        "WT": 0.56407,
+        "TC": 0.0,
+        "ET": 0.0,
+        "mean_dice": 0.18802333333333332,
+        "train_loss": -0.27789,
+        "val_loss": -0.29515,
+        "seconds": 461.036
+      }
+    },
+    "21_25": {
+      "baseline": {
+        "WT": 0.8011,
+        "TC": 0.00342,
+        "ET": 0.00484,
+        "mean_dice": 0.2697866666666667,
+        "train_loss": -0.38839999999999997,
+        "val_loss": -0.3983,
+        "seconds": 722.032
+      },
+      "ds": {
+        "WT": 0.78982,
+        "TC": 0.15078,
+        "ET": 0.015519999999999999,
+        "mean_dice": 0.31870666666666664,
+        "train_loss": -0.41986,
+        "val_loss": -0.39744,
+        "seconds": 460.874
+      }
+    },
+    "26_30": {
+      "baseline": {
+        "WT": 0.82182,
+        "TC": 0.49108,
+        "ET": 0.50272,
+        "mean_dice": 0.6052066666666667,
+        "train_loss": -0.43908,
+        "val_loss": -0.45771999999999996,
+        "seconds": 721.264
+      },
+      "ds": {
+        "WT": 0.8066,
+        "TC": 0.52924,
+        "ET": 0.4353,
+        "mean_dice": 0.59038,
+        "train_loss": -0.44734,
+        "val_loss": -0.44116,
+        "seconds": 460.558
+      }
+    },
+    "29_38": {
+      "baseline": {
+        "WT": 0.84535,
+        "TC": 0.76869,
+        "ET": 0.79019,
+        "mean_dice": 0.80141,
+        "train_loss": -0.49945,
+        "val_loss": -0.50331,
+        "seconds": 719.981
+      },
+      "ds": {
+        "WT": 0.83733,
+        "TC": 0.77039,
+        "ET": 0.79573,
+        "mean_dice": 0.80115,
+        "train_loss": -0.49054000000000003,
+        "val_loss": -0.50448,
+        "seconds": 458.724
+      }
+    },
+    "34_38": {
+      "baseline": {
+        "WT": 0.8476,
+        "TC": 0.7711,
+        "ET": 0.79204,
+        "mean_dice": 0.80358,
+        "train_loss": -0.5076,
+        "val_loss": -0.50654,
+        "seconds": 720.014
+      },
+      "ds": {
+        "WT": 0.84068,
+        "TC": 0.77582,
+        "ET": 0.80204,
+        "mean_dice": 0.80618,
+        "train_loss": -0.49698000000000003,
+        "val_loss": -0.50868,
+        "seconds": 457.572
+      }
+    },
+    "151_198": {
+      "baseline": {
+        "WT": 0.8805895833333334,
+        "TC": 0.8218208333333333,
+        "ET": 0.8468416666666667,
+        "mean_dice": 0.8497506944444444,
+        "train_loss": -0.5708375,
+        "val_loss": -0.56793125,
+        "seconds": 718.7397916666666
+      }
+    }
+  },
+  "historical_full_validations": {
+    "epoch100": {
+      "mean": {
+        "raw": {
+          "WT": 0.838212362765074,
+          "TC": 0.5411732030481232,
+          "ET": 0.5604039166629119,
+          "mean": 0.646596494158703
+        },
+        "postprocessed": {
+          "WT": 0.8393518125394674,
+          "TC": 0.6824110343292472,
+          "ET": 0.7019878553866596,
+          "mean": 0.7412502340851247
+        }
+      },
+      "delta": {
+        "WT": 0.0011394497743933973,
+        "TC": 0.141237831281124,
+        "ET": 0.14158393872374775,
+        "mean": 0.09465373992642168
+      },
+      "dice_convention": {
+        "empty_reference_and_prediction": 1.0,
+        "empty_reference_with_false_positives": 0.0
+      },
+      "settings": {
+        "precision": "float32",
+        "patch_size": [
+          81,
+          128,
+          128
+        ],
+        "tile_step_size": 0.5,
+        "gaussian_blending": true,
+        "mirroring": true,
+        "mirroring_axes": [
+          1,
+          2
+        ],
+        "probability_threshold": 0.5,
+        "min_component_sizes_et_tc_wt": [
+          161,
+          166,
+          50
+        ],
+        "closing_radius": 1
+      },
+      "epoch": 100,
+      "checkpoint": "/gpfs/scratch1/shared/apiaghiardelli/SNN_paper_unet_sel3_fold0/Dataset001_BraTS24GLI/nnUNetTrainerSNNFPTT__SNNPlans__3d_fullres/fold_0/checkpoint_epoch_0100.pth"
+    },
+    "epoch150": {
+      "mean": {
+        "raw": {
+          "WT": 0.8466238456744228,
+          "TC": 0.5731747037847276,
+          "ET": 0.5963249595117108,
+          "mean": 0.6720411696569538
+        },
+        "postprocessed": {
+          "WT": 0.8469671469237194,
+          "TC": 0.6935573548339257,
+          "ET": 0.7149168697223017,
+          "mean": 0.7518137904933156
+        }
+      },
+      "delta": {
+        "WT": 0.00034330124929660144,
+        "TC": 0.1203826510491981,
+        "ET": 0.1185919102105909,
+        "mean": 0.07977262083636183
+      },
+      "dice_convention": {
+        "empty_reference_and_prediction": 1.0,
+        "empty_reference_with_false_positives": 0.0
+      },
+      "settings": {
+        "precision": "float32",
+        "patch_size": [
+          81,
+          128,
+          128
+        ],
+        "tile_step_size": 0.5,
+        "gaussian_blending": true,
+        "mirroring": true,
+        "mirroring_axes": [
+          1,
+          2
+        ],
+        "probability_threshold": 0.5,
+        "min_component_sizes_et_tc_wt": [
+          161,
+          166,
+          50
+        ],
+        "closing_radius": 1
+      },
+      "epoch": 150,
+      "checkpoint": "/gpfs/scratch1/shared/apiaghiardelli/SNN_paper_unet_sel3_fold0/Dataset001_BraTS24GLI/nnUNetTrainerSNNFPTT__SNNPlans__3d_fullres/fold_0/checkpoint_epoch_0150.pth"
+    },
+    "best": {
+      "mean": {
+        "raw": {
+          "WT": 0.8478957384127377,
+          "TC": 0.5720414672074888,
+          "ET": 0.5888645712009424,
+          "mean": 0.669600592273723
+        },
+        "postprocessed": {
+          "WT": 0.8487086201824009,
+          "TC": 0.7054764339004439,
+          "ET": 0.720169107606364,
+          "mean": 0.758118053896403
+        }
+      },
+      "delta": {
+        "WT": 0.0008128817696632096,
+        "TC": 0.13343496669295507,
+        "ET": 0.1313045364054216,
+        "mean": 0.08851746162267993
+      },
+      "dice_convention": {
+        "empty_reference_and_prediction": 1.0,
+        "empty_reference_with_false_positives": 0.0
+      },
+      "settings": {
+        "precision": "float32",
+        "patch_size": [
+          81,
+          128,
+          128
+        ],
+        "tile_step_size": 0.5,
+        "gaussian_blending": true,
+        "mirroring": true,
+        "mirroring_axes": [
+          1,
+          2
+        ],
+        "probability_threshold": 0.5,
+        "min_component_sizes_et_tc_wt": [
+          161,
+          166,
+          50
+        ],
+        "closing_radius": 1
+      }
+    }
+  },
+  "debug_training_settings": {
+    "baseline": {
+      "num_iterations_per_epoch": "250",
+      "num_val_iterations_per_epoch": "50",
+      "initial_lr": "0.001",
+      "num_epochs": "200",
+      "oversample_foreground_percent": "0.33",
+      "enable_deep_supervision": "False",
+      "loss": "DC_and_BCE_loss(\n  (ce): BCEWithLogitsLoss()\n  (dc): MemoryEfficientSoftDiceLoss()\n)"
+    },
+    "ds": {
+      "num_iterations_per_epoch": "250",
+      "num_val_iterations_per_epoch": "50",
+      "initial_lr": "0.01",
+      "num_epochs": "400",
+      "oversample_foreground_percent": "0.33",
+      "enable_deep_supervision": "False",
+      "loss": "DC_and_BCE_loss(\n  (ce): BCEWithLogitsLoss()\n  (dc): MemoryEfficientSoftDiceLoss()\n)"
+    }
+  },
+  "mean_dice_thresholds": {
+    "baseline": {
+      "0.7": 28,
+      "0.8": 28,
+      "0.82": 35
+    },
+    "ds": {
+      "0.7": 29,
+      "0.8": 30,
+      "0.82": 35
+    }
+  }
+}

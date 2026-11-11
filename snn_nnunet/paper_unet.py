@@ -4,10 +4,10 @@ from torch import nn
 from torch.nn import functional as F
 
 from snn_nnunet import surrogate
-from snn_nnunet.paper_config import PAPER_DEFAULTS, paper_options, normalize_bidirectional_fusion
+from snn_nnunet.paper_config import PAPER_DEFAULTS, ENCODER_BLOCK_NAMES, paper_options, normalize_bidirectional_fusion, validate_shared_soma_options, neuron_model, bidirectional_blocks
 from snn_nnunet.precision import FP32Module, fp32_forward
 from snn_nnunet.spike_neurons import PLIFNode
-from snn_nnunet.recurrent_neuron import SelectiveMultiTimescaleLIF
+from snn_nnunet.recurrent_neuron import SelectiveMultiTimescaleLIF, make_selective_neuron
 
 
 def _plif(options, **kwargs):
@@ -16,19 +16,25 @@ def _plif(options, **kwargs):
     return PLIFNode(**options, surrogate_function=surrogate.ATan(alpha=alpha), **kwargs)
 
 
-def _neuron(name, channels, options):
-    model = options['overrides'].get(name, options['model'])
+def _neuron(name, channels, options, *, shared_soma=False):
+    model = neuron_model(options, name)
     plif = options['plif']
     if model == 'plif':
         return _plif(plif)
-    return SelectiveMultiTimescaleLIF(
-        channels, options['selective'], init_tau=plif['init_tau'],
+    neuron_type = make_selective_neuron
+    if shared_soma:
+        from snn_nnunet.shared_soma import SharedSOMALIF
+        neuron_type = SharedSOMALIF
+    config = dict(options['multi_memory'], model=model,
+                  selective_readout=options['selective_readout'])
+    return neuron_type(
+        channels, config, init_tau=plif['init_tau'],
         detach_reset=plif['detach_reset'],
         surrogate_function=surrogate.ATan(alpha=plif['surrogate_alpha']))
 
 
 class PaperBlock(nn.Module):
-    def __init__(self, name, in_channels, out_channels, options, *, deconv=False, head=False):
+    def __init__(self, name, in_channels, out_channels, options, *, deconv=False, head=False, shared_soma=False):
         super().__init__()
         block = dict(options['head' if head else 'deconv' if deconv else 'conv'])
         self.dropout = block.pop('dropout')
@@ -42,8 +48,11 @@ class PaperBlock(nn.Module):
         norm = options['normalization']
         self.norm = (nn.Identity() if head else nn.GroupNorm(
             norm['num_groups'], out_channels, eps=norm['eps'], affine=norm['affine']))
-        self.spike_neurons = (_plif(plif, no_spiking=True) if head
-                              else _neuron(name, out_channels, options['neurons']))
+        self.spiking = not head and options[
+            'encoder_spiking' if name in ENCODER_BLOCK_NAMES else 'decoder_spiking']
+        self.spike_neurons = (_plif(plif, no_spiking=True) if head else
+                              _neuron(name, out_channels, options['neurons'], shared_soma=shared_soma)
+                              if self.spiking else nn.GELU())
 
     def forward(self, x, time_step):
         return self.activate(self.project(x), time_step)
@@ -54,9 +63,12 @@ class PaperBlock(nn.Module):
         return self.norm(x)
 
     def activate(self, x, time_step, *, apply_dropout=True):
-        x = self.spike_neurons(x, time_step)
-        if not self.is_head:
-            x = x[0]
+        if not self.is_head and not self.spiking:
+            x = self.spike_neurons(x)
+        else:
+            x = self.spike_neurons(x, time_step)
+            if not self.is_head:
+                x = x[0]
         return F.dropout(x, self.dropout, self.training) if apply_dropout and self.dropout else x
 
 
@@ -130,6 +142,9 @@ class PaperUNet(FP32Module):
         self.bidirectional_fusion = normalize_bidirectional_fusion(bidirectional_fusion, enabled=bidirectional)
         self.options = paper_options(options)
         opts = self.options
+        validate_shared_soma_options(opts, enabled=bidirectional, fusion=self.bidirectional_fusion)
+        self.bidirectional_blocks = bidirectional_blocks(opts, enabled=bidirectional)
+        shared_soma = bidirectional and self.bidirectional_fusion == 'Shared_SOMA'
         e1, e2, e3 = opts['encoder_channels']
         d1, d2, d3 = opts['decoder_channels']
         for name, incoming, outgoing, up in (
@@ -139,16 +154,46 @@ class PaperUNet(FP32Module):
             ('deconv_block2', d1, d2, True), ('deconv2_conv', d2, d2, False),
             ('concat2_conv', e1+d2, d2, False), ('deconv_block3', d2, d3, True),
             ('deconv3_conv', d3, d3, False)):
-            setattr(self, name, PaperBlock(name, incoming, outgoing, opts, deconv=up))
+            setattr(self, name, PaperBlock(
+                name, incoming, outgoing, opts, deconv=up,
+                shared_soma=shared_soma and name in self.bidirectional_blocks))
         self.class_conv = PaperBlock('class_conv', d3, out_channels, opts, head=True)
         self.pool = nn.MaxPool2d(**opts['pool'])
         self.multiple = opts['pool']['stride'] ** 3
         self._next_step = None
-        if bidirectional:
+        if bidirectional and not shared_soma:
             self.bidirectional_fusions = nn.ModuleList(
                 (PaperStageFusion(channels, opts['neurons']['plif'], opts['normalization'])
                  if self.bidirectional_fusion == 'conv_plif' else PaperORFusion())
-                for channels in (e1, e2, e3))
+                if f'conv_block{index}' in self.bidirectional_blocks else nn.Identity()
+                for index, channels in enumerate((e1, e2, e3), 1))
+        self.deep_supervision_enabled = opts['deep_supervision']['enabled']
+        self.deep_supervision_resolution = opts['deep_supervision']['resolution']
+        self.auxiliary_heads = nn.ModuleList()
+        if self.deep_supervision_enabled:
+            # Added heads must not change common weights or subsequent RNG draws.
+            devices = list(range(torch.cuda.device_count())) if torch.cuda.is_initialized() else []
+            with torch.random.fork_rng(devices=devices):
+                self.auxiliary_heads.extend((nn.Conv2d(d2, out_channels, 1),
+                                             nn.Conv2d(d1, out_channels, 1)))
+
+    def _segmentation_outputs(self, logits, auxiliary, spatial_shape):
+        main = torch.stack(logits, dim=2)
+        if auxiliary is None:
+            return main
+        if self.deep_supervision_resolution == 'native':
+            return (main, *(torch.stack(slices, dim=2) for slices in auxiliary))
+        h, w = spatial_shape
+        padded = (h + (-h) % self.multiple, w + (-w) % self.multiple)
+        outputs = [main]
+        for slices in auxiliary:
+            # Interpolate only H/W; never downsample labels or the slice axis.
+            sequence = torch.stack(slices, dim=1)
+            batch, steps, channels = sequence.shape[:3]
+            resized = F.interpolate(sequence.flatten(0, 1), size=padded,
+                                    mode='bilinear', align_corners=False)[..., :h, :w]
+            outputs.append(resized.reshape(batch, steps, channels, h, w).transpose(1, 2))
+        return tuple(outputs)
 
     def reset_states(self, *, preserve_diagnostics=False):
         activity = _activity_snapshots(self) if preserve_diagnostics else ()
@@ -195,15 +240,28 @@ class PaperUNet(FP32Module):
             # Rebinding/removing live tensors does not detach either scan's graph.
             _reset_neurons(block, preserve_diagnostics=True)
 
-    def _forward_bidirectional(self, x_win):
+    def _forward_bidirectional(self, x_win, *, return_auxiliary=False):
         h, w = x_win.shape[-2:]
         sequence = F.pad(x_win, (0, (-w) % self.multiple, 0, (-h) % self.multiple))
         stages = []
-        for index, fusion in enumerate(self.bidirectional_fusions, 1):
+        for index in range(1, 4):
             block = getattr(self, f'conv_block{index}')
             # Exactly one ConvBlock per actual stage: its input is shared by
             # both directions. Later blocks with directional inputs cannot cache.
             currents = tuple(block.project(sequence[:, z]) for z in range(sequence.shape[1]))
+            if f'conv_block{index}' not in self.bidirectional_blocks:
+                spikes = self._scan_stage(block, currents)
+                sequence = self.pool(spikes.flatten(0, 1)).unflatten(0, spikes.shape[:2])
+                stages.append(sequence)
+                continue
+            if self.bidirectional_fusion == 'Shared_SOMA':
+                spikes = block.spike_neurons(torch.stack(currents, dim=1))
+                sequence = self.pool(spikes.flatten(0, 1)).unflatten(0, spikes.shape[:2])
+                if block.dropout:
+                    sequence = F.dropout(sequence, block.dropout, self.training)
+                stages.append(sequence)
+                continue
+            fusion = self.bidirectional_fusions[index-1]
             directional_dropout = self.bidirectional_fusion == 'conv_plif'
             forward = self._scan_stage(block, currents, apply_dropout=directional_dropout)
             cell = block.spike_neurons
@@ -225,28 +283,37 @@ class PaperUNet(FP32Module):
                 sequence = F.dropout(sequence, block.dropout, self.training)
             stages.append(sequence)
         logits = []
+        auxiliary = ([], []) if return_auxiliary else None
         pool1, pool2, bottleneck = stages
         for z in range(x_win.shape[1]):
             x = self.deconv1_conv(self.deconv_block1(bottleneck[:, z], z), z)
             x = self.concat1_conv(torch.cat((pool2[:, z], x), dim=1), z)
+            if auxiliary is not None:
+                auxiliary[1].append(self.auxiliary_heads[1](x))
             x = self.deconv2_conv(self.deconv_block2(x, z), z)
             x = self.concat2_conv(torch.cat((pool1[:, z], x), dim=1), z)
+            if auxiliary is not None:
+                auxiliary[0].append(self.auxiliary_heads[0](x))
             x = self.deconv3_conv(self.deconv_block3(x, z), z)
             logits.append(self.class_conv(x, z)[..., :h, :w])
-        return torch.stack(logits, dim=2)
+        return self._segmentation_outputs(logits, auxiliary, (h, w))
 
     @fp32_forward
-    def forward(self, x_win, t0=0):
+    def forward(self, x_win, t0=0, *, return_auxiliary=False):
         if x_win.ndim != 5 or x_win.shape[2] != 4 or min(x_win.shape) <= 0:
             raise ValueError('expected nonempty [B,T,4,H,W] input')
         if type(t0) is not int or t0 < 0:
             raise ValueError('t0 must be a nonnegative integer')
+        if type(return_auxiliary) is not bool:
+            raise ValueError('return_auxiliary must be boolean')
+        if return_auxiliary and not self.deep_supervision_enabled:
+            raise ValueError('return_auxiliary requires deep_supervision.enabled')
         if self.bidirectional:
             if t0 != 0:
                 raise ValueError('bidirectional mode requires a whole independent patch with t0=0')
             self.reset_states()
             try:
-                return self._forward_bidirectional(x_win)
+                return self._forward_bidirectional(x_win, return_auxiliary=return_auxiliary)
             finally:
                 self.reset_states(preserve_diagnostics=True)
         if t0 == 0:
@@ -256,6 +323,7 @@ class PaperUNet(FP32Module):
         h, w = x_win.shape[-2:]
         ph, pw = (-h) % self.multiple, (-w) % self.multiple
         logits = []
+        auxiliary = ([], []) if return_auxiliary else None
         for i in range(x_win.shape[1]):
             t = t0+i
             x = F.pad(x_win[:, i], (0, pw, 0, ph))
@@ -264,9 +332,13 @@ class PaperUNet(FP32Module):
             x = self.pool(self.conv_block3(pool2, t))
             x = self.deconv1_conv(self.deconv_block1(x, t), t)
             x = self.concat1_conv(torch.cat((pool2, x), dim=1), t)
+            if auxiliary is not None:
+                auxiliary[1].append(self.auxiliary_heads[1](x))
             x = self.deconv2_conv(self.deconv_block2(x, t), t)
             x = self.concat2_conv(torch.cat((pool1, x), dim=1), t)
+            if auxiliary is not None:
+                auxiliary[0].append(self.auxiliary_heads[0](x))
             x = self.deconv3_conv(self.deconv_block3(x, t), t)
             logits.append(self.class_conv(x, t)[..., :h, :w])
         self._next_step = t0+x_win.shape[1]
-        return torch.stack(logits, dim=2)
+        return self._segmentation_outputs(logits, auxiliary, (h, w))

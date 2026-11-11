@@ -1,0 +1,232 @@
+"""Start an isolated SNN or stock nnU-Net training run from YAML."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+from typing import Any
+
+import yaml
+
+
+NATIVE_CONFIGURATIONS = {
+    "unet2d": "2d",
+    "unet3d": "3d_fullres",
+}
+
+
+def _integer(config: dict[str, Any], name: str, minimum: int, maximum: int) -> int:
+    value = config.get(name)
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be an integer between {minimum} and {maximum}")
+    return value
+
+
+def _config(path: Path) -> dict[str, Any]:
+    with path.open(encoding="utf-8") as stream:
+        config = yaml.safe_load(stream)
+    if not isinstance(config, dict):
+        raise ValueError("The experiment file must contain a YAML mapping")
+    if config.get("family") not in {"unet2d", "unet3d", "snn"}:
+        raise ValueError("family must be unet2d, unet3d, or snn")
+    _integer(config, "dataset_id", 0, 999)
+    _integer(config, "fold", 0, 4)
+    _integer(config, "gpus", 1, 64)
+    if not isinstance(config.get("run_dir"), str) or not config["run_dir"].strip():
+        raise ValueError("run_dir must be a nonempty path")
+    if config["family"] == "snn":
+        snn = config.get("snn")
+        if not isinstance(snn, dict):
+            raise ValueError("snn settings must be a YAML mapping")
+        if snn.get("variant") not in {"orig", "shallow", "medium", "deep"}:
+            raise ValueError("snn.variant must be orig, shallow, medium, or deep")
+        _integer(snn, "temporal_axis", 0, 2)
+        _integer(snn, "k", 1, 4096)
+        if type(snn.get("use_fptt")) is not bool:
+            raise ValueError("snn.use_fptt must be true or false")
+        vss_output_spiking = snn.get("vss_output_spiking", True)
+        if type(vss_output_spiking) is not bool:
+            raise ValueError("snn.vss_output_spiking must be true or false")
+        snn["vss_output_spiking"] = vss_output_spiking
+        spatial = snn.get("spatial_mamba", {})
+        if not isinstance(spatial, dict):
+            raise ValueError("snn.spatial_mamba must be a YAML mapping")
+        spatial_defaults = {
+            "patch_embedding_spiking": True,
+            "dwconv2d_spiking": True,
+            "output_spiking": False,
+        }
+        if spatial.keys() - spatial_defaults.keys():
+            raise ValueError("snn.spatial_mamba has unknown options")
+        spatial_defaults.update(spatial)
+        for key, value in spatial_defaults.items():
+            if type(value) is not bool:
+                raise ValueError(f"snn.spatial_mamba.{key} must be true or false")
+        snn["spatial_mamba"] = spatial_defaults
+        temporal = snn.get("temporal_mamba", {})
+        if not isinstance(temporal, dict):
+            raise ValueError("snn.temporal_mamba must be a YAML mapping")
+        defaults = {
+            "enabled": False, "kernel_size": 3, "d_state": 16,
+            "dt_rank": "auto", "debug_shapes": False,
+            "norm_spiking": True, "dwconv1D_spiking": True,
+        }
+        if temporal.keys() - (defaults.keys() | {"plif_enabled"}):
+            raise ValueError("snn.temporal_mamba has unknown options")
+        legacy_plif = temporal.pop("plif_enabled", None)
+        if legacy_plif is not None:
+            if type(legacy_plif) is not bool:
+                raise ValueError("snn.temporal_mamba.plif_enabled must be true or false")
+            defaults["norm_spiking"] = legacy_plif
+            defaults["dwconv1D_spiking"] = legacy_plif
+        defaults.update(temporal)
+        if type(defaults["enabled"]) is not bool:
+            raise ValueError("snn.temporal_mamba.enabled must be true or false")
+        for key in ("debug_shapes", "norm_spiking", "dwconv1D_spiking"):
+            if type(defaults[key]) is not bool:
+                raise ValueError(f"snn.temporal_mamba.{key} must be true or false")
+        for key in ("kernel_size", "d_state"):
+            if type(defaults[key]) is not int or defaults[key] <= 0:
+                raise ValueError(f"snn.temporal_mamba.{key} must be a positive integer")
+        rank = defaults["dt_rank"]
+        if rank != "auto" and (type(rank) is not int or rank <= 0):
+            raise ValueError("snn.temporal_mamba.dt_rank must be 'auto' or a positive integer")
+        if defaults["enabled"] and snn["variant"] != "orig":
+            raise ValueError("snn.temporal_mamba.enabled=true requires snn.variant: orig")
+        snn["temporal_mamba"] = defaults
+    return config
+
+
+def _dataset_folder(preprocessed: Path, dataset_id: int) -> Path:
+    matches = sorted(preprocessed.glob(f"Dataset{dataset_id:03d}_*"))
+    if len(matches) != 1 or not matches[0].is_dir():
+        raise ValueError(
+            f"Expected one preprocessed Dataset{dataset_id:03d}_* folder in {preprocessed}"
+        )
+    return matches[0]
+
+
+def _require_preprocessed_configuration(
+    dataset_folder: Path, plans: str, configuration: str
+) -> None:
+    plans_path = dataset_folder / f"{plans}.json"
+    if not plans_path.is_file():
+        raise ValueError(f"Missing plans: {plans_path}")
+    with plans_path.open(encoding="utf-8") as stream:
+        plans_data = json.load(stream)
+    configuration_data = plans_data.get("configurations", {}).get(configuration)
+    if not isinstance(configuration_data, dict):
+        raise ValueError(
+            f"Configuration '{configuration}' is missing from plans: {plans_path}"
+        )
+    data_identifier = configuration_data.get("data_identifier")
+    if not isinstance(data_identifier, str) or not data_identifier:
+        raise ValueError(
+            f"Configuration '{configuration}' has no data_identifier in {plans_path}"
+        )
+    data_folder = dataset_folder / data_identifier
+    if not data_folder.is_dir():
+        raise ValueError(
+            f"Missing preprocessed data for configuration '{configuration}': "
+            f"{data_folder}. Run nnUNetv2_preprocess with -c {configuration}."
+        )
+
+
+def run(config_path: Path) -> None:
+    config_path = config_path.expanduser().resolve()
+    config = _config(config_path)
+    family = config["family"]
+    dataset_id = config["dataset_id"]
+    fold = config["fold"]
+    gpus = config["gpus"]
+    run_dir = Path(config["run_dir"]).expanduser().resolve()
+
+    missing = [name for name in ("nnUNet_raw", "nnUNet_preprocessed") if not os.environ.get(name)]
+    if missing:
+        raise ValueError("Set these nnU-Net paths before training: " + ", ".join(missing))
+    preprocessed = Path(os.environ["nnUNet_preprocessed"]).expanduser().resolve()
+    dataset_folder = _dataset_folder(preprocessed, dataset_id)
+    plans = "SNNPlans" if family == "snn" else "nnUNetPlans"
+    configuration = "3d_fullres" if family == "snn" else NATIVE_CONFIGURATIONS[family]
+    _require_preprocessed_configuration(dataset_folder, plans, configuration)
+    if run_dir.exists() and any(run_dir.iterdir()):
+        raise ValueError(f"Run directory already contains files: {run_dir}. Choose a new run_dir.")
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(config_path, run_dir / "experiment.yaml")
+    os.environ["nnUNet_results"] = str(run_dir)
+    print(
+        f"Model family: {family}; configuration: {configuration}; "
+        f"dataset: {dataset_id}; fold: {fold}; GPUs: {gpus}",
+        flush=True,
+    )
+    print(f"Run directory: {run_dir}", flush=True)
+
+    if family == "snn":
+        from snn_nnunet import cli
+
+        snn = config["snn"]
+        cli.main([
+            "train", "--dataset-id", str(dataset_id), "--fold", str(fold),
+            "--run-dir", str(run_dir), "--gpus", str(gpus),
+            "--model", snn["variant"],
+            "--temporal-axis", str(snn["temporal_axis"]),
+            "--k", str(snn["k"]),
+            "--fptt" if snn["use_fptt"] else "--no-fptt",
+            "--vss-output-spiking" if snn["vss_output_spiking"]
+            else "--no-vss-output-spiking",
+            "--temporal-mamba" if snn["temporal_mamba"]["enabled"] else "--no-temporal-mamba",
+            "--temporal-mamba-kernel-size", str(snn["temporal_mamba"]["kernel_size"]),
+            "--temporal-mamba-d-state", str(snn["temporal_mamba"]["d_state"]),
+            "--temporal-mamba-dt-rank", str(snn["temporal_mamba"]["dt_rank"]),
+            "--temporal-mamba-norm-spiking" if snn["temporal_mamba"]["norm_spiking"]
+            else "--no-temporal-mamba-norm-spiking",
+            "--temporal-mamba-dwconv1d-spiking" if snn["temporal_mamba"]["dwconv1D_spiking"]
+            else "--no-temporal-mamba-dwconv1d-spiking",
+            "--temporal-mamba-debug-shapes" if snn["temporal_mamba"]["debug_shapes"]
+            else "--no-temporal-mamba-debug-shapes",
+            "--spatial-patch-embedding-spiking" if snn["spatial_mamba"]["patch_embedding_spiking"]
+            else "--no-spatial-patch-embedding-spiking",
+            "--spatial-dwconv2d-spiking" if snn["spatial_mamba"]["dwconv2d_spiking"]
+            else "--no-spatial-dwconv2d-spiking",
+            "--spatial-output-spiking" if snn["spatial_mamba"]["output_spiking"]
+            else "--no-spatial-output-spiking",
+        ])
+    else:
+        from nnunetv2.run.run_training import run_training
+        from nnunetv2.utilities.file_path_utilities import get_output_folder
+        from snn_nnunet.empty_dice_evaluation import finalize_fold_summary
+
+        run_training(
+            dataset_name_or_id=str(dataset_id),
+            configuration=configuration,
+            fold=fold,
+            trainer_class_name="nnUNetTrainer",
+            plans_identifier="nnUNetPlans",
+            num_gpus=gpus,
+        )
+        model_folder = Path(get_output_folder(
+            dataset_id, "nnUNetTrainer", "nnUNetPlans", configuration
+        ))
+        summary_path = model_folder / f"fold_{fold}" / "validation" / "summary.json"
+        if summary_path.is_file():
+            metrics = finalize_fold_summary(model_folder, fold)
+            print(
+                "Mean Validation Dice (empty-empty=1): "
+                f"{metrics['foreground_mean']['Dice']}",
+                flush=True,
+            )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, required=True, help="YAML experiment file")
+    args = parser.parse_args()
+    run(args.config)
+
+
+if __name__ == "__main__":
+    main()

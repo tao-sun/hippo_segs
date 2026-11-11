@@ -56,14 +56,19 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
             self.plans_manager.plans['snn_config'] = self.snn_config.to_dict()
             self.my_init_kwargs['plans']['snn_config'] = self.snn_config.to_dict()
         self.num_epochs = self.snn_config.num_epochs
-        self.num_iterations_per_epoch = 250
-        self.num_val_iterations_per_epoch = 50
+        self.num_iterations_per_epoch = self.snn_config.train_batches_per_epoch
+        self.num_val_iterations_per_epoch = self.snn_config.val_batches_per_epoch
         self.initial_lr = self.snn_config.initial_lr
         self.validation_every = self.snn_config.validation_every
         self._periodic_validation = None
+        self._overfit_subject_ids = None
+        self._overfit_datasets = None
+        self._overfit_last_evaluation = None
         self.weight_decay = 3e-5
         self.oversample_foreground_percent = 0.33
         self.enable_deep_supervision = False
+        # Keep a complete recovery point after every completed epoch.
+        self.save_every = 1
         for key in _EPOCH_METRICS:
             self.logger.local_logger.my_fantastic_logging.setdefault(key, [])
 
@@ -108,9 +113,119 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
         # Keeping that lookup live also lets the native predictor rebuild this model.
         return network_adapter.SNNnnUNetAdapter(config)
 
+    def _ensure_overfit_subjects(self):
+        """Select and restrict volume files before native datasets, patches or caches."""
+        if not self.snn_config.overfit_num_volumes:
+            return None
+        if getattr(self, '_overfit_subject_ids', None) is not None:
+            return self._overfit_subject_ids
+        from pathlib import Path
+        from nnunetv2.training.dataloading.nnunet_dataset import infer_dataset_class
+        from snn_nnunet.overfit import select_overfit_subjects, stage_selected_data
+
+        if self.dataset_class is None:
+            self.dataset_class = infer_dataset_class(self.preprocessed_dataset_folder)
+        distributed = getattr(self, 'is_ddp', False)
+        status = [None]
+        if not distributed or dist.get_rank() == 0:
+            try:
+                ids = select_overfit_subjects(
+                    self, self.snn_config.overfit_num_volumes, self.snn_config.seed)
+                folder = stage_selected_data(
+                    self.preprocessed_dataset_folder, Path(self.output_folder) / 'overfit_data', ids)
+                status[0] = {'ids': ids, 'folder': str(folder)}
+            except Exception as error:
+                if not distributed:
+                    raise
+                status[0] = {'error': f'{type(error).__name__}: {error}'}
+        if distributed:
+            dist.broadcast_object_list(status, src=0)
+        if 'error' in status[0]:
+            raise RuntimeError(f"Overfit selection failed: {status[0]['error']}")
+        self._overfit_subject_ids = tuple(status[0]['ids'])
+        # Native unpack_dataset scans this folder; only selected files are visible.
+        self.preprocessed_dataset_folder = status[0]['folder']
+        if not distributed or dist.get_rank() == 0:
+            self.print_to_log_file(
+                f'OVERFIT DIAGNOSTIC ONLY: train=validation=test; '
+                f'{len(self._overfit_subject_ids)} unique labeled training volumes; '
+                f'seed={self.snn_config.seed}; subjects={list(self._overfit_subject_ids)}')
+        return self._overfit_subject_ids
+
+    def do_split(self):
+        if not self.snn_config.overfit_num_volumes:
+            return super().do_split()
+        ids = self._ensure_overfit_subjects()
+        return list(ids), list(ids)
+
+    def get_tr_and_val_datasets(self):
+        if not self.snn_config.overfit_num_volumes:
+            return super().get_tr_and_val_datasets()
+        from snn_nnunet.overfit import make_overfit_datasets
+        ids = self._ensure_overfit_subjects()
+        if getattr(self, '_overfit_datasets', None) is None:
+            self._overfit_datasets = make_overfit_datasets(self, ids)
+        return self._overfit_datasets['train'], self._overfit_datasets['validation']
+
+    def _evaluate_overfit(self):
+        """All ranks rendezvous; rank zero evaluates identical deterministic splits."""
+        ids = self._ensure_overfit_subjects()
+        if self._overfit_last_evaluation is not None:
+            epoch, summary = self._overfit_last_evaluation
+            if epoch == self.current_epoch:
+                return summary
+        from snn_nnunet.overfit import evaluate_overfit_volumes
+        distributed = getattr(self, 'is_ddp', False)
+        status = [None]
+        if distributed:
+            dist.barrier()
+        if not distributed or dist.get_rank() == 0:
+            network = self.network
+            try:
+                # A rank-zero DDP forward would otherwise wait for buffer broadcasts.
+                self.network = self._unwrapped_network()
+                summary = evaluate_overfit_volumes(self, ids, epoch=self.current_epoch)
+                status[0] = {'summary': summary}
+            except Exception as error:
+                if not distributed:
+                    raise
+                status[0] = {'error': f'{type(error).__name__}: {error}'}
+            finally:
+                self.network = network
+        if distributed:
+            dist.broadcast_object_list(status, src=0)
+        if 'error' in status[0]:
+            raise RuntimeError(f"Overfit evaluation failed: {status[0]['error']}")
+        summary = status[0]['summary']
+        self._overfit_last_evaluation = (self.current_epoch, summary)
+        return summary
+
+    def on_epoch_end(self):
+        # Native epoch handling writes latest before best. Suppress only its
+        # periodic write, then publish latest after best and epoch bookkeeping.
+        save_every = self.save_every
+        self.save_every = self.num_epochs + 1
+        try:
+            super().on_epoch_end()
+        finally:
+            self.save_every = save_every
+        from snn_nnunet.resume_validation import save_completed_checkpoint
+
+        save_completed_checkpoint(self, os.path.join(self.output_folder, 'checkpoint_latest.pth'))
+        if self.snn_config.overfit_num_volumes:
+            self._evaluate_overfit()
+
+    def on_train_end(self):
+        super().on_train_end()
+        if self.snn_config.overfit_num_volumes:
+            self._evaluate_overfit()
+
     def on_train_start(self):
+        overfit = getattr(getattr(self, 'snn_config', None), 'overfit_num_volumes', 0)
+        if overfit:
+            self._ensure_overfit_subjects()
         super().on_train_start()
-        if self.validation_every and self._periodic_validation is None:
+        if not overfit and self.validation_every and self._periodic_validation is None:
             from snn_nnunet.resume_validation import install_periodic_validation
 
             controller = install_periodic_validation(self, self.validation_every)
@@ -118,7 +233,7 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
             controller.validate_current()
 
     def set_deep_supervision_enabled(self, enabled: bool):
-        """The adapter has no nnU-Net decoder or deep-supervision heads."""
+        """Native target pyramids stay disabled; paper heads are requested explicitly."""
 
     def configure_rotation_dummyDA_mirroring_and_inital_patch_size(self):
         rotation, dummy_2d, initial_patch_size, mirror_axes = (
@@ -155,16 +270,31 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
                 device=str(self.device),
                 gpu_name=torch.cuda.get_device_name(self.device) if self.device.type == 'cuda' else None)
             self.print_to_log_file('Reproducibility:', self.reproducibility)
+            self.print_to_log_file(
+                f'Batches per epoch: training={self.num_iterations_per_epoch}, '
+                f'validation={self.num_val_iterations_per_epoch} (per process)')
             if self.snn_config.bidirectional:
                 self.print_to_log_file(
-                    f'Bidirectional Paper U-Net: {self.snn_config.bidirectional_fusion} fusion after pooling; full-Z BPTT '
+                    f'Bidirectional Paper U-Net: {self.snn_config.bidirectional_fusion} '
+                    f'{"memory fusion before pooling" if self.snn_config.bidirectional_fusion == "Shared_SOMA" else "fusion after pooling"}; full-Z BPTT '
                     f'k={self.snn_config.k}, temporal_axis={self.snn_config.temporal_axis}, use_fptt=False')
         super().initialize()
+        if self.local_rank == 0:
+            for name, cell in named_selective_neurons(self._unwrapped_network()):
+                if getattr(cell, 'is_linear_attention', False):
+                    if cell.gamma is None:
+                        self.print_to_log_file(f'Attention residual {name}: attention_gamma={cell.attention_gamma:g} (fixed)')
+                    else:
+                        self.print_to_log_file(
+                            f'Attention residual {name}: attention_gamma_mode={cell.attention_gamma_mode}; '
+                            f'gamma shape={tuple(cell.gamma.shape)} init={cell.config["attention_gamma_init"]:g} (learnable)')
         if self.snn_config.use_fptt:
             fptt.init_running_params(self._get_adapter())
         self._check_temporal_regularization()
 
     def get_dataloaders(self):
+        if self.snn_config.overfit_num_volumes:
+            self._ensure_overfit_subjects()
         if not self.snn_config.deterministic:
             return super().get_dataloaders()
         from snn_nnunet.reproducibility import deterministic_dataloaders
@@ -180,6 +310,9 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
             raise ValueError('Unrecognized temporal parameters; cannot verify their regularization policy')
         fptt_exempt = getattr(adapter, '_fptt_exempt_parameter_names', frozenset())
         for name, cell in cells:
+            if getattr(cell, 'is_linear_attention', False) and cell.gamma is not None:
+                if not cell.gamma.requires_grad or id(cell.gamma) not in groups:
+                    raise ValueError(f'{name}.gamma must be trainable and included in the optimizer')
             decay = groups[id(cell.temporal_raw)]['weight_decay']
             expected = self.weight_decay if cell.config['temporal_weight_decay'] else 0.
             if decay != expected:
@@ -197,23 +330,25 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
                 )
 
     def save_checkpoint(self, filename: str) -> None:
-        super().save_checkpoint(filename)
         if self.local_rank != 0 or self.disable_checkpointing:
+            super().save_checkpoint(filename)
             return
 
-        checkpoint = torch.load(filename, map_location="cpu", weights_only=False)
-        state = {name: getattr(self.snn_config, name) for name in _CHECKPOINT_CONFIG_FIELDS}
-        if self.snn_config.use_fptt:
-            state.update(fptt.export_fptt_tensors(self._get_adapter()))
-        checkpoint["fptt_state"] = state
-        checkpoint['reproducibility'] = self.reproducibility
-        if self.snn_config.model_name == "paper_unet":
-            checkpoint["snn_config"] = self.snn_config.to_dict()
-
+        # Build the entire native + SNN payload beside the destination. A failed
+        # write must leave the preceding complete checkpoint available for resume.
         directory = os.path.dirname(os.path.abspath(filename))
         descriptor, temporary = tempfile.mkstemp(prefix=".checkpoint-", suffix=".pth", dir=directory)
         os.close(descriptor)
         try:
+            super().save_checkpoint(temporary)
+            checkpoint = torch.load(temporary, map_location="cpu", weights_only=False)
+            state = {name: getattr(self.snn_config, name) for name in _CHECKPOINT_CONFIG_FIELDS}
+            if self.snn_config.use_fptt:
+                state.update(fptt.export_fptt_tensors(self._get_adapter()))
+            checkpoint["fptt_state"] = state
+            checkpoint['reproducibility'] = self.reproducibility
+            if self.snn_config.model_name == "paper_unet":
+                checkpoint["snn_config"] = self.snn_config.to_dict()
             torch.save(checkpoint, temporary)
             os.replace(temporary, filename)
         finally:
@@ -228,7 +363,7 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
         saved_plans = checkpoint.get("init_args", {}).get("plans", {})
         saved_config = saved_plans.get("snn_config", {})
         restored_policy = SNNConfig.from_plans(saved_plans)
-        for field in ('seed', 'deterministic', 'augmentation_workers'):
+        for field in ('seed', 'deterministic', 'augmentation_workers', 'overfit_num_volumes'):
             if getattr(restored_policy, field) != getattr(self.snn_config, field):
                 raise ValueError(f'Checkpoint {field} differs from the current reproducibility policy')
         if self.snn_config.model_name == "paper_unet" or saved_config.get("model_name") == "paper_unet":
@@ -346,8 +481,17 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
             for _, cell in recurrent_cells:
                 frequency = cell.config["diagnostics"]["every_n_windows"]
                 cell.collect_diagnostics = bool(frequency and window_index % frequency == 0)
-            logits = self.network(data_window, t0=t0, chunk_size=window_length)
-            task_loss = self.loss(logits, target_window)
+            supervision = (config.model_kwargs.get('deep_supervision', {})
+                           if config.model_name == 'paper_unet' else {})
+            kwargs = {'return_auxiliary': True} if supervision.get('enabled', False) else {}
+            logits = self.network(data_window, t0=t0, chunk_size=window_length, **kwargs)
+            if supervision.get('enabled', False):
+                from snn_nnunet.deep_supervision import deep_supervision_loss
+                task_loss = deep_supervision_loss(logits, target_window, self.loss, supervision['weights'],
+                                                  temporal_axis=axis,
+                                                  spatial_stride=config.model_kwargs['pool']['stride'])
+            else:
+                task_loss = self.loss(logits, target_window)
             regularization = torch.zeros_like(task_loss)
             if config.use_fptt:
                 regularization = fptt.regularizer_loss(
@@ -365,6 +509,9 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
                 self.network.parameters(), 12, error_if_nonfinite=True
             )
             self.optimizer.step()
+            for _, cell in recurrent_cells:
+                if getattr(cell, 'is_linear_attention', False):
+                    cell.project_gamma_()
             did_step = True
 
             if config.use_fptt and did_step:
@@ -406,6 +553,8 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
 
     def perform_actual_validation(self, save_probabilities: bool = False):
         """Use FP32 and consistent empty-region Dice before native metrics are logged."""
+        if self.snn_config.overfit_num_volumes:
+            return self._evaluate_overfit()
         geometry = nullcontext()
         if self.snn_config.model_name == "paper_unet":
             from snn_nnunet.custom_full_validation import temporary_patch_size
@@ -470,6 +619,14 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
             self.logger.log(key, values.get(key, float("nan")), self.current_epoch)
         summary = {key: round(value, 6) for key, value in values.items()
                    if key.endswith(("soma/firing_rate", "projection/input_ratio", "lambda/min_gap"))}
+        attention_prefixes = {key.removesuffix('/gamma/mean') for key in values
+                              if key.endswith('/gamma/mean')}
+        for prefix in attention_prefixes:
+            for metric in ('gamma/mean', 'gamma/min', 'gamma/max', 'input/rms',
+                           'projection/rms', 'projection/input_ratio', 'gradient/gamma/norm'):
+                key = f'{prefix}/{metric}'
+                if key in values:
+                    summary[key] = round(values[key], 6)
         if summary:
             self.print_to_log_file("Recurrent neuron diagnostics:", summary)
         anomalies = {key: value for key, value in values.items()
@@ -519,10 +676,31 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
                     f'temporal_fptt_regularization={cell.config["temporal_fptt_regularization"]}'
                 )
 
+    @torch.no_grad()
+    def _log_attention_gammas(self):
+        """Log actual epoch-end coefficients, independent of diagnostic sampling."""
+        if self.local_rank != 0:
+            return
+        store = self.logger.local_logger.my_fantastic_logging
+        for name, cell in named_selective_neurons(self._unwrapped_network()):
+            if not getattr(cell, 'is_linear_attention', False) or cell.gamma is None:
+                continue
+            gamma = cell.gamma.detach()
+            values = torch.stack((gamma.mean(), gamma.amin(), gamma.amax())).cpu().tolist()
+            for stat, value in zip(('mean', 'min', 'max'), values):
+                key = f'attention_gamma/{name}/{stat}'
+                history = store.setdefault(key, [])
+                history.extend([float('nan')] * max(0, self.current_epoch - len(history)))
+                self.logger.log(key, value, self.current_epoch)
+            self.print_to_log_file(
+                f'Attention gamma epoch {self.current_epoch + 1} {name}: '
+                f'mean={values[0]:.8g} min={values[1]:.8g} max={values[2]:.8g}')
+
     def on_train_epoch_end(self, train_outputs: list[dict]):
         if self.snn_config.use_fptt:
             fptt.reset_running_params(self._get_adapter())
         self._log_temporal_parameters()
+        self._log_attention_gammas()
         # nnU-Net collates every key; nested recurrent diagnostics are aggregated below.
         super().on_train_epoch_end([{"loss": row["loss"]} for row in train_outputs])
         keys = ("task_loss", "fptt_regularization", "total_loss")

@@ -31,6 +31,9 @@ def init_running_params(model):
 def reset_running_params(model):
     for name, param in regularized_named_parameters(model):
         param.data.copy_(model.avg_weights[name].data)
+    for _, cell in named_selective_neurons(model):
+        if getattr(cell, 'is_linear_attention', False):
+            cell.project_gamma_()
 
 
 # add a loss item

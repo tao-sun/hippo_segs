@@ -203,20 +203,40 @@ class PeriodicFullValidation:
             f"Epoch {epoch} full-volume Dice: raw={summary['mean']['raw']['mean']:.6f}; "
             f"postprocessed={summary['mean']['postprocessed']['mean']:.6f}"
         )
+        if 'mean_per_patient' in summary:
+            trainer.print_to_log_file(
+                f"Epoch {epoch} full-volume Dice per patient: "
+                f"raw={summary['mean_per_patient']['raw']['mean']:.6f}; "
+                f"postprocessed={summary['mean_per_patient']['postprocessed']['mean']:.6f}"
+            )
 
     def _update_history(self):
         summaries = []
+        dataset_base = getattr(self.trainer, 'preprocessed_dataset_folder_base', None)
+        patient_wise = (dataset_base is not None and
+                        (Path(dataset_base) / 'patient_partition.json').is_file())
         for path in sorted(self.root.glob('epoch_*/summary.json')):
             try:
                 summary = json.loads(path.read_text())
             except json.JSONDecodeError:
                 continue
             if 'epoch' in summary:
+                if patient_wise and 'mean_per_patient' not in summary:
+                    # Upgrade saved volume scores without reading images or
+                    # running inference again. Retain epoch/checkpoint/settings.
+                    from snn_nnunet.custom_full_validation import summarize_cases, write_patient_dice_tables
+                    summary.update(summarize_cases(summary['cases'], patient_wise=True))
+                    _write_json(path, summary)
+                    write_patient_dice_tables(summary, path.parent)
                 summaries.append(summary)
         if not summaries:
             return
         columns = ['epoch', 'cases', 'raw_WT', 'raw_TC', 'raw_ET', 'raw_mean',
                    'postprocessed_WT', 'postprocessed_TC', 'postprocessed_ET', 'postprocessed_mean', 'checkpoint']
+        columns += ['patients'] + [f'{stage}_per_{unit}_{region}'
+                                  for unit in ('volume', 'patient')
+                                  for stage in ('raw', 'postprocessed')
+                                  for region in ('WT', 'TC', 'ET', 'mean')]
         destination = self.root / 'dice_history.csv'
         temporary = destination.with_suffix('.csv.tmp')
         with temporary.open('w', newline='', encoding='utf-8') as stream:
@@ -227,6 +247,14 @@ class PeriodicFullValidation:
                 for stage in ('raw', 'postprocessed'):
                     row.update({f'{stage}_{region}': summary['mean'][stage][region]
                                 for region in ('WT', 'TC', 'ET', 'mean')})
+                    volumes = summary.get('mean_per_volume', summary['mean'])
+                    row.update({f'{stage}_per_volume_{region}': volumes[stage][region]
+                                for region in ('WT', 'TC', 'ET', 'mean')})
+                    if 'mean_per_patient' in summary:
+                        row.update({f'{stage}_per_patient_{region}': summary['mean_per_patient'][stage][region]
+                                    for region in ('WT', 'TC', 'ET', 'mean')})
+                if 'mean_per_patient' in summary:
+                    row['patients'] = summary['counts']['patients']
                 writer.writerow(row)
         os.replace(temporary, destination)
         best = max(summaries, key=lambda s: s['mean']['postprocessed']['mean'])
@@ -236,6 +264,7 @@ class PeriodicFullValidation:
         os.replace(temporary_checkpoint, best_checkpoint)
         _write_json(self.root / 'best_postprocessed.json', {
             'epoch': best['epoch'], 'mean': best['mean'], 'checkpoint': str(best_checkpoint),
+            **{key: best[key] for key in ('mean_per_volume', 'mean_per_patient', 'counts') if key in best},
         })
 
 

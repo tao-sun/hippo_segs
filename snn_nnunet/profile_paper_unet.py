@@ -68,6 +68,19 @@ def selective_cost(cell, sites):
                      *_product(gate.kernel_size) for gate in cell.readout_gates)
     projection = sites*cell.memory_projection.in_channels*cell.memory_projection.out_channels
     compartments = len(cell.state_names)
+    if getattr(cell, 'is_linear_attention', False):
+        from snn_nnunet.profile_linear_attention import linear_attention_cost
+        attention = linear_attention_cost(channels, sites)
+        attention_macs = sum(value for name, value in attention.items() if name.endswith('_macs'))
+        return {
+            'spatial_depthwise_macs': depthwise, 'readout_gate_macs': 0,
+            'memory_projection_macs': projection,
+            'continuous_linear_macs': depthwise+projection+attention_macs,
+            'elementwise_multiplications': sites*channels*compartments*(4 if cell.spatial_enabled else 2),
+            'elementwise_additions': sites*channels*(compartments*(2 if cell.spatial_enabled else 1)+1),
+            'gate_bias_additions': 0, 'gate_sigmoid_elements': 0,
+            'ssn_spatial_update_sites': sites, **attention,
+        }
     return {
         'spatial_depthwise_macs': depthwise,
         'readout_gate_macs': gates,
@@ -103,17 +116,25 @@ def parameter_formula(model):
             # Temporal 3C; spatial eta 3C + DW weights 27C; gate 6C²+3C
             # or static 3C; projection C²; somatic scalar PLIF.
             total += 3*outgoing+outgoing**2+1
+            if getattr(neuron, 'is_shared_soma', False):
+                total += 6*outgoing**2+3*outgoing
             if neuron.spatial_enabled:
                 total += 30*outgoing
-            total += (6*outgoing**2+3*outgoing if neuron.selective_enabled else 3*outgoing)
-        else:
+            if getattr(neuron, 'is_linear_attention', False):
+                total += 256*outgoing+96
+                if neuron.gamma is not None:
+                    total += outgoing  # Independent LayerScale coefficient per feature channel.
+            else:
+                total += (6*outgoing**2+3*outgoing if neuron.selective_enabled else 3*outgoing)
+        elif isinstance(neuron, PLIFNode):
             total += 1
     total += d3*out_channels*opts['head']['kernel_size']**2
     total += out_channels if opts['head']['bias'] else 0
     total += 1  # Continuous voltage head has a learned PLIF time constant.
     if getattr(model, 'bidirectional', False) and model.bidirectional_fusion == 'conv_plif':
         total += sum(2*c*c+1 + (2*c if opts['normalization']['affine'] else 0)
-                     for c in (e1, e2, e3))
+                     for index, c in enumerate((e1, e2, e3), 1)
+                     if f'conv_block{index}' in model.bidirectional_blocks)
     return total
 
 
@@ -125,6 +146,7 @@ def estimate_cost(model, shape=(81, 128, 128), batch=1):
     h, w = (math.ceil(n/model.multiple)*model.multiple for n in (h, w))
     bi = getattr(model, 'bidirectional', False)
     fusion_method = model.bidirectional_fusion if bi else None
+    shared_soma = bi and fusion_method == 'Shared_SOMA'
     layers, ssn = [], []
     plif_sites = 0
     or_comparisons = 0
@@ -135,27 +157,54 @@ def estimate_cost(model, shape=(81, 128, 128), batch=1):
         layer = block.deconv if block.is_deconv else block.conv
         out = _output_spatial(layer, incoming_shape[2:])
         macs = convolution_macs(layer, incoming_shape)*z
-        kind = 'continuous_input' if name == 'conv_block1' else 'spike_eligible'
+        if name == 'conv_block1':
+            spiking_input = False
+        elif name in ('conv_block2', 'conv_block3', 'deconv_block1'):
+            spiking_input = model.options['encoder_spiking']
+        elif name in ('concat1_conv', 'concat2_conv'):
+            spiking_input = model.options['encoder_spiking'] and model.options['decoder_spiking']
+        else:
+            spiking_input = model.options['decoder_spiking']
+        kind = 'spike_eligible' if spiking_input else 'continuous_input'
+        neuron_calls = 0 if isinstance(block.spike_neurons, nn.GELU) else z*repeats
         layers.append({'name': name, 'kind': kind, 'macs': macs,
                        'input_bchw': list(incoming_shape), 'output_hw': list(out),
-                       'convolution_calls': z, 'neuron_calls': z*repeats})
+                       'convolution_calls': z, 'neuron_calls': neuron_calls})
         sites = batch*z*_product(out)*repeats
-        plif_sites += sites*layer.out_channels
+        if not isinstance(block.spike_neurons, nn.GELU):
+            plif_sites += sites*layer.out_channels
         if isinstance(block.spike_neurons, SelectiveMultiTimescaleLIF):
-            ssn.append({'name': name, 'directional_repeats': repeats, 'ssn_calls': z*repeats,
-                        **selective_cost(block.spike_neurons, sites)})
+            cell = block.spike_neurons
+            if getattr(cell, 'is_shared_soma', False):
+                cost = selective_cost(cell, sites)
+                # A second memory trajectory, but no second readout/projection/soma.
+                depthwise = cost['spatial_depthwise_macs']
+                fusion = sites*6*cell.channels**2
+                cost['spatial_depthwise_macs'] += depthwise
+                cost['continuous_linear_macs'] += depthwise+fusion
+                cost['memory_fusion_macs'] = fusion
+                cost['memory_fusion_bias_additions'] = sites*3*cell.channels
+                cost['elementwise_multiplications'] += sites*cell.channels*3*(4 if cell.spatial_enabled else 2)
+                cost['elementwise_additions'] += sites*cell.channels*3*(2 if cell.spatial_enabled else 1)
+                cost['ssn_spatial_update_sites'] *= 2
+                ssn.append({'name': name, 'directional_repeats': 2, 'ssn_calls': 1,
+                            'memory_trajectory_calls': 2*z, 'readout_calls': z, 'soma_calls': z, **cost})
+            else:
+                ssn.append({'name': name, 'directional_repeats': repeats, 'ssn_calls': z*repeats,
+                            **selective_cost(cell, sites)})
         return (batch, layer.out_channels, *out)
 
     spatial = (batch, 4, h, w)
     skips = []
     pool = model.pool
     for index in range(3):
-        spatial = record(f'conv_block{index+1}', spatial, repeats=2 if bi else 1)
+        active = f'conv_block{index+1}' in model.bidirectional_blocks
+        spatial = record(f'conv_block{index+1}', spatial, repeats=2 if active and not shared_soma else 1)
         kernel = pool.kernel_size if isinstance(pool.kernel_size, int) else pool.kernel_size[0]
         stride = pool.stride if isinstance(pool.stride, int) else pool.stride[0]
         padding = pool.padding if isinstance(pool.padding, int) else pool.padding[0]
         spatial = (*spatial[:2], *((n+2*padding-kernel)//stride+1 for n in spatial[2:]))
-        if bi and fusion_method == 'conv_plif':
+        if active and fusion_method == 'conv_plif':
             fusion = model.bidirectional_fusions[index]
             fusion_input = (batch, spatial[1]*2, *spatial[2:])
             layers.append({'name': f'bidirectional_fusions.{index}',
@@ -164,7 +213,7 @@ def estimate_cost(model, shape=(81, 128, 128), batch=1):
                            'input_bchw': list(fusion_input), 'output_hw': list(spatial[2:]),
                            'convolution_calls': z, 'neuron_calls': z})
             plif_sites += batch*z*_product(spatial[1:])
-        elif bi:
+        elif active and not shared_soma:
             or_comparisons += batch*z*_product(spatial[1:])
         skips.append(spatial)
     for index in range(1, 4):
@@ -322,7 +371,7 @@ def measure_activity(model, inputs, *, training=False):
         try:
             for name, module in probe.named_modules():
                 # Functional SSN internals are already accounted analytically.
-                internal = any(word in name for word in ('.spatial_kernels.', '.readout_gates.', '.memory_projection'))
+                internal = any(word in name for word in ('.spatial_kernels.', '.readout_gates.', '.memory_projection', '.attention.'))
                 if isinstance(module, (nn.Conv2d, nn.ConvTranspose2d)) and not internal:
                     hooks.append(module.register_forward_hook(conv_hook(name)))
                 if isinstance(module, (PLIFNode, SelectiveMultiTimescaleLIF)):

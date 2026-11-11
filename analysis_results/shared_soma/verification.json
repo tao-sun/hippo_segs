@@ -1,0 +1,52 @@
+{
+  "test_command": ".venv/bin/python -m pytest -q",
+  "passed": 70,
+  "failed": 0,
+  "warnings": 4,
+  "warning_origin": "pre-existing SciPy deprecations in batchgenerators",
+  "baseline_passed": 35,
+  "legacy_bitwise_cases": 8,
+  "legacy_rtol": 0,
+  "legacy_atol": 0,
+  "protected_sources_unchanged": true,
+  "strict_legacy_checkpoint_loads": 8,
+  "architecture_tests": "independent memory equations/alignment, three-scale mean initialization, readout/projection oracle, one forward soma, binary spikes, pooling/dropout, 81-slice gradients, subject/error resets, axes, full-patch BPTT, config/checkpoint/optimizer roundtrips, native train_step, operation accounting",
+  "review": {
+    "critical": 0,
+    "important": 0,
+    "minor_findings_resolved": [
+      "new fusion gradient diagnostics (RED/GREEN)",
+      "CUDA warmup=0 early validation (RED/GREEN)",
+      "checkpoint test comment corrected"
+    ],
+    "deferred": []
+  },
+  "opt_in_yaml_validated": true,
+  "documented_cli_commands_validated": 3,
+  "modified_files": [
+    "snn_nnunet/cli.py",
+    "snn_nnunet/network_adapter.py",
+    "snn_nnunet/paper_config.py",
+    "snn_nnunet/paper_unet.py",
+    "snn_nnunet/profile_paper_unet.py",
+    "snn_nnunet/trainer.py"
+  ],
+  "new_files": [
+    "SHARED_SOMA.md",
+    "analysis_results/shared_soma/legacy_reference.json",
+    "analysis_results/shared_soma/legacy_regression.json",
+    "analysis_results/shared_soma/report.json",
+    "analysis_results/shared_soma/verification.json",
+    "snn_nnunet/profile_shared_soma.py",
+    "snn_nnunet/shared_soma.py",
+    "test_shared_soma.py",
+    "test_shared_soma_legacy.py",
+    "unet_shared_soma.yaml"
+  ],
+  "local_ignored_plan": "docs/superpowers/plans/2026-11-05-shared-soma.md",
+  "cuda_available": false,
+  "gpu_peak_memory": "unmeasured",
+  "gpu_latency": "unmeasured",
+  "latency_scope": "tiny synthetic CPU patch only; full-size counts analytical; benchmark run after task test processes exited",
+  "final_suite_summary": "70 passed, 4 warnings in 47.40s"
+}

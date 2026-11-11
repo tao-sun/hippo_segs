@@ -1,0 +1,16 @@
+{
+  "cases": 8,
+  "bitwise_equal": true,
+  "rtol": 0,
+  "atol": 0,
+  "protected_sources_unchanged": true,
+  "strict_checkpoint_loads": 8,
+  "compared": [
+    "parameters",
+    "key_order",
+    "outputs",
+    "all_parameter_gradients",
+    "input_gradients",
+    "A/B/A resets"
+  ]
+}

@@ -36,8 +36,10 @@ def build_parser():
     parser.add_argument("--configuration", default="3d_fullres")
     parser.add_argument("--trainer", default="nnUNetTrainer")
     parser.add_argument("--plans", default="nnUNetPlans")
-    parser.add_argument("--checkpoint-name", default="checkpoint_final.pth")
-    parser.add_argument("--patch-size", nargs=3, type=int, default=(128, 128, 128))
+    parser.add_argument("--checkpoint-name", default=None)
+    parser.add_argument("--patch-size", nargs=3, type=int, default=None)
+    parser.add_argument("--subset", choices=('val', 'test'), default='val',
+                        help='Internal validation, or explicit held-out patient test after training')
     parser.add_argument("--tile-step-size", type=float, default=0.5)
     parser.add_argument("--prob-threshold", type=float, default=0.5)
     parser.add_argument(
@@ -93,9 +95,7 @@ def dice_metrics(reference, prediction):
     return result
 
 
-def summarize_cases(cases):
-    if not cases:
-        raise ValueError("cannot summarize an empty validation fold")
+def _mean_case_dice(cases):
     means = {}
     for stage in ("raw", "postprocessed"):
         region_means = {
@@ -104,11 +104,72 @@ def summarize_cases(cases):
         }
         region_means["mean"] = float(np.mean(list(region_means.values())))
         means[stage] = region_means
+    return means
+
+
+def summarize_cases(cases, *, patient_wise=False):
+    """Average volume Dice; optionally also give every base patient ID equal weight."""
+    if not cases:
+        raise ValueError("cannot summarize an empty validation fold")
+    means = _mean_case_dice(cases)
     delta = {
         key: means["postprocessed"][key] - means["raw"][key]
         for key in (*REGION_ORDER, "mean")
     }
-    return {"cases": cases, "mean": means, "delta": delta, "dice_convention": dict(DICE_CONVENTION)}
+    summary = {"cases": cases, "mean": means, "delta": delta, "dice_convention": dict(DICE_CONVENTION)}
+    if patient_wise:
+        from snn_nnunet.patient_partition import patient_id
+
+        groups, seen = {}, set()
+        for case in cases:
+            identifier = case['case']
+            patient = patient_id(identifier)
+            if identifier in seen:
+                raise ValueError(f'Duplicate volume in patient Dice aggregation: {identifier}')
+            seen.add(identifier)
+            groups.setdefault(patient, []).append(case)
+        patients = []
+        for patient, volumes in sorted(groups.items()):
+            volumes = sorted(volumes, key=lambda case: case['case'])
+            patients.append({'patient': patient, 'num_volumes': len(volumes),
+                             'cases': [case['case'] for case in volumes],
+                             **_mean_case_dice(volumes)})
+        patient_means = {}
+        for stage in ('raw', 'postprocessed'):
+            scores = {region: float(np.mean([patient[stage][region] for patient in patients]))
+                      for region in REGION_ORDER}
+            scores['mean'] = float(np.mean(list(scores.values())))
+            patient_means[stage] = scores
+        summary.update(
+            counts={'volumes': len(cases), 'patients': len(patients)},
+            patients=patients, mean_per_volume=means, mean_per_patient=patient_means,
+            delta_per_patient={region: patient_means['postprocessed'][region] - patient_means['raw'][region]
+                               for region in (*REGION_ORDER, 'mean')},
+        )
+    return summary
+
+
+def write_patient_dice_tables(summary, output_dir):
+    """Export evaluation aggregates plus auditable volume means for each patient."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with (output_dir / 'aggregate_metrics.csv').open('w', newline='', encoding='utf-8') as stream:
+        writer = csv.writer(stream)
+        writer.writerow(('aggregation', 'stage', 'region', 'dice', 'num_volumes', 'num_patients'))
+        for aggregation in ('per_volume', 'per_patient'):
+            for stage in ('raw', 'postprocessed'):
+                for region in (*REGION_ORDER, 'mean'):
+                    writer.writerow((aggregation, stage, region,
+                                     summary[f'mean_{aggregation}'][stage][region],
+                                     summary['counts']['volumes'], summary['counts']['patients']))
+    with (output_dir / 'patient_metrics.csv').open('w', newline='', encoding='utf-8') as stream:
+        writer = csv.writer(stream)
+        writer.writerow(('patient', 'num_volumes', 'cases', 'stage', *REGION_ORDER, 'mean'))
+        for patient in summary['patients']:
+            for stage in ('raw', 'postprocessed'):
+                writer.writerow((patient['patient'], patient['num_volumes'],
+                                 ';'.join(patient['cases']), stage,
+                                 *(patient[stage][region] for region in (*REGION_ORDER, 'mean'))))
 
 
 def print_dice_summary(summary):
@@ -121,6 +182,15 @@ def print_dice_summary(summary):
     )
     gains = " ".join(f"{region}={summary['delta'][region]:+.6f}" for region in REGION_ORDER)
     print(f"Dice gain from postprocessing: {gains} mean={summary['delta']['mean']:+.6f}", flush=True)
+    if 'mean_per_patient' in summary:
+        print(f"Evaluation aggregation: {summary['counts']['volumes']} volumes; "
+              f"{summary['counts']['patients']} patients", flush=True)
+        for unit in ('volume', 'patient'):
+            for stage in ('raw', 'postprocessed'):
+                scores = summary[f'mean_per_{unit}'][stage]
+                values = ' '.join(f'{region}={scores[region]:.6f}'
+                                  for region in (*REGION_ORDER, 'mean'))
+                print(f'Mean Dice per {unit} ({stage}): {values}', flush=True)
 
 
 def postprocess_regions(regions, min_component_sizes_et_tc_wt, closing_radius):
@@ -179,6 +249,7 @@ def run_fold_validation(
     closing_radius=1,
     predictor_class=None,
     export_prediction=None,
+    subset='val',
 ):
     """Run tiled inference on a trainer's validation split and evaluate before/after PP."""
     import torch
@@ -223,7 +294,8 @@ def run_fold_validation(
             trainer.inference_allowed_mirroring_axes,
         )
 
-    _, validation_keys = trainer.do_split()
+    from snn_nnunet.partition_runtime import evaluation_case_ids
+    validation_keys = evaluation_case_ids(trainer, subset)
     dataset_val = trainer.dataset_class(
         trainer.preprocessed_dataset_folder,
         validation_keys,
@@ -325,8 +397,12 @@ def run_fold_validation(
                 flush=True,
             )
 
-    summary = summarize_cases(case_results)
+    dataset_base = getattr(trainer, 'preprocessed_dataset_folder_base', None)
+    patient_wise = (subset == 'test' or (dataset_base is not None and
+                    (Path(dataset_base) / 'patient_partition.json').is_file()))
+    summary = summarize_cases(case_results, patient_wise=patient_wise)
     summary["settings"] = {
+        "subset": subset,
         "precision": "float32",
         "patch_size": [int(value) for value in patch_size],
         "tile_step_size": float(tile_step_size),
@@ -354,6 +430,8 @@ def run_fold_validation(
                             metrics["gt_voxels"], metrics["pred_voxels"],
                         )
                     )
+    if patient_wise:
+        write_patient_dice_tables(summary, output_dir)
     print_dice_summary(summary)
     return summary
 
@@ -366,6 +444,12 @@ def main(argv=None):
     args.results_root = args.results_root.resolve()
     if not args.results_root.is_dir():
         raise FileNotFoundError(f"Results root does not exist: {args.results_root}")
+    from snn_nnunet.partition_runtime import restore_run_partition
+    partition = restore_run_partition(args.results_root)
+    if args.subset == 'test' and partition is None:
+        raise ValueError('Held-out test requires a saved patient partition from a new training run')
+    args.checkpoint_name = args.checkpoint_name or (
+        'checkpoint_best.pth' if args.subset == 'test' else 'checkpoint_final.pth')
 
     # Rebuild the model from this run's metadata. The shared preprocessed plans
     # may have been replaced by a later experiment with a different architecture.
@@ -381,6 +465,8 @@ def main(argv=None):
         )
     model_dir = model_dirs[0]
     checkpoint = model_dir / f"fold_{args.fold}" / args.checkpoint_name
+    if args.subset == 'test' and not (checkpoint.parent / 'checkpoint_final.pth').is_file():
+        raise ValueError('Complete training before evaluating the held-out patient test')
     for required_file in (model_dir / "plans.json", model_dir / "dataset.json", checkpoint):
         if not required_file.is_file():
             raise FileNotFoundError(f"Required saved model file not found: {required_file}")
@@ -390,11 +476,27 @@ def main(argv=None):
         dataset_json = json.load(stream)
     if plans["dataset_name"] != model_dir.parent.name or plans["plans_name"] != args.plans:
         raise ValueError(f"Saved plans do not match the selected model directory: {model_dir}")
+    if args.subset == 'test':
+        # An epoch extension retains the earlier final checkpoint. Its existence
+        # alone does not establish completion of the currently saved horizon.
+        final_state = torch.load(checkpoint.parent / 'checkpoint_final.pth',
+                                 map_location='cpu', weights_only=False)
+        completed = final_state.get('current_epoch') if isinstance(final_state, dict) else None
+        del final_state
+        target = plans['snn_config'].get('num_epochs', 300) if 'snn_config' in plans else 1000
+        if (type(completed) is not int or type(target) is not int or target < 1
+                or completed < target):
+            raise ValueError(f'Test requires training to be complete: final checkpoint '
+                             f'completed {completed} epochs; current target is {target}')
     plans["continue_training"] = True
+    if args.patch_size is None:
+        args.patch_size = plans.get('snn_config', {}).get('validation_patch_size', (128, 128, 128))
 
     # Set the result root before importing nnU-Net so trainer paths and logs
     # belong to the selected run, even when the shell points to another run.
     os.environ["nnUNet_results"] = str(args.results_root)
+    from snn_nnunet.cli import configure_runtime
+    configure_runtime()
     from nnunetv2.utilities.find_objects import recursive_find_trainer_class_by_name
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -409,7 +511,7 @@ def main(argv=None):
     )
     print(f"Loading checkpoint: {checkpoint}", flush=True)
     trainer.load_checkpoint(str(checkpoint))
-    print(f"Validation output: {args.output_dir}", flush=True)
+    print(f"Evaluation subset: {args.subset}; output: {args.output_dir}", flush=True)
     run_fold_validation(
         trainer,
         output_dir=args.output_dir,
@@ -418,6 +520,7 @@ def main(argv=None):
         prob_threshold=args.prob_threshold,
         min_component_sizes=args.min_component_sizes,
         closing_radius=args.closing_radius,
+        subset=args.subset,
     )
     return 0
 

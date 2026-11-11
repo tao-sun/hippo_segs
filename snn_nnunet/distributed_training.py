@@ -19,6 +19,7 @@ def main(argv=None):
     parser.add_argument('--fold', type=int, required=True)
     parser.add_argument('--continue-training', action='store_true')
     parser.add_argument('--save-probabilities', action='store_true')
+    parser.add_argument('--skip-final-validation', action='store_true')
     args = parser.parse_args(argv)
 
     from snn_nnunet.cli import configure_runtime
@@ -39,7 +40,8 @@ def main(argv=None):
         )
         maybe_load_checkpoint(trainer, args.continue_training, False)
         trainer.run_training()
-        trainer.perform_actual_validation(args.save_probabilities)
+        if not args.skip_final_validation:
+            trainer.perform_actual_validation(args.save_probabilities)
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()

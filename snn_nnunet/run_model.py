@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import json
 import math
 import os
@@ -25,11 +26,46 @@ def _integer(config: dict[str, Any], name: str, minimum: int, maximum: int) -> i
     return value
 
 
-def _config(path: Path) -> dict[str, Any]:
+def _read_experiment(path: Path) -> dict[str, Any]:
+    """Read legacy YAML or resolve one mode into an independent experiment."""
     with path.open(encoding="utf-8") as stream:
         config = yaml.safe_load(stream)
     if not isinstance(config, dict):
         raise ValueError("The experiment file must contain a YAML mapping")
+    if 'mode' not in config and 'modes' not in config:
+        return config
+    if 'mode' not in config or 'modes' not in config:
+        raise ValueError('Selectable configs require both mode and modes')
+    mode, modes = config['mode'], config['modes']
+    if not isinstance(mode, str) or not mode:
+        raise ValueError('mode must be a nonempty string')
+    if not isinstance(modes, dict) or not modes:
+        raise ValueError('modes must be a nonempty mapping')
+    if mode not in modes:
+        raise ValueError(f'Unknown mode {mode!r}; available modes: {list(modes)}')
+    selected = modes[mode]
+    if not isinstance(selected, dict):
+        raise ValueError(f'modes.{mode} must be a mapping')
+    if {'mode', 'modes'} & selected.keys():
+        raise ValueError(f'modes.{mode} cannot redefine mode or modes')
+
+    def merge(common, overrides):
+        result = deepcopy(common)
+        for key, value in overrides.items():
+            result[key] = (merge(result[key], value)
+                           if key in result and isinstance(result[key], dict) and isinstance(value, dict)
+                           else deepcopy(value))
+        return result
+
+    common = {key: value for key, value in config.items() if key not in ('mode', 'modes')}
+    return merge(common, selected)
+
+
+def _config(path: Path) -> dict[str, Any]:
+    return _validate_experiment(_read_experiment(path))
+
+
+def _validate_experiment(config: dict[str, Any]) -> dict[str, Any]:
     if config.get("family") not in {"unet2d", "unet3d", "snn"}:
         raise ValueError("family must be unet2d, unet3d, or snn")
     _integer(config, "dataset_id", 0, 999)
@@ -44,11 +80,14 @@ def _config(path: Path) -> dict[str, Any]:
         config["gpus"] = allocated
     if not isinstance(config.get("run_dir"), str) or not config["run_dir"].strip():
         raise ValueError("run_dir must be a nonempty path")
+    if 'data_partition' in config and (
+            not isinstance(config['data_partition'], str) or not config['data_partition'].strip()):
+        raise ValueError('data_partition must be a nonempty path to a patient partition')
     if config["family"] == "snn":
         snn = config.get("snn")
         if not isinstance(snn, dict):
             raise ValueError("snn settings must be a YAML mapping")
-        if snn.get("variant") == "paper_unet" and config.keys() - {"family", "dataset_id", "fold", "gpus", "run_dir", "snn"}:
+        if snn.get("variant") == "paper_unet" and config.keys() - {"family", "dataset_id", "fold", "gpus", "run_dir", "snn", "data_partition"}:
             raise ValueError("paper_unet: unknown top-level experiment options")
         if snn.get("variant") != "paper_unet" and "paper_unet" in snn:
             raise ValueError("snn.paper_unet requires snn.variant: paper_unet")
@@ -73,6 +112,18 @@ def _config(path: Path) -> dict[str, Any]:
         snn.setdefault("epochs", 300)
         if type(snn["epochs"]) is not int or snn["epochs"] <= 0:
             raise ValueError("snn.epochs must be a positive integer")
+        for name, default in (("train_batches_per_epoch", 250), ("val_batches_per_epoch", 50)):
+            snn.setdefault(name, default)
+            if type(snn[name]) is not int or snn[name] <= 0:
+                raise ValueError(f"snn.{name} must be a positive integer")
+        snn.setdefault("overfit_num_volumes", 0)
+        if type(snn["overfit_num_volumes"]) is not int or snn["overfit_num_volumes"] < 0:
+            raise ValueError("snn.overfit_num_volumes must be a nonnegative integer")
+        if config.get('data_partition') and snn['overfit_num_volumes']:
+            raise ValueError('data_partition is incompatible with the overfit diagnostic')
+        snn.setdefault("skip_final_validation", False)
+        if type(snn["skip_final_validation"]) is not bool:
+            raise ValueError("snn.skip_final_validation must be true or false")
         training_patch = snn.get("training_patch_size")
         if training_patch is not None and (
                 not isinstance(training_patch, list) or len(training_patch) != 3
@@ -92,7 +143,7 @@ def _config(path: Path) -> dict[str, Any]:
             from snn_nnunet.paper_config import paper_options
             from snn_nnunet.network_adapter import SNNConfig
             from snn_nnunet.prepare_plans import DEFAULT_SNN_CONFIG
-            allowed = {"variant", "epochs", "lr", "training_patch_size", "validation_every",
+            allowed = {"overfit_num_volumes", "skip_final_validation", "train_batches_per_epoch", "val_batches_per_epoch", "variant", "epochs", "lr", "training_patch_size", "validation_every",
                        "validation_patch_size", "temporal_axis", "k", "use_fptt", "paper_unet",
                        "fptt_alpha", "fptt_beta", "fptt_rho", "fptt_lambda",
                        "seed", "deterministic", "augmentation_workers", "bidirectional", "bidirectional_fusion"}
@@ -105,6 +156,9 @@ def _config(path: Path) -> dict[str, Any]:
             effective.update(model_name="paper_unet", model_kwargs=paper_options(snn.get("paper_unet", {})),
                              use_fptt=snn["use_fptt"], temporal_axis=snn["temporal_axis"], k=snn["k"],
                              num_epochs=snn["epochs"], initial_lr=snn["lr"],
+                             overfit_num_volumes=snn["overfit_num_volumes"],
+                             train_batches_per_epoch=snn["train_batches_per_epoch"],
+                             val_batches_per_epoch=snn["val_batches_per_epoch"],
                              validation_every=snn["validation_every"], validation_patch_size=snn["validation_patch_size"])
             effective.update({key: snn[key] for key in ('seed', 'deterministic', 'augmentation_workers')})
             effective['bidirectional'] = snn.setdefault('bidirectional', False)
@@ -228,6 +282,9 @@ def _paper_training_args(config):
             "--model", "paper_unet", "--paper-unet", json.dumps(snn["paper_unet"]),
             "--temporal-axis", str(snn["temporal_axis"]), "--k", str(snn["k"]),
             "--epochs", str(snn["epochs"]), "--lr", str(snn["lr"]),
+            "--overfit-num-volumes", str(snn["overfit_num_volumes"]),
+            "--train-batches-per-epoch", str(snn["train_batches_per_epoch"]),
+            "--val-batches-per-epoch", str(snn["val_batches_per_epoch"]),
             "--seed", str(snn['seed']), "--augmentation-workers", str(snn['augmentation_workers']),
             "--deterministic" if snn['deterministic'] else "--no-deterministic",
             "--validation-every", str(snn["validation_every"]),
@@ -239,12 +296,15 @@ def _paper_training_args(config):
         args.extend(["--" + key.replace("_", "-"), str(snn[key])])
     if snn.get("training_patch_size") is not None:
         args.extend(["--training-patch-size", *map(str, snn["training_patch_size"])])
+    if snn["skip_final_validation"]:
+        args.append("--skip-final-validation")
     return args
 
 
 def run(config_path: Path) -> None:
     config_path = config_path.expanduser().resolve()
-    config = _config(config_path)
+    source_config = _read_experiment(config_path)
+    config = _validate_experiment(deepcopy(source_config))
     family = config["family"]
     dataset_id = config["dataset_id"]
     fold = config["fold"]
@@ -263,8 +323,20 @@ def run(config_path: Path) -> None:
         raise ValueError(f"Run directory already contains files: {run_dir}. Choose a new run_dir.")
 
     run_dir.mkdir(parents=True, exist_ok=True)
-    with config_path.open(encoding="utf-8") as stream:
-        saved_config = yaml.safe_load(stream)
+    if config.get('data_partition'):
+        from snn_nnunet.partition_runtime import stage_run_partition, restore_run_partition
+        partition = Path(config['data_partition']).expanduser()
+        if not partition.is_absolute():
+            partition = config_path.parent / partition
+        partition = partition.resolve()
+        plan_data = json.loads((dataset_folder / f'{plans}.json').read_text())
+        identifier = plan_data['configurations'][configuration]['data_identifier']
+        stage_run_partition(dataset_folder, run_dir, partition, identifier)
+        snapshot = restore_run_partition(run_dir)
+        source_config['data_partition'] = str(partition)
+        counts = snapshot['partition']['counts'][fold]
+        print(f'Patient partition (outer fold {fold}): {counts}', flush=True)
+    saved_config = source_config
     saved_config["gpus"] = gpus
     if family == 'snn':
         saved_config['snn'].update({key: config['snn'][key]
@@ -288,7 +360,8 @@ def run(config_path: Path) -> None:
         if snn["variant"] == "paper_unet":
             cli.main(_paper_training_args(config))
             return
-        architecture_args = ["--recurrent-neuron", json.dumps(snn["spatial_mamba"]["recurrent_neuron"])]
+        architecture_args = (["--skip-final-validation"] if snn["skip_final_validation"] else [])
+        architecture_args.extend(["--recurrent-neuron", json.dumps(snn["spatial_mamba"]["recurrent_neuron"])])
         architecture_args.extend([
             '--seed', str(snn['seed']), '--augmentation-workers', str(snn['augmentation_workers']),
             '--deterministic' if snn['deterministic'] else '--no-deterministic'])
@@ -316,6 +389,9 @@ def run(config_path: Path) -> None:
             "--temporal-axis", str(snn["temporal_axis"]),
             "--k", str(snn["k"]),
             "--epochs", str(snn["epochs"]),
+            "--overfit-num-volumes", str(snn["overfit_num_volumes"]),
+            "--train-batches-per-epoch", str(snn["train_batches_per_epoch"]),
+            "--val-batches-per-epoch", str(snn["val_batches_per_epoch"]),
             "--lr", str(snn["lr"]),
             "--validation-every", str(snn["validation_every"]),
             "--validation-patch-size", *map(str, snn["validation_patch_size"]),

@@ -9,7 +9,7 @@ from snn_nnunet import surrogate
 from snn_nnunet.config_aliases import normalize_spiking_options
 from snn_nnunet.precision import FP32Module, fp32_forward
 from snn_nnunet.recurrent_config import recurrent_options
-from snn_nnunet.recurrent_neuron import SelectiveMultiTimescaleLIF
+from snn_nnunet.recurrent_neuron import SelectiveMultiTimescaleLIF, make_selective_neuron
 from snn_nnunet.spike_neurons import PLIFNode, SPIKING_NODE_TYPES, make_spiking_node
 from snn_nnunet.spikmamba import Spiking2DPatchEmbedding, SpikMambaBlock
 
@@ -230,7 +230,7 @@ class _SpikMambaEncoderAdapter(nn.Module):
         self.post_norm = nn.GroupNorm(1, self.out_channels)
         recurrent_neuron = recurrent_options(recurrent_neuron)
         if output_spiking and recurrent_neuron is not None:
-            self.post_plif = SelectiveMultiTimescaleLIF(
+            self.post_plif = make_selective_neuron(
                 self.out_channels, recurrent_neuron, init_tau=init_tau,
                 surrogate_function=surrogate.ATan(), detach_reset=True,
             )

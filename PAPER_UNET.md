@@ -2,15 +2,38 @@
 
 Fresh paper runs replace obsolete architecture settings in shared preparation plans before validating the requested YAML. Resume continues to validate saved settings strictly; preprocessing does not need to be repeated.
 
-`paper_unet` runs through the existing SNN nnU-Net launcher, plans, adapter, trainer, validation, resume, and FP32 sliding-window predictor. There is no separate training pipeline. The example is `unet_config.yaml`; change experiment settings in that file only before starting a fresh run.
+`paper_unet` runs through the existing SNN nnU-Net launcher, plans, adapter, trainer, validation, resume, and FP32 sliding-window predictor. There is no separate training pipeline. Use `snn.variant: paper_unet` in `unet_config.yaml`; settings live directly under `snn`. There is no experiment mode selector. Change experiment settings only before starting a fresh run.
 
 The reference is `git show main:model.py`, class `SNNBraTS`. The branch `SpikingArch2_v2` has no root `model.py`; its `snn_nnunet/model.py` implements Mamba encoders and has different activation/head behavior. The new core copies the original graph: 4→32→64→128 encoder with three pooling operations, three 128-channel upsampling stages, concatenations with **pool2** and **pool1**, and the original convolution plus **non-spiking PLIF voltage integrator** as the head. Kernel/stride/padding, bias, GroupNorm(1,C), and dropout defaults match the reference. Head output channels remain the pipeline's three overlapping BraTS regions.
 
 Spatial padding goes on the bottom/right before each slice, to a multiple of the product of the three pooling strides (8 by default). Final logits are cropped to the input dimensions. Pool and transposed-convolution settings must invert each other exactly. Convolution/head settings must preserve resolution. Channels are configurable, but the graph and its two skip connections are fixed. There are no Mamba, VSS, SS2D, FUE, extra stem, residual decoder, or additional skip modules.
 
+
+The main YAML enables three supervised outputs with `deep_supervision.resolution: native`
+and weights `[1.0, 0.5, 0.25]` (normalized). Auxiliary logits stay at half/quarter
+H/W resolution; nearest-exact targets retain the full slice axis and match the
+model padding. Missing `resolution` keeps legacy `full` behavior for old configs
+and checkpoints. See [DEEP_SUPERVISION.md](DEEP_SUPERVISION.md) for the loss and
+fresh-run requirements.
+
+## Enable spiking independently in encoder and decoder
+
+Two boolean switches under `snn.paper_unet` control the activation family:
+
+```yaml
+snn:
+  paper_unet:
+    encoder_spiking: false
+    decoder_spiking: false
+```
+
+Both default to `true`, preserving existing configurations, weights and neuron choices. Set either to `false` to replace all neuron activations in that section with `nn.GELU()` after the existing GroupNorm and before dropout. The encoder switch controls `conv_block1`–`conv_block3`; the decoder switch controls all eight remaining Conv/Deconv blocks, including skip fusion. Per-block neuron overrides apply only while their section's spiking is enabled. No neuron parameters or memory states are created for a GELU block.
+
+With encoder spiking disabled, no backward selective-neuron scan or bidirectional neuron fusion is built or executed, even if `bidirectional: true`. The final head keeps its existing non-spiking PLIF voltage integrator; the switches do not replace it with GELU. Deep supervision remains available. Flags are saved in plans and reconstructed for inference and checkpoint loading. Changing either switch changes the architecture: select a fresh `run_dir` and train a new run.
+
 ## Choose neurons
 
-The example YAML selects PLIF globally. Overrides of `conv_block1`, `conv_block2`, and `conv_block3` select three selective encoder blocks while retaining eight PLIF decoder blocks; commenting out those overrides gives an all-PLIF model.
+With `neurons.model: plif`, overrides of `conv_block1`, `conv_block2`, and `conv_block3` choose the three encoder neurons while retaining eight PLIF decoder blocks. Use `selective_multitimescale_lif` for plain SiLIF or `MultiMemoryLinearAttentionLIF` for the attention variant; commenting out these overrides gives an all-PLIF model.
 
 All spiking ConvBlocks and DeconvBlocks use one independent activation after normalization and before dropout. Set:
 
@@ -24,18 +47,18 @@ snn:
         deconv_block3: plif
 ```
 
-Allowed models: `plif`, `selective_multitimescale_lif`. Supported block names:
+Allowed models: `plif`, `selective_multitimescale_lif`, `MultiMemoryLinearAttentionLIF`. Select attention by writing, for example, `conv_block2: MultiMemoryLinearAttentionLIF` in the same overrides mapping. These selections can be mixed, including in decoder blocks. Explicit overrides take priority over the legacy `neurons.selective.model` selector. Supported block names:
 
 - `conv_block1`, `conv_block2`, `conv_block3`
 - `deconv_block1`, `deconv1_conv`, `concat1_conv`
 - `deconv_block2`, `deconv2_conv`, `concat2_conv`
 - `deconv_block3`, `deconv3_conv`
 
-`neurons.plif` and `neurons.selective` hold the shared parameters of each neuron family. For selective neurons, `neurons.plif` configures the existing somatic PLIF's tau, surrogate and detach-reset settings. The selective spatial neuron's validated equations, initialization and dynamics are unchanged. It is distinct from Mamba's selective scan. `head.plif` configures the final voltage integrator independently. `class_conv` cannot be overridden by a spiking neuron; its `spiking` and `normalization` switches must remain false.
+`neurons.plif` configures the somatic LIF parameters. `neurons.multi_memory` holds the memory, decay, spatial mixing, projection and diagnostic settings shared by plain selective and linear attention neurons. `neurons.selective_readout` holds only the plain selective neuron gate settings; attention ignores that section. For both multi-memory neuron types, `neurons.plif` configures the existing somatic PLIF's tau, surrogate and detach-reset settings. The selective spatial neuron's validated equations, initialization and dynamics are unchanged. It is distinct from Mamba's selective scan. `head.plif` configures the final voltage integrator independently. `class_conv` cannot be overridden by a spiking neuron; its `spiking` and `normalization` switches must remain false.
 
 `use_fptt: true` selects the existing FPTT regularizer and running-parameter updates. `false` selects TBPTT. `k` sets the gradient window length. The YAML exposes all four supported FPTT coefficients. Windows retain the neuron states and advance absolute slice offsets; each new patch/sequence starts at `t0=0`, resetting all memories including the head. `detach_states()` retains values and truncates all recurrent graphs.
 
-Set `snn.paper_unet.neurons.selective.temporal_weight_decay: false` to exempt only the selective neurons' learned `temporal_raw` parameters from optimizer weight decay. Keep `temporal_fptt_regularization: true` to retain their FPTT loss terms, auxiliary running-parameter updates, and epoch-end replacement by averaged weights when `use_fptt: true`. Setting that flag to `false` also excludes them from these FPTT operations; with both flags false, the memory coefficients remain trainable through the task loss. Other parameters keep the native `3e-5` decay and their original FPTT behavior. The example YAML disables temporal weight decay and keeps the temporal FPTT option enabled. Missing options default to `true`, preserving legacy behavior. Changing either flag for active selective neurons requires a new run directory; incompatible optimizer policies are rejected on resume.
+Set `snn.paper_unet.neurons.multi_memory.temporal_weight_decay: false` to exempt only the selective neurons' learned `temporal_raw` parameters from optimizer weight decay. Keep `temporal_fptt_regularization: true` to retain their FPTT loss terms, auxiliary running-parameter updates, and epoch-end replacement by averaged weights when `use_fptt: true`. Setting that flag to `false` also excludes them from these FPTT operations; with both flags false, the memory coefficients remain trainable through the task loss. Other parameters keep the native `3e-5` decay and their original FPTT behavior. The example YAML disables temporal weight decay and keeps the temporal FPTT option enabled. Missing options default to `true`, preserving legacy behavior. Changing either flag for active selective neurons requires a new run directory; incompatible optimizer policies are rejected on resume.
 
 The trainer recognizes selective cells through a stable capability marker, because nnU-Net external trainer discovery removes and reloads Python modules, invalidating class-identity checks. At initialization it prints and checks each cell's actual optimizer decay, FPTT participation, and trainability; epoch snapshots use the same reload-safe discovery. Existing running jobs retain their already-loaded code and optimizer.
 
@@ -45,7 +68,7 @@ The full effective configuration is serialized into `plans.snn_config`, `run_con
 
 ## Repeatable fresh training
 
-Optional progressive bidirectional encoder recurrence is documented in [BIDIRECTIONAL_UNET.md](BIDIRECTIONAL_UNET.md), with the computational comparison in [BIDIRECTIONAL_COSTS.md](BIDIRECTIONAL_COSTS.md). Its `snn.bidirectional` switch defaults to false; true selects post-pooling `snn.bidirectional_fusion: conv_plif` or `or` and enforces whole-patch BPTT with FPTT disabled. The `conv_plif` module uses Conv1x1 → GroupNorm → PLIF, reusing the configured normalization settings. OR bypasses that entire module and applies standard encoder dropout after fusion.
+Optional progressive bidirectional encoder recurrence is documented in [BIDIRECTIONAL_UNET.md](BIDIRECTIONAL_UNET.md), with the computational comparison in [BIDIRECTIONAL_COSTS.md](BIDIRECTIONAL_COSTS.md). Its `snn.bidirectional` switch defaults to false; true applies `snn.bidirectional_fusion` only to encoder blocks using plain `selective_multitimescale_lif`, and enforces whole-patch BPTT with FPTT disabled. Fusion choices are `OR`, `conv_PLIF`, and `Shared_SOMA` (the original `or`/`conv_plif` spellings also work). PLIF, linear attention and decoder blocks remain forward-only. With bidirectionality disabled the fusion setting is inactive. Shared_SOMA fuses memories before pooling and requires adaptive selective readout only in its active blocks; other fusions combine post-pooling outputs. The `conv_plif` module uses Conv1x1 → GroupNorm → PLIF, reusing the configured normalization settings. OR bypasses that entire module and applies standard encoder dropout after fusion.
 
 The YAML launcher enables strict deterministic training by default for new SNN experiments. The example exposes the policy explicitly:
 
@@ -93,10 +116,10 @@ Its existing SLURM resource request allocates one GPU, and the launcher uses the
 Read run/fold/dataset/epoch settings from the same YAML for resume and evaluation:
 
 ```bash
-RUN_DIR=$(.venv/bin/python -c 'import yaml; print(yaml.safe_load(open("unet_config.yaml"))["run_dir"])')
-FOLD=$(.venv/bin/python -c 'import yaml; print(yaml.safe_load(open("unet_config.yaml"))["fold"])')
-DATASET_ID=$(.venv/bin/python -c 'import yaml; print(yaml.safe_load(open("unet_config.yaml"))["dataset_id"])')
-EPOCHS=$(.venv/bin/python -c 'import yaml; print(yaml.safe_load(open("unet_config.yaml"))["snn"]["epochs"])')
+RUN_DIR=$(.venv/bin/python -c 'from pathlib import Path; from snn_nnunet.run_model import _read_experiment; print(_read_experiment(Path("unet_config.yaml"))["run_dir"])')
+FOLD=$(.venv/bin/python -c 'from pathlib import Path; from snn_nnunet.run_model import _read_experiment; print(_read_experiment(Path("unet_config.yaml"))["fold"])')
+DATASET_ID=$(.venv/bin/python -c 'from pathlib import Path; from snn_nnunet.run_model import _read_experiment; print(_read_experiment(Path("unet_config.yaml"))["dataset_id"])')
+EPOCHS=$(.venv/bin/python -c 'from pathlib import Path; from snn_nnunet.run_model import _read_experiment; print(_read_experiment(Path("unet_config.yaml"))["snn"]["epochs"])')
 
 # CPU verification of a saved resumable checkpoint; no training.
 .venv/bin/python -m snn_nnunet.resume_training \

@@ -1,0 +1,15 @@
+{
+  "cached_ground_truth_presence": {
+    "source": "class_locations in 270 preprocessed .pkl files, read with the project .venv",
+    "missing_files": 0,
+    "TC_absent": 77,
+    "ET_absent": 78,
+    "WT_absent": 0
+  },
+  "metric_direction": {
+    "custom": "empty GT and prediction gives Dice=1; empty GT with FP gives 0",
+    "stock_nnunet": "empty GT and prediction gives NaN, excluded from regional nanmean",
+    "direction_same_predictions": "Replacing excluded empty-empty cases with ones raises or preserves Dice; cannot alone explain a lower score relative to native evaluation",
+    "paper_empty_policy": "Not specified"
+  }
+}

@@ -11,7 +11,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from snn_nnunet.precision import FP32Module, fp32_forward
-from snn_nnunet.recurrent_config import recurrent_options, initial_temporal_raw, initial_bounded_logit
+from snn_nnunet.recurrent_config import RECURRENT_DEFAULTS, ATTENTION_MODEL, normalize_recurrent_model, recurrent_options, initial_temporal_raw, initial_bounded_logit
 from snn_nnunet.spike_neurons import PLIFNode
 
 
@@ -80,7 +80,7 @@ class SelectiveMultiTimescaleLIF(FP32Module):
         else:
             self.register_parameter('eta_logits', None)
             self.spatial_kernels = nn.ModuleList()
-        readout = self.config['selective_readout']
+        readout = self.config.get('selective_readout', RECURRENT_DEFAULTS['selective_readout'])
         self.selective_enabled = readout['enabled']
         if self.selective_enabled:
             self.readout_gates = nn.ModuleList([nn.Conv2d(2*channels, channels, 1) for _ in range(3)])
@@ -156,6 +156,15 @@ class SelectiveMultiTimescaleLIF(FP32Module):
         coefficients = self.static_gate_logits.float().sigmoid()
         return tuple(value[None, :, None, None].expand_as(features) for value in coefficients)
 
+    def _aggregate_memories(self, features, memories):
+        gates = self.readout(features, memories)
+        aggregate = sum(gate*memory for gate, memory in zip(gates, memories))
+        return aggregate, gates
+
+    def _project_memories(self, aggregate):
+        """Project the memory readout before adding the local features."""
+        return F.conv2d(aggregate, self.memory_projection.weight.float())
+
     @fp32_forward
     def forward(self, features, time_step):
         if features.ndim != 4 or features.shape[1] != self.channels:
@@ -185,9 +194,8 @@ class SelectiveMultiTimescaleLIF(FP32Module):
                     previous = (1-eta)*previous + eta*self.spatial_kernels[r](previous)
                 decay = lambdas[r][None, :, None, None]
                 setattr(self, name, decay*previous + (1-decay)*x)
-            gates = self.readout(x, self.memories)
-            aggregate = sum(gate*memory for gate, memory in zip(gates, self.memories))
-            projection = F.conv2d(aggregate, self.memory_projection.weight.float())
+            aggregate, gates = self._aggregate_memories(x, self.memories)
+            projection = self._project_memories(aggregate)
             current = x + projection
         # The existing soma receives FP32 current under the same full-precision guard.
         spike, voltage = self.soma(current, time_step)
@@ -262,3 +270,11 @@ class SelectiveMultiTimescaleLIF(FP32Module):
             self._zero_gradient_samples[name] = count
             stats[f'gradient/{name}/consecutive_zero_samples'] = count
         return stats
+
+
+def make_selective_neuron(channels, config, **kwargs):
+    """Select readout architecture while retaining all existing SiLIF sites."""
+    if config is not None and normalize_recurrent_model(config.get('model')) == ATTENTION_MODEL:
+        from snn_nnunet.linear_attention_neuron import MultiMemoryLinearAttentionLIF
+        return MultiMemoryLinearAttentionLIF(channels, config, **kwargs)
+    return SelectiveMultiTimescaleLIF(channels, config, **kwargs)

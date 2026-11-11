@@ -1,0 +1,137 @@
+{
+  "cases": 1350,
+  "base_patient_ids": 613,
+  "seed": 42,
+  "counts": [
+    {
+      "fold": 0,
+      "train_cases": 966,
+      "train_patients": 441,
+      "val_cases": 107,
+      "val_patients": 49,
+      "test_cases": 277,
+      "test_patients": 123
+    },
+    {
+      "fold": 1,
+      "train_cases": 970,
+      "train_patients": 441,
+      "val_cases": 111,
+      "val_patients": 49,
+      "test_cases": 269,
+      "test_patients": 123
+    },
+    {
+      "fold": 2,
+      "train_cases": 975,
+      "train_patients": 441,
+      "val_cases": 108,
+      "val_patients": 49,
+      "test_cases": 267,
+      "test_patients": 123
+    },
+    {
+      "fold": 3,
+      "train_cases": 957,
+      "train_patients": 441,
+      "val_cases": 113,
+      "val_patients": 50,
+      "test_cases": 280,
+      "test_patients": 122
+    },
+    {
+      "fold": 4,
+      "train_cases": 989,
+      "train_patients": 441,
+      "val_cases": 104,
+      "val_patients": 50,
+      "test_cases": 257,
+      "test_patients": 122
+    }
+  ],
+  "trainer_checks": [
+    {
+      "fold": 0,
+      "trainer": "nnUNetTrainer",
+      "train_cases": 966,
+      "val_cases": 107,
+      "test_cases": 277
+    },
+    {
+      "fold": 0,
+      "trainer": "nnUNetTrainerSNNFPTT",
+      "train_cases": 966,
+      "val_cases": 107,
+      "test_cases": 277
+    },
+    {
+      "fold": 1,
+      "trainer": "nnUNetTrainer",
+      "train_cases": 970,
+      "val_cases": 111,
+      "test_cases": 269
+    },
+    {
+      "fold": 1,
+      "trainer": "nnUNetTrainerSNNFPTT",
+      "train_cases": 970,
+      "val_cases": 111,
+      "test_cases": 269
+    },
+    {
+      "fold": 2,
+      "trainer": "nnUNetTrainer",
+      "train_cases": 975,
+      "val_cases": 108,
+      "test_cases": 267
+    },
+    {
+      "fold": 2,
+      "trainer": "nnUNetTrainerSNNFPTT",
+      "train_cases": 975,
+      "val_cases": 108,
+      "test_cases": 267
+    },
+    {
+      "fold": 3,
+      "trainer": "nnUNetTrainer",
+      "train_cases": 957,
+      "val_cases": 113,
+      "test_cases": 280
+    },
+    {
+      "fold": 3,
+      "trainer": "nnUNetTrainerSNNFPTT",
+      "train_cases": 957,
+      "val_cases": 113,
+      "test_cases": 280
+    },
+    {
+      "fold": 4,
+      "trainer": "nnUNetTrainer",
+      "train_cases": 989,
+      "val_cases": 104,
+      "test_cases": 257
+    },
+    {
+      "fold": 4,
+      "trainer": "nnUNetTrainerSNNFPTT",
+      "train_cases": 989,
+      "val_cases": 104,
+      "test_cases": 257
+    }
+  ],
+  "shared_metadata_unchanged": true,
+  "source_sha256": {
+    "splits_final.json": "7e5f8f9043a4e7e37a712b257fb452243e9ec5fd318e3ed5f72d663e4d8eaea8",
+    "SNNPlans.json": "bfd42a701d9357fed1e57fdc4e0704dc267d88ec26944d5ea537598ce3cde814",
+    "dataset.json": "94230ef50886ded7426491e0a26283a9a508e69cd35d1b383adc864fdadfd5c6"
+  },
+  "gpu_training_executed": false,
+  "unit_tests_passed": 107,
+  "unit_test_log": "analysis_results/patient_partition_2026-11-11/pytest_final.log",
+  "shell_syntax_checks_passed": true,
+  "python_syntax_checks_passed": true,
+  "original_model_and_training_settings_preserved": true,
+  "independent_review_important_findings_fixed": 2
+}

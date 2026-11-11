@@ -1,0 +1,22 @@
+{
+  "full_snapshot_hash": true,
+  "full_row_count": true,
+  "full_common_mean": true,
+  "full_csv_values": true,
+  "full_all_finite": true,
+  "full_csv_mean": true,
+  "native_snapshot_hash": true,
+  "native_row_count": true,
+  "native_common_mean": true,
+  "native_csv_values": true,
+  "native_all_finite": true,
+  "native_csv_mean": true,
+  "270_validation_cases": true,
+  "raw_WT_case_mean": true,
+  "raw_TC_case_mean": true,
+  "raw_ET_case_mean": true,
+  "postprocessed_WT_case_mean": true,
+  "postprocessed_TC_case_mean": true,
+  "postprocessed_ET_case_mean": true,
+  "artifacts_nonempty": true
+}

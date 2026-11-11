@@ -1,0 +1,31 @@
+{
+    "channel_names": {
+        "0": "T1",
+        "1": "T1ce",
+        "2": "T2",
+        "3": "FLAIR"
+    },
+    "labels": {
+        "background": 0,
+        "whole_tumor": [
+            1,
+            2,
+            3
+        ],
+        "tumor_core": [
+            1,
+            3
+        ],
+        "enhancing_tumor": 3
+    },
+    "numTraining": 1350,
+    "file_ending": ".nii.gz",
+    "licence": "Whoever converted this dataset was lazy and didn't look it up!",
+    "converted_by": "Please enter your name, especially when sharing datasets with others in a common infrastructure!",
+    "name": "BraTS24GLI",
+    "regions_class_order": [
+        2,
+        1,
+        3
+    ]
+}

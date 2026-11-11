@@ -1,0 +1,147 @@
+# Config unico: nessun selettore mode.
+# bidirectional abilita la scansione inversa solo negli encoder selective_multitimescale_lif.
+# bidirectional_fusion: OR / conv_PLIF / Shared_SOMA (ignorato se bidirectional: false).
+# In neurons.overrides scegli per blocco: plif / selective_multitimescale_lif / MultiMemoryLinearAttentionLIF.
+# PLIF e MultiMemoryLinearAttentionLIF restano unidirezionali; i parametri condivisi sono in neurons.multi_memory.
+family: snn
+dataset_id: 1
+fold: 0
+gpus: 1
+run_dir: /gpfs/scratch1/shared/apiaghiardelli/SNN_2D_Unet_SMMLif_DS_patientwise_seed42/outer_fold_0
+# Patient-wise outer test; 10% of the other four folds is internal validation.
+data_partition: /gpfs/home6/apiaghiardelli/hippo_segs/data_partitions/brats24_patient_seed42
+snn:
+  # Diagnostic only: same N labeled training subjects for train/validation/test.
+  overfit_num_volumes: 0
+  seed: 42
+  deterministic: true
+  augmentation_workers: 8
+  lr: 0.01
+  # Baseline originale: 50; validazione del fold completo ogni 50 epoche. 0 la disabilita.
+  validation_every: 50
+  temporal_axis: 0
+  use_fptt: false
+  variant: paper_unet
+  bidirectional: false
+  bidirectional_fusion: Shared_SOMA
+  epochs: 400
+  # Minibatch per epoca e per GPU; riduci entrambi per prove rapide.
+  train_batches_per_epoch: 250  # Baseline originale: 250 minibatch per epoca e per GPU.
+  val_batches_per_epoch: 50  # Baseline originale: 50 minibatch per epoca e per GPU.
+  # Baseline originale: false; true salta entrambe le validazioni complete a fine training.
+  skip_final_validation: false
+  training_patch_size:
+  - 81
+  - 128
+  - 128
+  validation_patch_size:
+  - 81
+  - 128
+  - 128
+  k: 81
+  fptt_alpha: 0.5
+  fptt_beta: 0.5
+  fptt_rho: 0.0
+  fptt_lambda: 2.0
+  paper_unet:
+    # Teste ausiliarie solo durante il training; ordine: finale, meta, quarto.
+    deep_supervision:
+      enabled: true
+      weights: [1.0, 0.5, 0.25]
+      resolution: native
+    # false sostituisce i neuroni della sezione con GELU; GroupNorm/dropout restano attivi.
+    encoder_spiking: true
+    decoder_spiking: true
+    encoder_channels:
+    - 32
+    - 64
+    - 128
+    decoder_channels:
+    - 128
+    - 128
+    - 128
+    conv:
+      kernel_size: 3
+      padding: 1
+      stride: 1
+      bias: false
+      dropout: 0.1
+    deconv:
+      kernel_size: 2
+      padding: 0
+      stride: 2
+      output_padding: 0
+      bias: false
+      dropout: 0.1
+    pool:
+      kernel_size: 2
+      stride: 2
+      padding: 0
+    normalization:
+      type: groupnorm
+      num_groups: 1
+      eps: 1.0e-05
+      affine: true
+    neurons:
+      model: plif
+      plif:
+        init_tau: 2.0
+        surrogate_alpha: 2.0
+        detach_reset: true
+      multi_memory: # Parametri condivisi dai neuroni multi-memoria
+        # Gamma is applied once after the existing attention output normalization.
+        attention_gamma_mode: learnable_per_channel  # fixed / learnable_per_channel
+        attention_gamma_init: 0.05
+        attention_gamma: 0.05  # Used only in fixed mode; 1.0 restores original scaling.
+        compartments: 3
+        temporal_weight_decay: false
+        temporal_fptt_regularization: true
+        lambda_init:
+        - 0.5
+        - 0.8
+        - 0.95
+        spatial_mixing:
+          enabled: true
+          kernel_size: 3
+          padding: zeros
+          eta_init: 0.1
+          kernel_init: near_identity
+          kernel_center_init: 0.95
+          kernel_surround_init: 0.001
+          max_kernel_l1_norm: 1.0
+        memory_projection:
+          kernel_size: 1
+          bias: false
+          init: xavier_uniform
+        memory_dtype: float32
+        direction: forward
+        diagnostics:
+          every_n_windows: 100
+          near_lambda_gap: 0.001
+          growth_ratio_threshold: 100.0
+      # Solo selective_multitimescale_lif; non usato dai neuroni con attention.
+      selective_readout:
+        enabled: true
+        gate: sigmoid
+        gate_kernel_size: 1
+        gate_init: zeros
+        static_gate_init: 0.5
+        fusion: weighted_sum
+      overrides:
+        conv_block1: selective_multitimescale_lif
+        conv_block2: selective_multitimescale_lif
+        conv_block3: selective_multitimescale_lif
+    head:
+      kernel_size: 3
+      padding: 1
+      stride: 1
+      bias: false
+      dropout: 0.0
+      normalization: false
+      spiking: false
+      plif:
+        init_tau: 2.0
+        surrogate_alpha: 2.0
+        detach_reset: true
+        v_threshold: 1.0
+        v_reset: 0.0

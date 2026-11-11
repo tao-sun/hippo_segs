@@ -3,24 +3,29 @@ from collections.abc import Mapping
 from copy import deepcopy
 import math
 
-from snn_nnunet.recurrent_config import RECURRENT_DEFAULTS, recurrent_options
+from snn_nnunet.recurrent_config import RECURRENT_DEFAULTS, ATTENTION_MODEL, normalize_recurrent_model, recurrent_options
 
 BLOCK_NAMES = ('conv_block1', 'conv_block2', 'conv_block3',
                'deconv_block1', 'deconv1_conv', 'concat1_conv',
                'deconv_block2', 'deconv2_conv', 'concat2_conv',
                'deconv_block3', 'deconv3_conv')
-NEURON_MODELS = ('plif', 'selective_multitimescale_lif')
-BIDIRECTIONAL_FUSIONS = ('conv_plif', 'or')
+ENCODER_BLOCK_NAMES = BLOCK_NAMES[:3]
+NEURON_MODELS = ('plif', 'selective_multitimescale_lif', ATTENTION_MODEL)
+BIDIRECTIONAL_FUSIONS = ('conv_plif', 'or', 'Shared_SOMA')
 PLIF_DEFAULTS = {'init_tau': 2.0, 'surrogate_alpha': 2.0, 'detach_reset': True}
 PAPER_DEFAULTS = {
     'encoder_channels': [32, 64, 128], 'decoder_channels': [128, 128, 128],
+    'encoder_spiking': True, 'decoder_spiking': True,
+    'deep_supervision': {'enabled': False, 'weights': [1.0, 0.3, 0.1], 'resolution': 'full'},
     'conv': {'kernel_size': 3, 'padding': 1, 'stride': 1, 'bias': False, 'dropout': .1},
     'deconv': {'kernel_size': 2, 'padding': 0, 'stride': 2, 'output_padding': 0,
                'bias': False, 'dropout': .1},
     'pool': {'kernel_size': 2, 'stride': 2, 'padding': 0},
     'normalization': {'type': 'groupnorm', 'num_groups': 1, 'eps': 1e-5, 'affine': True},
     'neurons': {'model': 'plif', 'overrides': {}, 'plif': PLIF_DEFAULTS,
-                'selective': RECURRENT_DEFAULTS},
+                'multi_memory': {key: value for key, value in RECURRENT_DEFAULTS.items()
+                                 if key != 'selective_readout'},
+                'selective_readout': RECURRENT_DEFAULTS['selective_readout']},
     'head': {'kernel_size': 3, 'padding': 1, 'stride': 1, 'bias': False,
              'dropout': 0., 'normalization': False, 'spiking': False,
              'plif': {**PLIF_DEFAULTS, 'v_threshold': 1., 'v_reset': 0.}},
@@ -31,9 +36,30 @@ def normalize_bidirectional_fusion(value, *, enabled):
     """Ignore inactive fusion settings and default legacy plans to Conv+PLIF."""
     if not enabled:
         return 'conv_plif'
+    aliases = {'or': 'or', 'conv_plif': 'conv_plif', 'shared_soma': 'Shared_SOMA'}
+    if isinstance(value, str):
+        value = aliases.get(value.strip().lower().replace(' ', '_'), value)
     if not isinstance(value, str) or value not in BIDIRECTIONAL_FUSIONS:
         raise ValueError(f'Unsupported fusion: {value!r}; expected one of {BIDIRECTIONAL_FUSIONS}')
     return value
+
+
+def neuron_model(neurons, name):
+    """Explicit block choices take priority over the old global readout selector."""
+    if name in neurons['overrides']:
+        return neurons['overrides'][name]
+    selected = neurons['model']
+    if (selected == 'selective_multitimescale_lif' and neurons['multi_memory'] is not None
+            and neurons['multi_memory']['model'] == ATTENTION_MODEL):
+        return ATTENTION_MODEL
+    return selected
+
+
+def bidirectional_blocks(options, *, enabled):
+    """Only plain SiLIF encoder stages have a backward branch."""
+    return tuple(name for name in ENCODER_BLOCK_NAMES
+                 if enabled and options['encoder_spiking']
+                 and neuron_model(options['neurons'], name) == 'selective_multitimescale_lif')
 
 
 def _merge(defaults, values, path):
@@ -44,9 +70,9 @@ def _merge(defaults, values, path):
         raise ValueError(f'{path}: unknown options {sorted(unknown)}')
     result = deepcopy(defaults)
     for key, value in values.items():
-        # Named overrides are validated against the fixed graph separately.
+        # Named overrides and active selective readouts are validated separately.
         result[key] = (_merge(defaults[key], value, f'{path}.{key}')
-                       if isinstance(defaults[key], dict) and key != 'overrides'
+                       if isinstance(defaults[key], dict) and key not in ('overrides', 'selective_readout')
                        else deepcopy(value))
     return result
 
@@ -77,7 +103,44 @@ def plif_options(values, *, head=False):
 
 
 def paper_options(values):
+    # Migrate old saved schemas before strict merging, without mutating callers.
+    values = deepcopy(values)
+    if isinstance(values, Mapping) and isinstance(values.get('neurons'), Mapping):
+        neurons = values['neurons']
+        if 'selective' in neurons:
+            if 'multi_memory' in neurons:
+                raise ValueError('neurons.selective and neurons.multi_memory cannot both be supplied')
+            common = neurons.pop('selective')
+            if not isinstance(common, Mapping):
+                raise ValueError('neurons.selective must be a mapping')
+            common = dict(common)
+            if 'selective_readout' in common:
+                if 'selective_readout' in neurons:
+                    raise ValueError('Supply selective_readout only once, under neurons')
+                neurons['selective_readout'] = common.pop('selective_readout')
+            neurons['multi_memory'] = common
+        if 'model' in neurons:
+            neurons['model'] = normalize_recurrent_model(neurons['model'])
+        if isinstance(neurons.get('overrides'), Mapping):
+            neurons['overrides'] = {name: normalize_recurrent_model(model)
+                                    for name, model in neurons['overrides'].items()}
     result = _merge(PAPER_DEFAULTS, values, 'paper_unet')
+    for key in ('encoder_spiking', 'decoder_spiking'):
+        if type(result[key]) is not bool:
+            raise ValueError(f'{key} must be boolean')
+    supervision = result['deep_supervision']
+    if type(supervision['enabled']) is not bool:
+        raise ValueError('deep_supervision.enabled must be boolean')
+    if supervision['resolution'] not in ('full', 'native'):
+        raise ValueError('deep_supervision.resolution must be full or native')
+    weights = supervision['weights']
+    if not isinstance(weights, (list, tuple)) or len(weights) != 3:
+        raise ValueError('deep_supervision.weights must contain main, half and quarter weights')
+    for value in weights:
+        _number(value, 'deep_supervision.weights', 0., True)
+    if not math.isfinite(sum(weights)):
+        raise ValueError('deep_supervision.weights must have a finite sum')
+    supervision['weights'] = [float(value) for value in weights]
     for key in ('encoder_channels', 'decoder_channels'):
         channels = result[key]
         if not isinstance(channels, (list, tuple)) or len(channels) != 3:
@@ -129,5 +192,20 @@ def paper_options(values):
         raise ValueError('neurons.overrides must map original spiking block names to supported neuron models')
     neurons['overrides'] = dict(overrides)
     neurons['plif'] = plif_options(neurons['plif'])
-    neurons['selective'] = recurrent_options(neurons['selective'])
+    common = recurrent_options(neurons['multi_memory'])
+    common.pop('selective_readout', None)
+    neurons['multi_memory'] = common
+    if any(neuron_model(neurons, name) == 'selective_multitimescale_lif' for name in BLOCK_NAMES):
+        # These gates apply only to selected plain selective cells.
+        config = recurrent_options(dict(common, model='selective_multitimescale_lif',
+                                        selective_readout=neurons['selective_readout']))
+        neurons['selective_readout'] = config['selective_readout']
     return result
+
+
+def validate_shared_soma_options(options, *, enabled, fusion):
+    """Check Shared_SOMA only where an active plain SiLIF encoder uses it."""
+    if fusion != 'Shared_SOMA' or not bidirectional_blocks(options, enabled=enabled):
+        return
+    if not options['neurons']['selective_readout']['enabled']:
+        raise ValueError('Shared_SOMA requires selective_readout.enabled=true')

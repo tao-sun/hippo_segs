@@ -1,0 +1,81 @@
+{
+  "date": "2026-11-10",
+  "run_id": "27779920",
+  "scope": "Read-only diagnostic comparison; no training, inference, or production code changes.",
+  "available_evidence": [
+    "plots/snn_vs_unet3d_28264599_27779920/summary.json",
+    "plots/snn_vs_unet3d_28264599_27779920/epoch_metrics.csv",
+    "slurm_nnunet_postprocess_27804540.out",
+    "validate_unet3d_brats24_fold0_best.sbatch",
+    "postprocess_nnunet.sbatch"
+  ],
+  "historical_training": {
+    "archived_completed_epochs": 643,
+    "initial_lr": 0.01,
+    "last_lr": 0.00397,
+    "last_epoch_patch_dice": 0.9063666666666667,
+    "last_10_epoch_patch_dice": 0.9040266666666665,
+    "scheduler_hypothesis": "Stock polynomial decay over 1000 epochs, exponent 0.9",
+    "scheduler_max_absolute_error_to_rounded_log": 4.993610101651502e-06,
+    "limitation": "Archive stops at epoch 643; absence of later training is not established."
+  },
+  "historical_volume_report": {
+    "WT": 0.901084,
+    "TC": 0.726186,
+    "ET": 0.736003,
+    "region_arithmetic_mean": 0.7877576666666667,
+    "postprocessing": "Largest-connected-component removal did not improve the reported scores; final scores unchanged. No evidence of custom closing in this specific report.",
+    "limitation": "Original checkpoint, per-case predictions and summary are unavailable at the expected baseline path; checkpoint provenance and averaging cannot be independently reconstructed."
+  },
+  "current_postprocessing_parser": {
+    "file": "postprocess_nnunet.sbatch",
+    "line": 63,
+    "invalid_arguments": [
+      "20,",
+      "30,",
+      "50"
+    ],
+    "reproduced": "argparse SystemExit(2): invalid int value 20,",
+    "no_volume_io": true,
+    "echo_disagrees_with_arguments": "Printed thresholds are 161/166/50; supplied thresholds are 20/30/50 with invalid commas.",
+    "historical_causality": "Not established; this is a defect in the current script."
+  },
+  "current_fold0_split": {
+    "n_train_cases": 1080,
+    "n_validation_cases": 270,
+    "shared_prefix_groups": 188,
+    "validation_cases_with_train_prefix": 209,
+    "example_train": "BraTS-GLI-00020-101",
+    "example_validation": "BraTS-GLI-00020-100",
+    "interpretation": "If BraTS-GLI-NNNNN denotes patient identity, this split is not patient-disjoint. Confirm against source patient/session metadata. Such overlap would usually make validation optimistic, not explain lower Dice.",
+    "historical_applicability": "Current split is not a timestamped copy of the original training split."
+  },
+  "metric_comparability": {
+    "our_current_regions": {
+      "WT": [
+        1,
+        2,
+        3
+      ],
+      "TC": [
+        1,
+        3
+      ],
+      "ET": [
+        3
+      ]
+    },
+    "our_current_empty_policy": {
+      "empty_reference_and_prediction": 1,
+      "empty_reference_false_positive": 0
+    },
+    "paper_unknowns": [
+      "Handling of empty-reference cases",
+      "Exact label sets behind TC wording",
+      "Saved plans/checkpoint protocol for the nnU-Net baseline"
+    ],
+    "warning_not_proven_error": "The native postprocessing warning compares prediction names to every reference file, so fold-only predictions against all-dataset references can trigger it legitimately."
+  },
+  "paper_url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC12808724/",
+  "next_verification": "Recover the original baseline checkpoint/plans and per-case predictions; evaluate the complete held-out split with explicit region and empty-case policies; compare native and custom postprocessing on identical predictions. Do not tune on the final held-out test set."
+}

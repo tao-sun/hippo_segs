@@ -30,10 +30,10 @@ def extended_checkpoint(checkpoint: dict, epochs: int) -> dict:
 
 
 def load_resume_checkpoint(fold_dir: Path) -> tuple[Path, dict]:
-    """A previous final checkpoint must not hide a more recent interrupted run."""
+    """Recover the most recent complete state, including best if latest failed."""
     candidates = []
     paths = [fold_dir / 'checkpoint_final.pth', fold_dir / 'checkpoint_latest.pth',
-             *sorted(fold_dir.glob('checkpoint_epoch_*.pth'))]
+             fold_dir / 'checkpoint_best.pth', *sorted(fold_dir.glob('checkpoint_epoch_*.pth'))]
     for path in paths:
         if path.is_file():
             try:
@@ -49,7 +49,7 @@ def load_resume_checkpoint(fold_dir: Path) -> tuple[Path, dict]:
         raise FileNotFoundError(f'No resumable checkpoint in {fold_dir}; refusing a fresh run')
     return max(candidates, key=lambda item: (item[1]['current_epoch'],
                                              bool(item[1].get('resume_lr_schedule')),
-                                             item[0].name != 'checkpoint_latest.pth'))
+                                             item[0].name not in ('checkpoint_latest.pth', 'checkpoint_best.pth')))
 
 
 def _write_json(path: Path, payload: dict) -> None:
@@ -166,7 +166,7 @@ def _resume(run_dir: Path, epochs: int, fold: int, check_only: bool,
         # Baseline validation may run before native on_train_start copies these plans.
         _write_json(model_dir / 'plans.json', trainer.plans_manager.plans)
         periodic = None
-        if validation_every:
+        if validation_every and not trainer.snn_config.overfit_num_volumes:
             from snn_nnunet.resume_validation import install_periodic_validation
             periodic = install_periodic_validation(trainer, validation_every)
             periodic.validate_current()
@@ -176,10 +176,15 @@ def _resume(run_dir: Path, epochs: int, fold: int, check_only: bool,
             # A boundary checkpoint may precede native on_train_end (e.g. failed validation).
             from snn_nnunet.resume_validation import save_completed_checkpoint
             save_completed_checkpoint(trainer, Path(trainer.output_folder) / 'checkpoint_final.pth')
-        trainer.perform_actual_validation()
+        patient_partition = (run_dir / 'data_partition.json').is_file()
+        if not patient_partition:
+            trainer.perform_actual_validation()
+        if trainer.snn_config.overfit_num_volumes:
+            return
         if periodic is not None:
             periodic.validate_current()
-            return
+            if not patient_partition:
+                return
 
         from snn_nnunet.custom_full_validation import main as validate
         validate([
@@ -208,6 +213,8 @@ def main() -> None:
     run_dir = args.run_dir.expanduser().resolve()
     if not run_dir.is_dir():
         raise FileNotFoundError(run_dir)
+    from snn_nnunet.partition_runtime import restore_run_partition
+    restore_run_partition(run_dir)
     for name in ('nnUNet_raw', 'nnUNet_preprocessed'):
         if not os.environ.get(name):
             raise ValueError(f'Set {name} before resuming')

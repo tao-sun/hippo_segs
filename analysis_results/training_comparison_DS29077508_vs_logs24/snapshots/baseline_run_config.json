@@ -1,0 +1,831 @@
+{
+  "command": "train",
+  "created_at": "2026-11-02T20:28:47",
+  "run_dir": "/gpfs/scratch1/shared/apiaghiardelli/SNN_paper_unet_sel3_fold0",
+  "dataset_id": 1,
+  "trainer": "nnUNetTrainerSNNFPTT",
+  "plans_identifier": "SNNPlans",
+  "configuration": "3d_fullres",
+  "arguments": {
+    "command": "train",
+    "dataset_id": 1,
+    "fold": 0,
+    "seed": 42,
+    "augmentation_workers": 8,
+    "deterministic": true,
+    "bidirectional": false,
+    "model": "paper_unet",
+    "paper_unet": {
+      "encoder_channels": [
+        32,
+        64,
+        128
+      ],
+      "decoder_channels": [
+        128,
+        128,
+        128
+      ],
+      "conv": {
+        "kernel_size": 3,
+        "padding": 1,
+        "stride": 1,
+        "bias": false,
+        "dropout": 0.1
+      },
+      "deconv": {
+        "kernel_size": 2,
+        "padding": 0,
+        "stride": 2,
+        "output_padding": 0,
+        "bias": false,
+        "dropout": 0.1
+      },
+      "pool": {
+        "kernel_size": 2,
+        "stride": 2,
+        "padding": 0
+      },
+      "normalization": {
+        "type": "groupnorm",
+        "num_groups": 1,
+        "eps": 1e-05,
+        "affine": true
+      },
+      "neurons": {
+        "model": "plif",
+        "overrides": {
+          "conv_block1": "selective_multitimescale_lif",
+          "conv_block2": "selective_multitimescale_lif",
+          "conv_block3": "selective_multitimescale_lif"
+        },
+        "plif": {
+          "init_tau": 2.0,
+          "surrogate_alpha": 2.0,
+          "detach_reset": true
+        },
+        "selective": {
+          "model": "selective_multitimescale_lif",
+          "compartments": 3,
+          "lambda_init": [
+            0.5,
+            0.8,
+            0.95
+          ],
+          "temporal_weight_decay": false,
+          "temporal_fptt_regularization": true,
+          "spatial_mixing": {
+            "enabled": true,
+            "kernel_size": 3,
+            "padding": "zeros",
+            "eta_init": 0.1,
+            "kernel_init": "near_identity",
+            "kernel_center_init": 0.95,
+            "kernel_surround_init": 0.001,
+            "max_kernel_l1_norm": 1.0
+          },
+          "selective_readout": {
+            "enabled": true,
+            "gate": "sigmoid",
+            "gate_kernel_size": 1,
+            "gate_init": "zeros",
+            "static_gate_init": 0.5,
+            "fusion": "weighted_sum"
+          },
+          "memory_projection": {
+            "kernel_size": 1,
+            "bias": false,
+            "init": "xavier_uniform"
+          },
+          "memory_dtype": "float32",
+          "direction": "forward",
+          "diagnostics": {
+            "every_n_windows": 100,
+            "near_lambda_gap": 0.001,
+            "growth_ratio_threshold": 100.0
+          }
+        }
+      },
+      "head": {
+        "kernel_size": 3,
+        "padding": 1,
+        "stride": 1,
+        "bias": false,
+        "dropout": 0.0,
+        "normalization": false,
+        "spiking": false,
+        "plif": {
+          "init_tau": 2.0,
+          "surrogate_alpha": 2.0,
+          "detach_reset": true,
+          "v_threshold": 1.0,
+          "v_reset": 0.0
+        }
+      }
+    },
+    "fptt_alpha": 0.5,
+    "fptt_beta": 0.5,
+    "fptt_rho": 0.0,
+    "fptt_lambda": 2.0,
+    "temporal_axis": 0,
+    "k": 81,
+    "epochs": 200,
+    "lr": 0.001,
+    "training_patch_size": [
+      81,
+      128,
+      128
+    ],
+    "validation_every": 50,
+    "validation_patch_size": [
+      81,
+      128,
+      128
+    ],
+    "use_fptt": false,
+    "temporal_mamba_enabled": null,
+    "temporal_mamba_kernel_size": null,
+    "temporal_mamba_d_state": null,
+    "temporal_mamba_dt_rank": null,
+    "temporal_mamba_debug_shapes": null,
+    "temporal_mamba_plif_enabled": null,
+    "temporal_mamba_norm_spiking": null,
+    "temporal_mamba_dwconv1D_spiking": null,
+    "spatial_patch_embedding_spiking": null,
+    "spatial_dwconv2d_spiking": null,
+    "spatial_output_spiking": null,
+    "stem_depth": null,
+    "stem_channels": null,
+    "downsample_kernel_size": null,
+    "dwconv2d_kernel_size": null,
+    "encoder_channels": null,
+    "vss_depths": null,
+    "downsample_strides": null,
+    "final_skip_fusion": null,
+    "decoder_block": null,
+    "neuron_model": null,
+    "hierarchical_encoder": null,
+    "full_resolution_skip": null,
+    "stem_spiking": null,
+    "downsampling_spiking": null,
+    "resdecoder_spiking1": null,
+    "resdecoder_spiking2": null,
+    "fue_skip1": null,
+    "fue_skip2": null,
+    "encoder_output_spiking": null,
+    "decoder_conv_spiking": null,
+    "output_spiking": null,
+    "gpus": 1,
+    "save_probabilities": false,
+    "run_dir": "/gpfs/scratch1/shared/apiaghiardelli/SNN_paper_unet_sel3_fold0",
+    "continue_training": false
+  },
+  "snn_config": {
+    "model_name": "paper_unet",
+    "model_kwargs": {
+      "encoder_channels": [
+        32,
+        64,
+        128
+      ],
+      "decoder_channels": [
+        128,
+        128,
+        128
+      ],
+      "conv": {
+        "kernel_size": 3,
+        "padding": 1,
+        "stride": 1,
+        "bias": false,
+        "dropout": 0.1
+      },
+      "deconv": {
+        "kernel_size": 2,
+        "padding": 0,
+        "stride": 2,
+        "output_padding": 0,
+        "bias": false,
+        "dropout": 0.1
+      },
+      "pool": {
+        "kernel_size": 2,
+        "stride": 2,
+        "padding": 0
+      },
+      "normalization": {
+        "type": "groupnorm",
+        "num_groups": 1,
+        "eps": 1e-05,
+        "affine": true
+      },
+      "neurons": {
+        "model": "plif",
+        "overrides": {
+          "conv_block1": "selective_multitimescale_lif",
+          "conv_block2": "selective_multitimescale_lif",
+          "conv_block3": "selective_multitimescale_lif"
+        },
+        "plif": {
+          "init_tau": 2.0,
+          "surrogate_alpha": 2.0,
+          "detach_reset": true
+        },
+        "selective": {
+          "model": "selective_multitimescale_lif",
+          "compartments": 3,
+          "lambda_init": [
+            0.5,
+            0.8,
+            0.95
+          ],
+          "temporal_weight_decay": false,
+          "temporal_fptt_regularization": true,
+          "spatial_mixing": {
+            "enabled": true,
+            "kernel_size": 3,
+            "padding": "zeros",
+            "eta_init": 0.1,
+            "kernel_init": "near_identity",
+            "kernel_center_init": 0.95,
+            "kernel_surround_init": 0.001,
+            "max_kernel_l1_norm": 1.0
+          },
+          "selective_readout": {
+            "enabled": true,
+            "gate": "sigmoid",
+            "gate_kernel_size": 1,
+            "gate_init": "zeros",
+            "static_gate_init": 0.5,
+            "fusion": "weighted_sum"
+          },
+          "memory_projection": {
+            "kernel_size": 1,
+            "bias": false,
+            "init": "xavier_uniform"
+          },
+          "memory_dtype": "float32",
+          "direction": "forward",
+          "diagnostics": {
+            "every_n_windows": 100,
+            "near_lambda_gap": 0.001,
+            "growth_ratio_threshold": 100.0
+          }
+        }
+      },
+      "head": {
+        "kernel_size": 3,
+        "padding": 1,
+        "stride": 1,
+        "bias": false,
+        "dropout": 0.0,
+        "normalization": false,
+        "spiking": false,
+        "plif": {
+          "init_tau": 2.0,
+          "surrogate_alpha": 2.0,
+          "detach_reset": true,
+          "v_threshold": 1.0,
+          "v_reset": 0.0
+        }
+      }
+    },
+    "temporal_axis": 0,
+    "k": 81,
+    "use_fptt": false,
+    "fptt_alpha": 0.5,
+    "fptt_beta": 0.5,
+    "fptt_rho": 0.0,
+    "fptt_lambda": 2.0,
+    "num_input_channels": 4,
+    "num_output_channels": 3,
+    "num_epochs": 200,
+    "initial_lr": 0.001,
+    "validation_every": 50,
+    "validation_patch_size": [
+      81,
+      128,
+      128
+    ],
+    "seed": 42,
+    "deterministic": true,
+    "augmentation_workers": 8,
+    "bidirectional": false
+  },
+  "plans": {
+    "dataset_name": "Dataset001_BraTS24GLI",
+    "plans_name": "SNNPlans",
+    "original_median_spacing_after_transp": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "original_median_shape_after_transp": [
+      142,
+      175,
+      136
+    ],
+    "image_reader_writer": "SimpleITKIO",
+    "transpose_forward": [
+      0,
+      1,
+      2
+    ],
+    "transpose_backward": [
+      0,
+      1,
+      2
+    ],
+    "configurations": {
+      "2d": {
+        "data_identifier": "nnUNetPlans_2d",
+        "preprocessor_name": "DefaultPreprocessor",
+        "batch_size": 105,
+        "patch_size": [
+          192,
+          160
+        ],
+        "median_image_size_in_voxels": [
+          175.0,
+          136.0
+        ],
+        "spacing": [
+          1.0,
+          1.0
+        ],
+        "normalization_schemes": [
+          "ZScoreNormalization",
+          "ZScoreNormalization",
+          "ZScoreNormalization",
+          "ZScoreNormalization"
+        ],
+        "use_mask_for_norm": [
+          true,
+          true,
+          true,
+          true
+        ],
+        "resampling_fn_data": "resample_data_or_seg_to_shape",
+        "resampling_fn_seg": "resample_data_or_seg_to_shape",
+        "resampling_fn_data_kwargs": {
+          "is_seg": false,
+          "order": 3,
+          "order_z": 0,
+          "force_separate_z": null
+        },
+        "resampling_fn_seg_kwargs": {
+          "is_seg": true,
+          "order": 1,
+          "order_z": 0,
+          "force_separate_z": null
+        },
+        "resampling_fn_probabilities": "resample_data_or_seg_to_shape",
+        "resampling_fn_probabilities_kwargs": {
+          "is_seg": false,
+          "order": 1,
+          "order_z": 0,
+          "force_separate_z": null
+        },
+        "architecture": {
+          "network_class_name": "dynamic_network_architectures.architectures.unet.PlainConvUNet",
+          "arch_kwargs": {
+            "n_stages": 6,
+            "features_per_stage": [
+              32,
+              64,
+              128,
+              256,
+              512,
+              512
+            ],
+            "conv_op": "torch.nn.modules.conv.Conv2d",
+            "kernel_sizes": [
+              [
+                3,
+                3
+              ],
+              [
+                3,
+                3
+              ],
+              [
+                3,
+                3
+              ],
+              [
+                3,
+                3
+              ],
+              [
+                3,
+                3
+              ],
+              [
+                3,
+                3
+              ]
+            ],
+            "strides": [
+              [
+                1,
+                1
+              ],
+              [
+                2,
+                2
+              ],
+              [
+                2,
+                2
+              ],
+              [
+                2,
+                2
+              ],
+              [
+                2,
+                2
+              ],
+              [
+                2,
+                2
+              ]
+            ],
+            "n_conv_per_stage": [
+              2,
+              2,
+              2,
+              2,
+              2,
+              2
+            ],
+            "n_conv_per_stage_decoder": [
+              2,
+              2,
+              2,
+              2,
+              2
+            ],
+            "conv_bias": true,
+            "norm_op": "torch.nn.modules.instancenorm.InstanceNorm2d",
+            "norm_op_kwargs": {
+              "eps": 1e-05,
+              "affine": true
+            },
+            "dropout_op": null,
+            "dropout_op_kwargs": null,
+            "nonlin": "torch.nn.LeakyReLU",
+            "nonlin_kwargs": {
+              "inplace": true
+            }
+          },
+          "_kw_requires_import": [
+            "conv_op",
+            "norm_op",
+            "dropout_op",
+            "nonlin"
+          ]
+        },
+        "batch_dice": true
+      },
+      "3d_fullres": {
+        "data_identifier": "nnUNetPlans_3d_fullres",
+        "preprocessor_name": "DefaultPreprocessor",
+        "batch_size": 2,
+        "patch_size": [
+          81,
+          128,
+          128
+        ],
+        "median_image_size_in_voxels": [
+          142.0,
+          175.0,
+          136.0
+        ],
+        "spacing": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "normalization_schemes": [
+          "ZScoreNormalization",
+          "ZScoreNormalization",
+          "ZScoreNormalization",
+          "ZScoreNormalization"
+        ],
+        "use_mask_for_norm": [
+          true,
+          true,
+          true,
+          true
+        ],
+        "resampling_fn_data": "resample_data_or_seg_to_shape",
+        "resampling_fn_seg": "resample_data_or_seg_to_shape",
+        "resampling_fn_data_kwargs": {
+          "is_seg": false,
+          "order": 3,
+          "order_z": 0,
+          "force_separate_z": null
+        },
+        "resampling_fn_seg_kwargs": {
+          "is_seg": true,
+          "order": 1,
+          "order_z": 0,
+          "force_separate_z": null
+        },
+        "resampling_fn_probabilities": "resample_data_or_seg_to_shape",
+        "resampling_fn_probabilities_kwargs": {
+          "is_seg": false,
+          "order": 1,
+          "order_z": 0,
+          "force_separate_z": null
+        },
+        "architecture": {
+          "network_class_name": "dynamic_network_architectures.architectures.unet.PlainConvUNet",
+          "arch_kwargs": {
+            "n_stages": 6,
+            "features_per_stage": [
+              32,
+              64,
+              128,
+              256,
+              320,
+              320
+            ],
+            "conv_op": "torch.nn.modules.conv.Conv3d",
+            "kernel_sizes": [
+              [
+                3,
+                3,
+                3
+              ],
+              [
+                3,
+                3,
+                3
+              ],
+              [
+                3,
+                3,
+                3
+              ],
+              [
+                3,
+                3,
+                3
+              ],
+              [
+                3,
+                3,
+                3
+              ],
+              [
+                3,
+                3,
+                3
+              ]
+            ],
+            "strides": [
+              [
+                1,
+                1,
+                1
+              ],
+              [
+                2,
+                2,
+                2
+              ],
+              [
+                2,
+                2,
+                2
+              ],
+              [
+                2,
+                2,
+                2
+              ],
+              [
+                2,
+                2,
+                2
+              ],
+              [
+                2,
+                2,
+                1
+              ]
+            ],
+            "n_conv_per_stage": [
+              2,
+              2,
+              2,
+              2,
+              2,
+              2
+            ],
+            "n_conv_per_stage_decoder": [
+              2,
+              2,
+              2,
+              2,
+              2
+            ],
+            "conv_bias": true,
+            "norm_op": "torch.nn.modules.instancenorm.InstanceNorm3d",
+            "norm_op_kwargs": {
+              "eps": 1e-05,
+              "affine": true
+            },
+            "dropout_op": null,
+            "dropout_op_kwargs": null,
+            "nonlin": "torch.nn.LeakyReLU",
+            "nonlin_kwargs": {
+              "inplace": true
+            }
+          },
+          "_kw_requires_import": [
+            "conv_op",
+            "norm_op",
+            "dropout_op",
+            "nonlin"
+          ]
+        },
+        "batch_dice": false
+      }
+    },
+    "experiment_planner_used": "ExperimentPlanner",
+    "label_manager": "LabelManager",
+    "foreground_intensity_properties_per_channel": {
+      "0": {
+        "max": 9210.0,
+        "mean": 1210.5902099609375,
+        "median": 988.15185546875,
+        "min": -29.0,
+        "percentile_00_5": 100.0298879623413,
+        "percentile_99_5": 3668.1718823242118,
+        "std": 901.5140380859375
+      },
+      "1": {
+        "max": 37707.08984375,
+        "mean": 1390.58251953125,
+        "median": 1278.1578369140625,
+        "min": 0.0,
+        "percentile_00_5": 120.99885005950928,
+        "percentile_99_5": 5094.306887207029,
+        "std": 1066.119873046875
+      },
+      "2": {
+        "max": 8751.0,
+        "mean": 1139.5274658203125,
+        "median": 890.017333984375,
+        "min": 0.0,
+        "percentile_00_5": 218.25799560546875,
+        "percentile_99_5": 4011.0068359375,
+        "std": 756.5709228515625
+      },
+      "3": {
+        "max": 4479.0,
+        "mean": 823.3295288085938,
+        "median": 805.9666137695312,
+        "min": 0.0,
+        "percentile_00_5": 85.61640930175781,
+        "percentile_99_5": 2573.0,
+        "std": 488.0124206542969
+      }
+    },
+    "snn_config": {
+      "model_name": "paper_unet",
+      "model_kwargs": {
+        "encoder_channels": [
+          32,
+          64,
+          128
+        ],
+        "decoder_channels": [
+          128,
+          128,
+          128
+        ],
+        "conv": {
+          "kernel_size": 3,
+          "padding": 1,
+          "stride": 1,
+          "bias": false,
+          "dropout": 0.1
+        },
+        "deconv": {
+          "kernel_size": 2,
+          "padding": 0,
+          "stride": 2,
+          "output_padding": 0,
+          "bias": false,
+          "dropout": 0.1
+        },
+        "pool": {
+          "kernel_size": 2,
+          "stride": 2,
+          "padding": 0
+        },
+        "normalization": {
+          "type": "groupnorm",
+          "num_groups": 1,
+          "eps": 1e-05,
+          "affine": true
+        },
+        "neurons": {
+          "model": "plif",
+          "overrides": {
+            "conv_block1": "selective_multitimescale_lif",
+            "conv_block2": "selective_multitimescale_lif",
+            "conv_block3": "selective_multitimescale_lif"
+          },
+          "plif": {
+            "init_tau": 2.0,
+            "surrogate_alpha": 2.0,
+            "detach_reset": true
+          },
+          "selective": {
+            "model": "selective_multitimescale_lif",
+            "compartments": 3,
+            "lambda_init": [
+              0.5,
+              0.8,
+              0.95
+            ],
+            "temporal_weight_decay": false,
+            "temporal_fptt_regularization": true,
+            "spatial_mixing": {
+              "enabled": true,
+              "kernel_size": 3,
+              "padding": "zeros",
+              "eta_init": 0.1,
+              "kernel_init": "near_identity",
+              "kernel_center_init": 0.95,
+              "kernel_surround_init": 0.001,
+              "max_kernel_l1_norm": 1.0
+            },
+            "selective_readout": {
+              "enabled": true,
+              "gate": "sigmoid",
+              "gate_kernel_size": 1,
+              "gate_init": "zeros",
+              "static_gate_init": 0.5,
+              "fusion": "weighted_sum"
+            },
+            "memory_projection": {
+              "kernel_size": 1,
+              "bias": false,
+              "init": "xavier_uniform"
+            },
+            "memory_dtype": "float32",
+            "direction": "forward",
+            "diagnostics": {
+              "every_n_windows": 100,
+              "near_lambda_gap": 0.001,
+              "growth_ratio_threshold": 100.0
+            }
+          }
+        },
+        "head": {
+          "kernel_size": 3,
+          "padding": 1,
+          "stride": 1,
+          "bias": false,
+          "dropout": 0.0,
+          "normalization": false,
+          "spiking": false,
+          "plif": {
+            "init_tau": 2.0,
+            "surrogate_alpha": 2.0,
+            "detach_reset": true,
+            "v_threshold": 1.0,
+            "v_reset": 0.0
+          }
+        }
+      },
+      "temporal_axis": 0,
+      "k": 81,
+      "use_fptt": false,
+      "fptt_alpha": 0.5,
+      "fptt_beta": 0.5,
+      "fptt_rho": 0.0,
+      "fptt_lambda": 2.0,
+      "num_input_channels": 4,
+      "num_output_channels": 3,
+      "num_epochs": 200,
+      "initial_lr": 0.001,
+      "validation_every": 50,
+      "validation_patch_size": [
+        81,
+        128,
+        128
+      ],
+      "seed": 42,
+      "deterministic": true,
+      "augmentation_workers": 8,
+      "bidirectional": false
+    }
+  }
+}
