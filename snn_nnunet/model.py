@@ -991,8 +991,12 @@ def build_model(model_name: str, out_channels: int = 3, patch_size: int = 4,
     if model_name == "paper_unet":
         if (patch_size != 4 or not linear_projection or not residual_connections or
                 not dwconv2d_spiking or patch_embedding_spiking or input_skip or
-                not output_spiking or temporal_mamba is not None or spatial_output_spiking):
+                not output_spiking or spatial_output_spiking):
             raise ValueError("paper_unet does not accept Mamba/legacy architecture controls")
+        if temporal_mamba is not None:
+            if type(temporal_mamba) is not bool:
+                raise ValueError('paper_unet.temporal_mamba must be boolean; legacy Mamba mappings require orig')
+            architecture['temporal_mamba'] = temporal_mamba
         from snn_nnunet.paper_unet import PaperUNet
         return PaperUNet(out_channels=out_channels, **architecture)
     architecture = normalize_spiking_options(architecture)

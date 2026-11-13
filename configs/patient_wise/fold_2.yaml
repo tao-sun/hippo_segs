@@ -7,7 +7,7 @@ family: snn
 dataset_id: 1
 fold: 2
 gpus: 1
-run_dir: /gpfs/scratch1/shared/apiaghiardelli/SNN_2D_Unet_SMMLif_DS_patientwise_seed42/outer_fold_2
+run_dir: /gpfs/scratch1/shared/apiaghiardelli/SSMLIF_01_pw_ds_fullres_mamba/outer_fold_2
 # Patient-wise outer test; 10% of the other four folds is internal validation.
 data_partition: /gpfs/home6/apiaghiardelli/hippo_segs/data_partitions/brats24_patient_seed42
 snn:
@@ -31,11 +31,11 @@ snn:
   # Baseline originale: false; true salta entrambe le validazioni complete a fine training.
   skip_final_validation: false
   training_patch_size:
-  - 81
+  - 128
   - 128
   - 128
   validation_patch_size:
-  - 81
+  - 128
   - 128
   - 128
   k: 81
@@ -44,6 +44,14 @@ snn:
   fptt_rho: 0.0
   fptt_lambda: 2.0
   paper_unet:
+    # Skip from encoder conv_block1 before pooling into the final decoder convolution.
+    full_resolution_skip: true
+    # true: encode all slices, temporal Mamba, then decode; false: current baseline.
+    temporal_mamba: true
+    # Autoregressive feedback requires temporal_mamba: false and bidirectional: false.
+    previous_probability_feedback: false
+    previous_probability_feedback_detach: true
+    previous_probability_feedback_init: zeros
     # Teste ausiliarie solo durante il training; ordine: finale, meta, quarto.
     deep_supervision:
       enabled: true

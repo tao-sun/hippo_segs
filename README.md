@@ -34,7 +34,7 @@ uv run --python 3.10 python -m snn_nnunet.cli prepare \
 
 The converter writes `Dataset501_BraTS24GLI` under `nnUNet_raw`. Channels `_0000` through `_0003` are T1, T1ce, T2, and FLAIR. Only segmentation value `4` is changed to background `0`; image intensities and geometry are preserved. Unlabeled cases go to `imagesTs`. An already formatted `Dataset501_BraTS24GLI` raw directory can also be passed as `--dataset-root`.
 
-Preparation runs native nnU-Net fingerprinting, planning, and preprocessing with dataset integrity checks. It derives `SNNPlans.json` from stock plans, retaining the stock preprocessed data identifier. The SNN `3d_fullres` plan uses a **[128, 128, 128] voxel patch** and **batch size 4**. Its `model_kwargs.patch_size: 4` is the internal 2D SpikMamba patch-embedding factor, not the nnU-Net spatial patch size.
+Preparation runs native nnU-Net fingerprinting, planning, and preprocessing with dataset integrity checks. It derives `SNNPlans.json` from stock plans, retaining the stock preprocessed data identifier. The SNN `3d_fullres` plan defaults to a **[128, 128, 128] voxel patch** and **batch size 2**; the launcher can override the batch size as described below. Its `model_kwargs.patch_size: 4` is the internal 2D SpikMamba patch-embedding factor, not the nnU-Net spatial patch size.
 
 ## Train and resume
 
@@ -77,6 +77,17 @@ when changing the initial LR. Editing the launcher YAML does not change an
 already running job or a saved continuation schedule.
 
 
+Set `snn.batch_size: 4` to use four patches per minibatch for SNN training
+and online patch validation. This is the global batch size, divided across
+GPUs by nnU-Net; with one GPU all four patches are processed together.
+The CLI equivalent is `--batch-size 4`. The value must be a positive integer
+and is saved in `configurations.3d_fullres.batch_size` in effective plans,
+run metadata, and checkpoint initialization arguments. Omitting it preserves
+the existing plans value. The active `unet_config.yaml` selects 4. Use a fresh
+`run_dir`: existing results reject incompatible batch-size overrides, and
+editing the YAML does not change running jobs or saved resume plans.
+The LR and minibatch counts per epoch are independent of this setting.
+
 Set `snn.training_patch_size: [162, 128, 128]` to use the same spatial patch
 size for training and online patch validation. The launcher sets
 `configurations.3d_fullres.patch_size` in the effective plans and saves it
@@ -114,21 +125,34 @@ For a quick three-epoch experiment, set `snn.epochs: 3` in `unet_config.yaml`
 with the 5/2 batch budgets and validation controls above, keeping the desired
 architecture and patch size. Choose a fresh `run_dir`.
 
-Set `snn.validation_every: 50` to evaluate the selected fold on complete
-validation volumes at completed epochs 50, 100, 150, etc., using the exact
-current weights and the existing BraTS component filtering and closing.
+Set `snn.validation_every: 50` to evaluate complete volumes at completed
+epochs 50, 100, 150, etc., using
+`checkpoint_best.pth`, the global best EMA pseudo Dice on validation patches,
+and the existing BraTS component filtering and closing. The selected checkpoint
+can come from any earlier epoch, including before the latest 50-epoch interval.
+Patient-wise runs evaluate the outer test fold for monitoring. Test scores
+never update `checkpoint_best.pth` or select a postprocessing-best checkpoint.
+Legacy runs without a separate patient test retain internal validation.
 `snn.validation_patch_size: [162, 128, 128]` uses the full temporal extent
 of Dataset001 on axis 0, with padding for shorter cases. The current fold-0
 YAML enables these settings. The pipeline uses FP32, Gaussian blending,
-50% overlap and mirroring on the non-temporal axes. Training mode and RNG
-states are restored afterward. With multiple GPUs, rank 0 validates the
+50% overlap and mirroring on the non-temporal axes. Current model weights,
+buffers, training modes and RNG states are restored afterward; optimizer,
+scheduler and training epoch are never loaded from the best checkpoint.
+With multiple GPUs, rank 0 validates the
 unwrapped network while all other ranks wait; training then resumes together.
 
 Each boundary saves `fold_0/checkpoint_epoch_0050.pth`, etc., and
-`fold_0/validation_periodic/epoch_0050/summary.json`, masks and metrics.
-`validation_periodic/dice_history.csv` records WT/TC/ET and mean Dice before
-and after postprocessing. `checkpoint_best_postprocessed.pth` retains the
-best postprocessed mean among evaluated boundaries. Plans and checkpoint
+`fold_0/testing_periodic_best_patch/epoch_0050/summary.json`, masks and metrics
+for patient-wise runs (`validation_periodic_best_patch/` for legacy validation).
+Each evaluation also retains an immutable `checkpoint_best_patch.pth` snapshot.
+The corresponding `dice_history.csv` records WT/TC/ET and mean Dice
+before and after postprocessing, the evaluation boundary (`epoch`), the actual
+selected epoch (`checkpoint_epoch`) and the patch EMA score. Existing results
+under `validation_periodic/` are preserved and are not mixed with the new
+protocol. On legacy validation only, `checkpoint_best_postprocessed.pth` retains
+the best postprocessed mean among evaluated patch-best snapshots. Patient-test
+monitoring never writes or updates that file. Plans and checkpoint
 initialization arguments preserve the interval and validation patch size;
 old plans default to interval 0 (disabled) and a 128-cubed validation patch.
 The resume command inherits the saved interval unless `--validation-every`
@@ -174,24 +198,31 @@ has been reached retries validation without further training.
 Use `--lr-mode continuous` to stretch the remaining polynomial decay from
 the current LR, avoiding a new increase when extending the horizon. Its
 origin and LR are saved in checkpoints and restored on subsequent resumes.
-`--validation-every 100` evaluates the exact current weights on the complete
-validation split at completed epochs 100, 200, etc., including the starting
+`--validation-every 100` evaluates the global patch-validation best on the complete
+outer test for patient-wise runs, or validation split for legacy runs,
+at completed epochs 100, 200, etc., including the starting
 boundary when needed. It uses the existing FP32 128-cubed sliding-window
 inference and BraTS postprocessing, retaining empty-empty Dice = 1.
-Training mode and Python/NumPy/PyTorch RNG states are restored afterward.
+Current weights, buffers, training modes and Python/NumPy/PyTorch RNG states
+are restored afterward. A missing best checkpoint is an explicit error.
 
 Inside `fold_0`, outputs are `checkpoint_epoch_0100.pth`, etc., and
-`validation_periodic/epoch_0100/summary.json`, `metrics.csv`, raw and
-postprocessed predictions. `validation_periodic/dice_history.csv` collects
-WT/TC/ET and mean Dice at each boundary. The highest postprocessed mean
-among these boundaries is saved as `checkpoint_best_postprocessed.pth`.
+`testing_periodic_best_patch/epoch_0100/summary.json`, `metrics.csv`, raw and
+postprocessed predictions for patient-wise runs; legacy runs use
+`validation_periodic_best_patch/`. Each directory's `dice_history.csv` collects
+WT/TC/ET and mean Dice at each boundary, plus selected checkpoint epoch and EMA.
+Only legacy validation may select `checkpoint_best_postprocessed.pth`.
 Interrupted validation is retried from its boundary checkpoint; completed
 reports are reused. Native full-volume validation also runs after training.
 Custom validation after a fresh or resumed training run uses
 `checkpoint_final.pth`, including runs stopped at 100, 200, or 300 epochs;
-it does not require `checkpoint_best.pth`. Periodic validation uses the exact
-current weights saved in each `checkpoint_epoch_*.pth`, so an older final
-checkpoint cannot affect intermediate results.
+it does not require `checkpoint_best.pth`. Periodic validation requires
+`checkpoint_best.pth` and evaluates its saved weights, while
+`checkpoint_epoch_*.pth` remains a recovery point for the current training.
+An older final checkpoint cannot affect intermediate results. For patient-wise
+runs, periodic outer-test evaluation is monitoring only. The dedicated final
+test command remains available after training; checkpoint selection throughout
+training uses only the EMA of internal patch-validation pseudo Dice.
 
 For `SNNMamba_k128_v2_analog_gelu`, the prepared H100 job requests **5 days**,
 targets **600 total epochs**, uses a continuous LR extension and performs
@@ -599,3 +630,7 @@ block overrides take priority over the legacy global attention selector.
 and inference. Choose a fresh run directory after changing neuron types or
 fusion architecture. Existing flat configs and earlier selectable configs
 remain readable.
+
+## Arch2 nella pipeline nnU-Net
+
+La variante `snn.variant: arch2` si configura tramite `snn.arch2`. Esempio completo: [arch2_config.yaml](arch2_config.yaml); architettura e avvio: [ARCH2.md](ARCH2.md).

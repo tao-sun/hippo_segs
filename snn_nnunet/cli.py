@@ -96,13 +96,16 @@ def _add_training_config(parser: argparse.ArgumentParser) -> None:
     parser.set_defaults(bidirectional=None)
     parser.add_argument('--bidirectional-fusion', metavar='{OR,conv_PLIF,Shared_SOMA}',
                         help='plain SiLIF encoder fusion; PLIF/attention stay forward-only; ignored when bidirectional is disabled')
-    parser.add_argument("--model", choices=("orig", "shallow", "medium", "deep", "paper_unet"), default="orig")
+    parser.add_argument("--model", choices=("orig", "shallow", "medium", "deep", "paper_unet", "arch2"), default="orig")
+    parser.add_argument('--arch2', type=json.loads, help='Arch2 options supplied by snn.arch2 in the experiment YAML')
     parser.add_argument("--paper-unet", type=json.loads, help="Paper U-Net options; normally supplied by unet_config.yaml")
     for key in ("fptt_alpha", "fptt_beta", "fptt_rho", "fptt_lambda"):
         parser.add_argument("--" + key.replace("_", "-"), type=float)
     parser.add_argument("--temporal-axis", type=int, choices=(0, 1, 2), default=0)
     parser.add_argument("--k", type=_positive_int, default=16)
     parser.add_argument("--epochs", type=_positive_int, help="total SNN training epochs; defaults to saved plans")
+    parser.add_argument('--batch-size', type=_positive_int,
+                        help='global patch batch size for training and online validation; defaults to saved plans')
     parser.add_argument("--train-batches-per-epoch", type=_positive_int,
                         help="training minibatches per epoch per process; defaults to saved plans or 250")
     parser.add_argument("--val-batches-per-epoch", type=_positive_int,
@@ -341,7 +344,10 @@ def _requested_config(args: argparse.Namespace, plans_path: Path) -> dict:
     saved = plans.get("snn_config", {})
     reuse_saved_paper = (isinstance(saved, dict) and saved.get("model_name") == "paper_unet"
                         and getattr(args, "paper_unet", None) is None)
-    if args.model == "paper_unet" and not args.continue_training and not reuse_saved_paper:
+    reuse_saved_arch2 = (isinstance(saved, dict) and saved.get('model_name') == 'arch2'
+                         and getattr(args, 'arch2', None) is None)
+    if ((args.model == "paper_unet" and not args.continue_training and not reuse_saved_paper)
+            or (args.model == 'arch2' and not args.continue_training and not reuse_saved_arch2)):
         from copy import deepcopy
         from snn_nnunet.prepare_plans import DEFAULT_SNN_CONFIG
         # Fresh paper runs replace the architecture stored in shared preparation
@@ -368,6 +374,20 @@ def _requested_config(args: argparse.Namespace, plans_path: Path) -> dict:
         value = getattr(args, key, None)
         if value is not None:
             config[key] = value
+    if args.model != 'arch2' and getattr(args, 'arch2', None) is not None:
+        raise ValueError('--arch2 requires --model arch2')
+    if args.model == 'arch2':
+        from snn_nnunet.arch2_config import arch2_options
+        from snn_nnunet.model import ARCHITECTURE_DEFAULTS
+        legacy_keys = set(ARCHITECTURE_DEFAULTS) | {'output_spiking', 'paper_unet', 'recurrent_neuron'}
+        incompatible = [key for key, value in vars(args).items()
+                        if value is not None and (key in legacy_keys or key.startswith(('spatial_', 'temporal_mamba')))]
+        if incompatible:
+            raise ValueError(f'arch2: incompatible options {incompatible}')
+        supplied = getattr(args, 'arch2', None)
+        source = saved.get('model_kwargs', {}) if saved.get('model_name') == 'arch2' else {}
+        config['model_kwargs'] = arch2_options(source if supplied is None else supplied)
+        return SNNConfig.from_plans({'snn_config': config}).to_dict()
     if args.model == "paper_unet":
         from snn_nnunet.paper_config import paper_options
         # Do not inherit Mamba kwargs when starting from the preparation plans.
@@ -465,6 +485,7 @@ def _persist_training_config(args: argparse.Namespace) -> None:
     update_snn_config(
         plans_path, _requested_config(args, plans_path), _results_folder(args.dataset_id),
         training_patch_size=getattr(args, "training_patch_size", None),
+        batch_size=getattr(args, 'batch_size', None),
     )
 
 

@@ -51,7 +51,7 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
         # The base trainer enables CUDA AMP by default. Keep SNN training in FP32.
         self.grad_scaler = None
         self.snn_config = SNNConfig.from_plans(self.plans_manager.plans)
-        if self.snn_config.bidirectional:
+        if self.snn_config.requires_full_sequence:
             # Save the effective whole-Z BPTT policy, including in native init_args.
             self.plans_manager.plans['snn_config'] = self.snn_config.to_dict()
             self.my_init_kwargs['plans']['snn_config'] = self.snn_config.to_dict()
@@ -278,6 +278,10 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
                     f'Bidirectional Paper U-Net: {self.snn_config.bidirectional_fusion} '
                     f'{"memory fusion before pooling" if self.snn_config.bidirectional_fusion == "Shared_SOMA" else "fusion after pooling"}; full-Z BPTT '
                     f'k={self.snn_config.k}, temporal_axis={self.snn_config.temporal_axis}, use_fptt=False')
+            if self.snn_config.model_name == 'paper_unet' and self.snn_config.model_kwargs['temporal_mamba']:
+                self.print_to_log_file(
+                    'Temporal Mamba bottleneck: binary spikes -> LayerNorm -> standard Mamba + residual; '
+                    'complete patch sequence, one optimizer update per patch, use_fptt=False')
         super().initialize()
         if self.local_rank == 0:
             for name, cell in named_selective_neurons(self._unwrapped_network()):
@@ -347,7 +351,7 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
                 state.update(fptt.export_fptt_tensors(self._get_adapter()))
             checkpoint["fptt_state"] = state
             checkpoint['reproducibility'] = self.reproducibility
-            if self.snn_config.model_name == "paper_unet":
+            if self.snn_config.model_name in {"paper_unet", "arch2"}:
                 checkpoint["snn_config"] = self.snn_config.to_dict()
             torch.save(checkpoint, temporary)
             os.replace(temporary, filename)
@@ -366,17 +370,20 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
         for field in ('seed', 'deterministic', 'augmentation_workers', 'overfit_num_volumes'):
             if getattr(restored_policy, field) != getattr(self.snn_config, field):
                 raise ValueError(f'Checkpoint {field} differs from the current reproducibility policy')
-        if self.snn_config.model_name == "paper_unet" or saved_config.get("model_name") == "paper_unet":
+        if (self.snn_config.model_name in {"paper_unet", "arch2"}
+                or saved_config.get("model_name") in {"paper_unet", "arch2"}):
             restored = SNNConfig.from_plans(saved_plans)
+            architecture = ('arch2' if 'arch2' in (restored.model_name, self.snn_config.model_name)
+                            else 'paper_unet')
             if (restored.model_name != self.snn_config.model_name or
                     restored.bidirectional != self.snn_config.bidirectional or
                     restored.bidirectional_fusion != self.snn_config.bidirectional_fusion or
                     restored.model_kwargs != self.snn_config.model_kwargs or
                     restored.temporal_axis != self.snn_config.temporal_axis):
-                raise ValueError("Checkpoint paper_unet architecture does not match current plans")
+                raise ValueError(f"Checkpoint {architecture} architecture does not match current plans")
             metadata = checkpoint.get("snn_config")
             if metadata is not None and SNNConfig.from_plans({"snn_config": metadata}).to_dict() != restored.to_dict():
-                raise ValueError("Checkpoint paper_unet metadata differs from saved plans")
+                raise ValueError(f"Checkpoint {architecture} metadata differs from saved plans")
         state = checkpoint.get("fptt_state")
         if not isinstance(state, dict):
             raise ValueError("Checkpoint is missing fptt_state")
@@ -470,7 +477,7 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
         recurrent_cells = list(named_selective_neurons(adapter))
         diagnostic_sums, diagnostic_counts = {}, {}
 
-        window_size = length if config.bidirectional else config.k
+        window_size = length if config.requires_full_sequence else config.k
         for t0 in range(0, length, window_size):
             end = min(t0 + window_size, length)
             window_length = end - t0
@@ -482,14 +489,16 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
                 frequency = cell.config["diagnostics"]["every_n_windows"]
                 cell.collect_diagnostics = bool(frequency and window_index % frequency == 0)
             supervision = (config.model_kwargs.get('deep_supervision', {})
-                           if config.model_name == 'paper_unet' else {})
+                           if config.model_name in {'paper_unet', 'arch2'} else {})
             kwargs = {'return_auxiliary': True} if supervision.get('enabled', False) else {}
             logits = self.network(data_window, t0=t0, chunk_size=window_length, **kwargs)
             if supervision.get('enabled', False):
                 from snn_nnunet.deep_supervision import deep_supervision_loss
                 task_loss = deep_supervision_loss(logits, target_window, self.loss, supervision['weights'],
                                                   temporal_axis=axis,
-                                                  spatial_stride=config.model_kwargs['pool']['stride'])
+                                                  spatial_stride=(config.model_kwargs['patch_size']
+                                                      if config.model_name == 'arch2'
+                                                      else config.model_kwargs['pool']['stride']))
             else:
                 task_loss = self.loss(logits, target_window)
             regularization = torch.zeros_like(task_loss)
@@ -556,7 +565,7 @@ class nnUNetTrainerSNNFPTT(nnUNetTrainer):
         if self.snn_config.overfit_num_volumes:
             return self._evaluate_overfit()
         geometry = nullcontext()
-        if self.snn_config.model_name == "paper_unet":
+        if self.snn_config.model_name in {"paper_unet", "arch2"}:
             from snn_nnunet.custom_full_validation import temporary_patch_size
             geometry = temporary_patch_size(self.configuration_manager, self.snn_config.validation_patch_size)
         with geometry, native_fp32_predictor(), native_empty_dice_evaluation():

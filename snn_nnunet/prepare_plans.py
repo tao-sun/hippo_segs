@@ -54,7 +54,11 @@ def _compatibility_config(plans: Mapping[str, Any]) -> dict[str, Any]:
     """Normalize the disabled optional branch when comparing legacy plans."""
 
     result = deepcopy(dict(plans))
-    result["snn_config"] = _validated_config(result["snn_config"])
+    # Resolve whole-sequence policies against geometry before comparing saved
+    # trainer plans with callers that still supply a baseline window length.
+    result["snn_config"] = SNNConfig.from_plans(result).to_dict()
+    if result['snn_config']['model_name'] == 'arch2':
+        return result
     result["snn_config"]["model_kwargs"].setdefault("spatial_output_spiking", False)
     result["snn_config"]["model_kwargs"].setdefault("neuron_model", "plif")
     result["snn_config"]["model_kwargs"].setdefault("dwconv2d_kernel_size", 3)
@@ -82,8 +86,7 @@ def derive_snn_plans(stock: Mapping[str, Any], snn_config: Mapping[str, Any]) ->
     result["configurations"]["3d_fullres"]["patch_size"] = [128, 128, 128]
     result["configurations"]["3d_fullres"]["batch_size"] = 2
     result["snn_config"] = _validated_config(snn_config)
-    if result['snn_config']['bidirectional']:
-        result['snn_config'] = SNNConfig.from_plans(result).to_dict()
+    result['snn_config'] = SNNConfig.from_plans(result).to_dict()
     return result
 
 
@@ -177,6 +180,7 @@ def update_snn_config(
     results_folder: Path | None = None,
     *,
     training_patch_size: list[int] | tuple[int, int, int] | None = None,
+    batch_size: int | None = None,
 ) -> Path:
     """Validate result compatibility and atomically persist a complete SNN config."""
 
@@ -184,13 +188,16 @@ def update_snn_config(
     with plans_path.open(encoding="utf-8") as stream:
         plans = json.load(stream)
     plans["snn_config"] = _validated_config(snn_config)
+    if batch_size is not None:
+        if type(batch_size) is not int or batch_size <= 0:
+            raise ValueError('batch_size must be a positive integer')
+        plans['configurations']['3d_fullres']['batch_size'] = batch_size
     if training_patch_size is not None:
         if (not isinstance(training_patch_size, (list, tuple)) or len(training_patch_size) != 3
                 or any(type(value) is not int or value <= 0 for value in training_patch_size)):
             raise ValueError("training_patch_size must contain three positive integers")
         plans["configurations"]["3d_fullres"]["patch_size"] = list(training_patch_size)
-    if plans['snn_config']['bidirectional']:
-        plans['snn_config'] = SNNConfig.from_plans(plans).to_dict()
+    plans['snn_config'] = SNNConfig.from_plans(plans).to_dict()
     if results_folder is not None:
         validate_results_compatibility(results_folder, plans)
     _atomic_write_json(plans_path, plans)

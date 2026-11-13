@@ -16,6 +16,12 @@ PLIF_DEFAULTS = {'init_tau': 2.0, 'surrogate_alpha': 2.0, 'detach_reset': True}
 PAPER_DEFAULTS = {
     'encoder_channels': [32, 64, 128], 'decoder_channels': [128, 128, 128],
     'encoder_spiking': True, 'decoder_spiking': True,
+    'full_resolution_skip': False,
+    'temporal_mamba': False,
+    'previous_probability_feedback': False,
+    'previous_probability_feedback_detach': True,
+    'previous_probability_feedback_init': 'zeros',
+    'temporal_mamba_options': {'d_state': 16, 'd_conv': 4, 'expand': 2, 'dt_rank': 'auto'},
     'deep_supervision': {'enabled': False, 'weights': [1.0, 0.3, 0.1], 'resolution': 'full'},
     'conv': {'kernel_size': 3, 'padding': 1, 'stride': 1, 'bias': False, 'dropout': .1},
     'deconv': {'kernel_size': 2, 'padding': 0, 'stride': 2, 'output_padding': 0,
@@ -125,9 +131,21 @@ def paper_options(values):
             neurons['overrides'] = {name: normalize_recurrent_model(model)
                                     for name, model in neurons['overrides'].items()}
     result = _merge(PAPER_DEFAULTS, values, 'paper_unet')
-    for key in ('encoder_spiking', 'decoder_spiking'):
+    for key in ('encoder_spiking', 'decoder_spiking', 'full_resolution_skip', 'temporal_mamba',
+                'previous_probability_feedback', 'previous_probability_feedback_detach'):
         if type(result[key]) is not bool:
             raise ValueError(f'{key} must be boolean')
+    if result['previous_probability_feedback_init'] != 'zeros':
+        raise ValueError('previous_probability_feedback_init must be zeros')
+    if result['previous_probability_feedback'] and result['temporal_mamba']:
+        raise ValueError('previous_probability_feedback requires temporal_mamba=false')
+    temporal = result['temporal_mamba_options']
+    for key in ('d_state', 'd_conv', 'expand'):
+        _int(temporal[key], f'temporal_mamba_options.{key}')
+    if temporal['dt_rank'] != 'auto':
+        _int(temporal['dt_rank'], 'temporal_mamba_options.dt_rank')
+    if result['temporal_mamba'] and not result['encoder_spiking']:
+        raise ValueError('temporal_mamba binary bottleneck requires encoder_spiking=true')
     supervision = result['deep_supervision']
     if type(supervision['enabled']) is not bool:
         raise ValueError('deep_supervision.enabled must be boolean')

@@ -101,10 +101,10 @@ def parameter_formula(model):
     e1, e2, e3 = opts['encoder_channels']
     d1, d2, d3 = opts['decoder_channels']
     out_channels = model.class_conv.conv.out_channels
-    topology = [(4, e1, False), (e1, e2, False), (e2, e3, False),
+    topology = [(model.conv_block1.conv.in_channels, e1, False), (e1, e2, False), (e2, e3, False),
                 (e3, d1, True), (d1, d1, False), (e2+d1, d1, False),
                 (d1, d2, True), (d2, d2, False), (e1+d2, d2, False),
-                (d2, d3, True), (d3, d3, False)]
+                (d2, d3, True), (d3 + (e1 if opts['full_resolution_skip'] else 0), d3, False)]
     total = 0
     for name, (incoming, outgoing, up) in zip(BLOCK_NAMES, topology):
         block = opts['deconv' if up else 'conv']
@@ -131,10 +131,20 @@ def parameter_formula(model):
     total += d3*out_channels*opts['head']['kernel_size']**2
     total += out_channels if opts['head']['bias'] else 0
     total += 1  # Continuous voltage head has a learned PLIF time constant.
+    if model.deep_supervision_enabled:
+        total += out_channels * (d1 + d2 + 2)  # Two 1x1 heads, including biases.
     if getattr(model, 'bidirectional', False) and model.bidirectional_fusion == 'conv_plif':
         total += sum(2*c*c+1 + (2*c if opts['normalization']['affine'] else 0)
                      for index, c in enumerate((e1, e2, e3), 1)
                      if f'conv_block{index}' in model.bidirectional_blocks)
+    if model.temporal_mamba_enabled:
+        temporal = opts['temporal_mamba_options']
+        inner = e3 * temporal['expand']
+        rank = math.ceil(e3 / 16) if temporal['dt_rank'] == 'auto' else temporal['dt_rank']
+        # LayerNorm; in/out projections; causal depthwise conv; x/dt projections;
+        # A_log, D and biases. Standard Mamba uses no in/out projection biases.
+        total += 2 * e3 + 3 * e3 * inner
+        total += inner * (temporal['d_conv'] + 2 * rank + 3 * temporal['d_state'] + 3)
     return total
 
 
@@ -159,9 +169,12 @@ def estimate_cost(model, shape=(81, 128, 128), batch=1):
         macs = convolution_macs(layer, incoming_shape)*z
         if name == 'conv_block1':
             spiking_input = False
+        elif name == 'deconv_block1' and model.temporal_mamba_enabled:
+            spiking_input = False  # Residual Mamba features are continuous.
         elif name in ('conv_block2', 'conv_block3', 'deconv_block1'):
             spiking_input = model.options['encoder_spiking']
-        elif name in ('concat1_conv', 'concat2_conv'):
+        elif name in ('concat1_conv', 'concat2_conv') or (
+                name == 'deconv3_conv' and model.full_resolution_skip):
             spiking_input = model.options['encoder_spiking'] and model.options['decoder_spiking']
         else:
             spiking_input = model.options['decoder_spiking']
@@ -194,30 +207,59 @@ def estimate_cost(model, shape=(81, 128, 128), batch=1):
                             **selective_cost(cell, sites)})
         return (batch, layer.out_channels, *out)
 
-    spatial = (batch, 4, h, w)
-    skips = []
-    pool = model.pool
-    for index in range(3):
-        active = f'conv_block{index+1}' in model.bidirectional_blocks
-        spatial = record(f'conv_block{index+1}', spatial, repeats=2 if active and not shared_soma else 1)
-        kernel = pool.kernel_size if isinstance(pool.kernel_size, int) else pool.kernel_size[0]
-        stride = pool.stride if isinstance(pool.stride, int) else pool.stride[0]
-        padding = pool.padding if isinstance(pool.padding, int) else pool.padding[0]
-        spatial = (*spatial[:2], *((n+2*padding-kernel)//stride+1 for n in spatial[2:]))
-        if active and fusion_method == 'conv_plif':
+    def record_fusion(index, spatial, *, full_resolution=False):
+        nonlocal plif_sites, or_comparisons
+        if fusion_method == 'conv_plif':
             fusion = model.bidirectional_fusions[index]
             fusion_input = (batch, spatial[1]*2, *spatial[2:])
-            layers.append({'name': f'bidirectional_fusions.{index}',
+            suffix = '.full_resolution_skip' if full_resolution else ''
+            layers.append({'name': f'bidirectional_fusions.{index}{suffix}',
                            'kind': 'spike_eligible',
                            'macs': convolution_macs(fusion.conv, fusion_input)*z,
                            'input_bchw': list(fusion_input), 'output_hw': list(spatial[2:]),
                            'convolution_calls': z, 'neuron_calls': z})
             plif_sites += batch*z*_product(spatial[1:])
-        elif active and not shared_soma:
+        else:
             or_comparisons += batch*z*_product(spatial[1:])
+
+    spatial = (batch, model.conv_block1.conv.in_channels, h, w)
+    skips = []
+    full_resolution_shape = None
+    pool = model.pool
+    for index in range(3):
+        active = f'conv_block{index+1}' in model.bidirectional_blocks
+        spatial = record(f'conv_block{index+1}', spatial, repeats=2 if active and not shared_soma else 1)
+        if index == 0 and model.full_resolution_skip:
+            full_resolution_shape = spatial
+            if active and not shared_soma:
+                record_fusion(index, spatial, full_resolution=True)
+        kernel = pool.kernel_size if isinstance(pool.kernel_size, int) else pool.kernel_size[0]
+        stride = pool.stride if isinstance(pool.stride, int) else pool.stride[0]
+        padding = pool.padding if isinstance(pool.padding, int) else pool.padding[0]
+        spatial = (*spatial[:2], *((n+2*padding-kernel)//stride+1 for n in spatial[2:]))
+        if active and not shared_soma:
+            record_fusion(index, spatial)
         skips.append(spatial)
+    temporal = {'enabled': model.temporal_mamba_enabled}
+    temporal_macs = 0
+    if model.temporal_mamba_enabled:
+        channels, height, width = spatial[1:]
+        settings = model.options['temporal_mamba_options']
+        inner = channels * settings['expand']
+        rank = math.ceil(channels / 16) if settings['dt_rank'] == 'auto' else settings['dt_rank']
+        sites = batch * height * width * z
+        projection_macs = sites * (3 * channels * inner + inner * (2 * rank + 2 * settings['d_state']))
+        conv_macs = sites * inner * settings['d_conv']
+        temporal_macs = projection_macs + conv_macs
+        temporal.update(sequence_btc=[batch * height * width, z, channels],
+                        parameters=sum(p.numel() for p in model.bottleneck_mamba.parameters()),
+                        linear_projection_macs=projection_macs, causal_conv1d_macs=conv_macs,
+                        selective_scan_operations='not estimated',
+                        scope='dense projection/conv MACs only; excludes selective scan, normalization, SiLU, gates and residual')
     for index in range(1, 4):
         spatial = record(f'deconv_block{index}', spatial)
+        if index == 3 and model.full_resolution_skip:
+            spatial = (batch, spatial[1]+full_resolution_shape[1], *spatial[2:])
         spatial = record(f'deconv{index}_conv', spatial)
         if index < 3:
             skip = skips[2-index]
@@ -234,9 +276,15 @@ def estimate_cost(model, shape=(81, 128, 128), batch=1):
     return {
         'shape_zyx': list(shape), 'padded_shape_zyx': [z, h, w], 'batch': batch,
         'bidirectional': bi, 'bidirectional_fusion': fusion_method,
+        'full_resolution_skip': model.full_resolution_skip,
+        'temporal_mamba': temporal,
+        'previous_probability_feedback': model.previous_probability_feedback_enabled,
+        'feedback_sigmoid_elements': batch*z*3*shape[1]*shape[2] if model.previous_probability_feedback_enabled else 0,
         'binary_or_comparisons': or_comparisons,
         'actual_parameters': parameters, 'parameter_formula': formula,
-        'dense_equivalent_macs': continuous+eligible+ssn_linear,
+        'dense_equivalent_macs': continuous+eligible+ssn_linear+temporal_macs,
+        'dense_equivalent_macs_is_partial': model.temporal_mamba_enabled or model.previous_probability_feedback_enabled,
+        'continuous_temporal_mamba_macs': temporal_macs,
         'continuous_input_macs': continuous, 'continuous_ssn_linear_macs': ssn_linear,
         'spike_eligible_dense_macs': eligible,
         'theoretical_ac_at_unit_activity': eligible,
@@ -245,7 +293,10 @@ def estimate_cost(model, shape=(81, 128, 128), batch=1):
         'ssn_elementwise_additions': sum(r['elementwise_additions'] for r in ssn),
         'plif_update_elements_including_continuous_head': plif_sites,
         'layers': layers, 'ssn': ssn,
-        'scope': 'forward only; batch=2 is training forward, excludes backward/optimizer',
+        'scope': 'forward only; batch=2 is training forward, excludes backward/optimizer' + (
+            '; Mamba selective scan, normalization, SiLU, gates and residual are not counted'
+            if model.temporal_mamba_enabled else '') + (
+            '; feedback sigmoid/concatenation are not counted' if model.previous_probability_feedback_enabled else ''),
     }
 
 
@@ -257,8 +308,9 @@ def theoretical_3d_comparator(model, shape=(81, 128, 128), batch=1):
     to a multiple of eight, crop logits. This is NOT an nnU-Net benchmark.
     """
     dims = tuple(math.ceil(n/model.multiple)*model.multiple for n in shape)
-    spatial = (batch, 4, *dims)
+    spatial = (batch, model.conv_block1.conv.in_channels, *dims)
     layers, skips = [], []
+    full_resolution_shape = None
     params = 0
 
     def record(name, incoming):
@@ -284,10 +336,14 @@ def theoretical_3d_comparator(model, shape=(81, 128, 128), batch=1):
     scale = model.options['pool']['stride']
     for i in range(1, 4):
         spatial = record(f'conv_block{i}', spatial)
+        if i == 1 and model.full_resolution_skip:
+            full_resolution_shape = spatial
         spatial = (*spatial[:2], *(n//scale for n in spatial[2:]))
         skips.append(spatial)
     for i in range(1, 4):
         spatial = record(f'deconv_block{i}', spatial)
+        if i == 3 and model.full_resolution_skip:
+            spatial = (batch, spatial[1]+full_resolution_shape[1], *spatial[2:])
         spatial = record(f'deconv{i}_conv', spatial)
         if i < 3:
             spatial = record(f'concat{i}_conv',
@@ -300,7 +356,9 @@ def theoretical_3d_comparator(model, shape=(81, 128, 128), batch=1):
             'deconv_kernel_zyx': [model.options['deconv']['kernel_size']]*3,
             'parameters_theoretical': params, 'dense_equivalent_macs': sum(r['macs'] for r in layers),
             'spike_eligible_dense_macs': 0, 'layers': layers,
-            'scope': 'theoretical continuous 3D CNN forward, not measured nnU-Net'}
+            'scope': 'theoretical continuous 3D CNN forward, not measured nnU-Net; excludes temporal Mamba' + (
+                '; seven-channel inputs supplied externally, autoregressive feedback not modeled'
+                if model.previous_probability_feedback_enabled else '')}
 
 
 def activity_record(layer, x):

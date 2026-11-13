@@ -142,25 +142,40 @@ class PaperUNet(FP32Module):
         self.bidirectional_fusion = normalize_bidirectional_fusion(bidirectional_fusion, enabled=bidirectional)
         self.options = paper_options(options)
         opts = self.options
+        self.full_resolution_skip = opts['full_resolution_skip']
+        self.temporal_mamba_enabled = opts['temporal_mamba']
+        self.previous_probability_feedback_enabled = opts['previous_probability_feedback']
+        self.previous_probability_feedback_detach = opts['previous_probability_feedback_detach']
+        if self.previous_probability_feedback_enabled:
+            if bidirectional:
+                raise ValueError('previous_probability_feedback requires bidirectional=false')
+            if out_channels != 3:
+                raise ValueError('previous_probability_feedback requires three output regions [WT, TC, ET]')
         validate_shared_soma_options(opts, enabled=bidirectional, fusion=self.bidirectional_fusion)
         self.bidirectional_blocks = bidirectional_blocks(opts, enabled=bidirectional)
         shared_soma = bidirectional and self.bidirectional_fusion == 'Shared_SOMA'
         e1, e2, e3 = opts['encoder_channels']
         d1, d2, d3 = opts['decoder_channels']
         for name, incoming, outgoing, up in (
-            ('conv_block1', 4, e1, False), ('conv_block2', e1, e2, False),
+            ('conv_block1', 7 if self.previous_probability_feedback_enabled else 4, e1, False),
+            ('conv_block2', e1, e2, False),
             ('conv_block3', e2, e3, False), ('deconv_block1', e3, d1, True),
             ('deconv1_conv', d1, d1, False), ('concat1_conv', e2+d1, d1, False),
             ('deconv_block2', d1, d2, True), ('deconv2_conv', d2, d2, False),
             ('concat2_conv', e1+d2, d2, False), ('deconv_block3', d2, d3, True),
-            ('deconv3_conv', d3, d3, False)):
+            ('deconv3_conv', d3 + (e1 if self.full_resolution_skip else 0), d3, False)):
             setattr(self, name, PaperBlock(
                 name, incoming, outgoing, opts, deconv=up,
                 shared_soma=shared_soma and name in self.bidirectional_blocks))
         self.class_conv = PaperBlock('class_conv', d3, out_channels, opts, head=True)
+        if self.previous_probability_feedback_enabled:
+            with torch.no_grad():
+                self.conv_block1.conv.weight[:, 4:].zero_()
+            self.conv_block1.conv.register_load_state_dict_pre_hook(self._load_feedback_input_weights)
         self.pool = nn.MaxPool2d(**opts['pool'])
         self.multiple = opts['pool']['stride'] ** 3
         self._next_step = None
+        self._previous_probabilities = None
         if bidirectional and not shared_soma:
             self.bidirectional_fusions = nn.ModuleList(
                 (PaperStageFusion(channels, opts['neurons']['plif'], opts['normalization'])
@@ -176,6 +191,24 @@ class PaperUNet(FP32Module):
             with torch.random.fork_rng(devices=devices):
                 self.auxiliary_heads.extend((nn.Conv2d(d2, out_channels, 1),
                                              nn.Conv2d(d1, out_channels, 1)))
+        self.bottleneck_mamba = None
+        if self.temporal_mamba_enabled:
+            from snn_nnunet.temporal_bottleneck import TemporalBottleneckMamba
+            self.bottleneck_mamba = TemporalBottleneckMamba(e3, **opts['temporal_mamba_options'])
+
+    @staticmethod
+    def _load_feedback_input_weights(module, state_dict, prefix, local_metadata,
+                                    strict, missing_keys, unexpected_keys, error_msgs):
+        """Weight-only warm start: preserve four MRI channels, zero-extend three."""
+        key = prefix + 'weight'
+        incoming = state_dict.get(key)
+        expected = module.weight.shape
+        if (isinstance(incoming, torch.Tensor) and incoming.ndim == 4
+                and incoming.shape[1] == 4 and expected[1] == 7
+                and incoming.shape[0] == expected[0] and incoming.shape[2:] == expected[2:]):
+            extended = incoming.new_zeros(expected)
+            extended[:, :4] = incoming
+            state_dict[key] = extended
 
     def _segmentation_outputs(self, logits, auxiliary, spatial_shape):
         main = torch.stack(logits, dim=2)
@@ -209,11 +242,16 @@ class PaperUNet(FP32Module):
         for cell, snapshot in activity:
             cell._activity = snapshot
         self._next_step = None
+        self._previous_probabilities = None
 
     def detach_states(self):
         for module in self.modules():
             if isinstance(module, (PLIFNode, SelectiveMultiTimescaleLIF)):
                 module.detach()
+        # Truncated-BPTT optimizer boundaries also end the feedback graph,
+        # including when prediction gradients are enabled inside each window.
+        if self._previous_probabilities is not None:
+            self._previous_probabilities = self._previous_probabilities.detach()
 
     def recurrent_states(self):
         """Named live states, including selective memories, soma and readout."""
@@ -244,25 +282,31 @@ class PaperUNet(FP32Module):
         h, w = x_win.shape[-2:]
         sequence = F.pad(x_win, (0, (-w) % self.multiple, 0, (-h) % self.multiple))
         stages = []
+        full_resolution = None
         for index in range(1, 4):
             block = getattr(self, f'conv_block{index}')
+            binary_bottleneck = self.temporal_mamba_enabled and index == 3
             # Exactly one ConvBlock per actual stage: its input is shared by
             # both directions. Later blocks with directional inputs cannot cache.
             currents = tuple(block.project(sequence[:, z]) for z in range(sequence.shape[1]))
             if f'conv_block{index}' not in self.bidirectional_blocks:
-                spikes = self._scan_stage(block, currents)
+                spikes = self._scan_stage(block, currents, apply_dropout=not binary_bottleneck)
+                if index == 1 and self.full_resolution_skip:
+                    full_resolution = spikes
                 sequence = self.pool(spikes.flatten(0, 1)).unflatten(0, spikes.shape[:2])
                 stages.append(sequence)
                 continue
             if self.bidirectional_fusion == 'Shared_SOMA':
                 spikes = block.spike_neurons(torch.stack(currents, dim=1))
                 sequence = self.pool(spikes.flatten(0, 1)).unflatten(0, spikes.shape[:2])
-                if block.dropout:
+                if block.dropout and not binary_bottleneck:
                     sequence = F.dropout(sequence, block.dropout, self.training)
+                if index == 1 and self.full_resolution_skip:
+                    full_resolution = F.dropout(spikes, block.dropout, self.training) if block.dropout else spikes
                 stages.append(sequence)
                 continue
             fusion = self.bidirectional_fusions[index-1]
-            directional_dropout = self.bidirectional_fusion == 'conv_plif'
+            directional_dropout = self.bidirectional_fusion == 'conv_plif' and not binary_bottleneck
             forward = self._scan_stage(block, currents, apply_dropout=directional_dropout)
             cell = block.spike_neurons
             record = getattr(cell, 'collect_diagnostics', False)
@@ -272,20 +316,34 @@ class PaperUNet(FP32Module):
                 cell._activity = {
                     **{f'forward/{key}': value for key, value in forward_stats.items()},
                     **{f'backward/{key}': value for key, value in cell._activity.items()}}
+            if index == 1 and self.full_resolution_skip:
+                # Reuse the existing fusion weights at the unpooled resolution.
+                # The pooled trunk below retains its original operation order.
+                full_resolution = fusion(forward, backward)
+                if self.bidirectional_fusion == 'or' and block.dropout:
+                    full_resolution = F.dropout(full_resolution, block.dropout, self.training)
             # Pool each aligned direction before fusion. The same fused output
             # feeds the pooled skip/bottleneck and the next encoder stage.
             forward = self.pool(forward.flatten(0, 1)).unflatten(0, forward.shape[:2])
             backward = self.pool(backward.flatten(0, 1)).unflatten(0, backward.shape[:2])
             sequence = fusion(forward, backward)
-            if self.bidirectional_fusion == 'or' and block.dropout:
+            if self.bidirectional_fusion == 'or' and block.dropout and not binary_bottleneck:
                 # OR itself remains binary. Standard inverted dropout is applied
                 # once afterwards, as in the agreed training architecture.
                 sequence = F.dropout(sequence, block.dropout, self.training)
             stages.append(sequence)
+        pool1, pool2, bottleneck = stages
+        if self.temporal_mamba_enabled:
+            bottleneck = self.bottleneck_mamba(bottleneck)
+        return self._decode_sequence(bottleneck, pool1, pool2, full_resolution,
+                                     (h, w), return_auxiliary=return_auxiliary)
+
+    def _decode_sequence(self, bottleneck, pool1, pool2, full_resolution,
+                         spatial_shape, *, return_auxiliary=False):
+        h, w = spatial_shape
         logits = []
         auxiliary = ([], []) if return_auxiliary else None
-        pool1, pool2, bottleneck = stages
-        for z in range(x_win.shape[1]):
+        for z in range(bottleneck.shape[1]):
             x = self.deconv1_conv(self.deconv_block1(bottleneck[:, z], z), z)
             x = self.concat1_conv(torch.cat((pool2[:, z], x), dim=1), z)
             if auxiliary is not None:
@@ -294,9 +352,36 @@ class PaperUNet(FP32Module):
             x = self.concat2_conv(torch.cat((pool1[:, z], x), dim=1), z)
             if auxiliary is not None:
                 auxiliary[0].append(self.auxiliary_heads[0](x))
-            x = self.deconv3_conv(self.deconv_block3(x, z), z)
+            x = self.deconv_block3(x, z)
+            if self.full_resolution_skip:
+                x = torch.cat((full_resolution[:, z], x), dim=1)
+            x = self.deconv3_conv(x, z)
             logits.append(self.class_conv(x, z)[..., :h, :w])
         return self._segmentation_outputs(logits, auxiliary, (h, w))
+
+    def _forward_temporal(self, x_win, *, return_auxiliary=False):
+        """Encode all slices, mix bottleneck depth, then decode matching slices."""
+        h, w = x_win.shape[-2:]
+        full_resolution, pool1, pool2, bottleneck = [], [], [], []
+        for z in range(x_win.shape[1]):
+            x = F.pad(x_win[:, z], (0, (-w) % self.multiple, 0, (-h) % self.multiple))
+            first = self.conv_block1(x, z)
+            first_pool = self.pool(first)
+            second_pool = self.pool(self.conv_block2(first_pool, z))
+            # Preserve binary spikes for Mamba: inverted post-spike dropout
+            # would rescale surviving ones. Surrogate gradients stay intact.
+            third = self.conv_block3.activate(self.conv_block3.project(second_pool),
+                                              z, apply_dropout=False)
+            if self.full_resolution_skip:
+                full_resolution.append(first)
+            pool1.append(first_pool)
+            pool2.append(second_pool)
+            bottleneck.append(self.pool(third))
+        mixed = self.bottleneck_mamba(torch.stack(bottleneck, dim=1))
+        return self._decode_sequence(
+            mixed, torch.stack(pool1, dim=1), torch.stack(pool2, dim=1),
+            torch.stack(full_resolution, dim=1) if self.full_resolution_skip else None,
+            (h, w), return_auxiliary=return_auxiliary)
 
     @fp32_forward
     def forward(self, x_win, t0=0, *, return_auxiliary=False):
@@ -308,12 +393,13 @@ class PaperUNet(FP32Module):
             raise ValueError('return_auxiliary must be boolean')
         if return_auxiliary and not self.deep_supervision_enabled:
             raise ValueError('return_auxiliary requires deep_supervision.enabled')
-        if self.bidirectional:
+        if self.bidirectional or self.temporal_mamba_enabled:
             if t0 != 0:
-                raise ValueError('bidirectional mode requires a whole independent patch with t0=0')
+                raise ValueError('bidirectional/temporal Mamba mode requires a whole independent patch with t0=0')
             self.reset_states()
             try:
-                return self._forward_bidirectional(x_win, return_auxiliary=return_auxiliary)
+                forward = self._forward_bidirectional if self.bidirectional else self._forward_temporal
+                return forward(x_win, return_auxiliary=return_auxiliary)
             finally:
                 self.reset_states(preserve_diagnostics=True)
         if t0 == 0:
@@ -322,12 +408,24 @@ class PaperUNet(FP32Module):
             raise ValueError('Expected consecutive windows; start new sequences with t0=0')
         h, w = x_win.shape[-2:]
         ph, pw = (-h) % self.multiple, (-w) % self.multiple
+        if self.previous_probability_feedback_enabled:
+            expected = (x_win.shape[0], 3, h, w)
+            if self._previous_probabilities is None:
+                self._previous_probabilities = x_win.new_zeros(expected)
+            elif (self._previous_probabilities.shape != expected
+                  or self._previous_probabilities.device != x_win.device):
+                raise ValueError('previous_probability_feedback continuation shape/device mismatch; '
+                                 'start an independent sequence with t0=0')
         logits = []
         auxiliary = ([], []) if return_auxiliary else None
         for i in range(x_win.shape[1]):
             t = t0+i
-            x = F.pad(x_win[:, i], (0, pw, 0, ph))
-            pool1 = self.pool(self.conv_block1(x, t))
+            x = x_win[:, i]
+            if self.previous_probability_feedback_enabled:
+                x = torch.cat((x, self._previous_probabilities), dim=1)
+            x = F.pad(x, (0, pw, 0, ph))
+            first_encoder = self.conv_block1(x, t)
+            pool1 = self.pool(first_encoder)
             pool2 = self.pool(self.conv_block2(pool1, t))
             x = self.pool(self.conv_block3(pool2, t))
             x = self.deconv1_conv(self.deconv_block1(x, t), t)
@@ -338,7 +436,15 @@ class PaperUNet(FP32Module):
             x = self.concat2_conv(torch.cat((pool1, x), dim=1), t)
             if auxiliary is not None:
                 auxiliary[0].append(self.auxiliary_heads[0](x))
-            x = self.deconv3_conv(self.deconv_block3(x, t), t)
-            logits.append(self.class_conv(x, t)[..., :h, :w])
+            x = self.deconv_block3(x, t)
+            if self.full_resolution_skip:
+                x = torch.cat((first_encoder, x), dim=1)
+            x = self.deconv3_conv(x, t)
+            current_logits = self.class_conv(x, t)[..., :h, :w]
+            logits.append(current_logits)
+            if self.previous_probability_feedback_enabled:
+                probabilities = torch.sigmoid(current_logits)
+                self._previous_probabilities = (probabilities.detach()
+                    if self.previous_probability_feedback_detach else probabilities)
         self._next_step = t0+x_win.shape[1]
         return self._segmentation_outputs(logits, auxiliary, (h, w))

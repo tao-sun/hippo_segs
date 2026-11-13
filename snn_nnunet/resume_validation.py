@@ -1,4 +1,4 @@
-"""Continuous LR extensions and full-volume validation at completed epoch boundaries."""
+"""Continuous LR extensions and periodic full-volume validation of the patch best."""
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -100,7 +100,7 @@ def save_completed_checkpoint(trainer, path: Path) -> None:
 
 @contextmanager
 def _preserve_training_state(trainer):
-    mode = trainer.network.training
+    modes = [(module, module.training) for module in trainer.network.modules()]
     python_state = random.getstate()
     numpy_state = np.random.get_state()
     torch_state = torch.get_rng_state()
@@ -108,13 +108,53 @@ def _preserve_training_state(trainer):
     try:
         yield
     finally:
-        trainer.network.train(mode)
+        for module, mode in modes:
+            module.training = mode
         random.setstate(python_state)
         np.random.set_state(numpy_state)
         torch.set_rng_state(torch_state)
         if cuda_states is not None:
             torch.cuda.set_rng_state_all(cuda_states)
             torch.cuda.empty_cache()
+
+
+@contextmanager
+def _temporary_network_weights(network, weights):
+    """Swap only model tensors; never restore optimizer, logger or training epoch."""
+    from torch._dynamo import OptimizedModule
+
+    module = network._orig_mod if isinstance(network, OptimizedModule) else network
+    original = module.state_dict()
+    saved = original.copy()
+    if hasattr(original, '_metadata'):
+        saved._metadata = deepcopy(original._metadata)
+    for name, tensor in original.items():
+        saved[name] = (tensor.detach().to('cpu', copy=True) if isinstance(tensor, torch.Tensor)
+                       else deepcopy(tensor))
+    # Live nonpersistent buffers are absent from state_dict, but inference may
+    # mutate them or replace them with different shapes.
+    transient_buffers = [
+        (child, name, child._buffers[name],
+         child._buffers[name].detach().to('cpu', copy=True)
+         if isinstance(child._buffers[name], torch.Tensor) else None)
+        for child in module.modules() for name in child._non_persistent_buffers_set
+        if name in child._buffers
+    ]
+    normalized = {
+        (name[7:] if name not in original and name.startswith('module.') else name): tensor
+        for name, tensor in weights.items()
+    }
+    try:
+        module.load_state_dict(normalized, strict=True)
+        yield
+    finally:
+        # load_state_dict can partially update weights before reporting a key or
+        # shape mismatch. Restore even when loading or inference raises.
+        module.load_state_dict(saved, strict=True)
+        for child, name, buffer, value in transient_buffers:
+            if buffer is not None:
+                buffer.copy_(value)
+            child._buffers[name] = buffer
 
 
 def _write_json(path: Path, data: dict) -> None:
@@ -138,7 +178,17 @@ class PeriodicFullValidation:
                 or any(type(value) is not int or value <= 0 for value in patch_size)):
             raise ValueError('Validation patch must contain three positive integers')
         self.patch_size = tuple(patch_size)
-        self.root = Path(trainer.output_folder) / 'validation_periodic'
+        dataset_base = getattr(trainer, 'preprocessed_dataset_folder_base', None)
+        patient_wise = (dataset_base is not None and
+                        (Path(dataset_base) / 'patient_partition.json').is_file())
+        # Patient-wise runs monitor their outer test; legacy runs have no
+        # separately defined test cohort and retain full-fold validation.
+        self.subset = 'test' if patient_wise else 'val'
+        self.role = 'monitoring_test' if patient_wise else 'internal_validation'
+        # Keep both the historical current-epoch evaluations and the earlier
+        # best-patch internal-validation protocol distinct from test monitoring.
+        directory = 'testing_periodic_best_patch' if patient_wise else 'validation_periodic_best_patch'
+        self.root = Path(trainer.output_folder) / directory
 
     def validate_current(self):
         trainer = self.trainer
@@ -167,6 +217,14 @@ class PeriodicFullValidation:
         epoch = trainer.current_epoch
         if epoch <= 0 or epoch % self.every:
             return
+        best_path = Path(trainer.output_folder) / 'checkpoint_best.pth'
+        if not best_path.is_file():
+            raise FileNotFoundError(f'Periodic validation requires patch-validation best: {best_path}')
+        selected = torch.load(best_path, map_location='cpu', weights_only=False)
+        checkpoint_epoch = selected['current_epoch']
+        if type(checkpoint_epoch) is not int or not 1 <= checkpoint_epoch <= epoch:
+            raise ValueError('Patch-best checkpoint epoch must be within completed training epochs')
+        patch_ema = float(selected['_best_ema'])
         destination = self.root / f'epoch_{epoch:04d}'
         summary_path = destination / 'summary.json'
         if summary_path.is_file():
@@ -175,28 +233,49 @@ class PeriodicFullValidation:
             except json.JSONDecodeError:
                 saved = {}
             if (saved.get('epoch') == epoch
+                    and saved.get('checkpoint_selection') == 'best_patch_ema'
+                    and saved.get('checkpoint_epoch') == checkpoint_epoch
+                    and saved.get('patch_validation_ema') == patch_ema
+                    and saved.get('settings', {}).get('subset') == self.subset
+                    and Path(saved.get('checkpoint', '')).is_file()
                     and tuple(saved.get('settings', {}).get('patch_size', ())) == self.patch_size):
                 self._update_history()
                 return
-        checkpoint_path = Path(trainer.output_folder) / f'checkpoint_epoch_{epoch:04d}.pth'
-        save_completed_checkpoint(trainer, checkpoint_path)
+        # Retain a recovery point for the current optimizer independently of
+        # the older patch-selected checkpoint used exclusively for inference.
+        save_completed_checkpoint(trainer, Path(trainer.output_folder) / f'checkpoint_epoch_{epoch:04d}.pth')
+        destination.mkdir(parents=True, exist_ok=True)
+        checkpoint_path = destination / 'checkpoint_best_patch.pth'
+        _atomic_checkpoint(checkpoint_path, selected)
         validator = self.validator
         if validator is None:
             from snn_nnunet.custom_full_validation import run_fold_validation
             validator = run_fold_validation
-        trainer.print_to_log_file(f'Full-volume validation with postprocessing: completed epoch {epoch}')
+        trainer.print_to_log_file(
+            f'Full-volume validation with postprocessing: completed epoch {epoch}; '
+            f'evaluating checkpoint_best.pth from completed epoch {checkpoint_epoch} '
+            f'(patch EMA pseudo Dice={patch_ema:.6f}); subset={self.subset}; role={self.role}'
+        )
         with _preserve_training_state(trainer), torch.no_grad():
             network = trainer.network
             if isinstance(network, torch.nn.parallel.DistributedDataParallel):
                 # A rank-zero-only DDP forward would wait for buffer broadcasts.
                 trainer.network = network.module
             try:
-                summary = validator(trainer, output_dir=destination, patch_size=self.patch_size)
+                with _temporary_network_weights(trainer.network, selected['network_weights']):
+                    summary = validator(trainer, output_dir=destination,
+                                        patch_size=self.patch_size, subset=self.subset)
             finally:
                 trainer.network = network
         summary.setdefault('settings', {})['patch_size'] = list(self.patch_size)
+        summary['settings']['subset'] = self.subset
+        summary['evaluation_role'] = self.role
         summary['epoch'] = epoch
         summary['checkpoint'] = str(checkpoint_path)
+        summary['checkpoint_source'] = str(best_path)
+        summary['checkpoint_epoch'] = checkpoint_epoch
+        summary['checkpoint_selection'] = 'best_patch_ema'
+        summary['patch_validation_ema'] = patch_ema
         _write_json(summary_path, summary)
         self._update_history()
         trainer.print_to_log_file(
@@ -233,6 +312,8 @@ class PeriodicFullValidation:
             return
         columns = ['epoch', 'cases', 'raw_WT', 'raw_TC', 'raw_ET', 'raw_mean',
                    'postprocessed_WT', 'postprocessed_TC', 'postprocessed_ET', 'postprocessed_mean', 'checkpoint']
+        columns += ['checkpoint_epoch', 'checkpoint_selection', 'patch_validation_ema', 'checkpoint_source',
+                    'subset', 'evaluation_role']
         columns += ['patients'] + [f'{stage}_per_{unit}_{region}'
                                   for unit in ('volume', 'patient')
                                   for stage in ('raw', 'postprocessed')
@@ -244,6 +325,10 @@ class PeriodicFullValidation:
             writer.writeheader()
             for summary in summaries:
                 row = {'epoch': summary['epoch'], 'cases': len(summary['cases']), 'checkpoint': summary['checkpoint']}
+                row.update({key: summary.get(key, '') for key in
+                            ('checkpoint_epoch', 'checkpoint_selection', 'patch_validation_ema',
+                             'checkpoint_source', 'evaluation_role')})
+                row['subset'] = summary.get('settings', {}).get('subset', self.subset)
                 for stage in ('raw', 'postprocessed'):
                     row.update({f'{stage}_{region}': summary['mean'][stage][region]
                                 for region in ('WT', 'TC', 'ET', 'mean')})
@@ -257,6 +342,10 @@ class PeriodicFullValidation:
                     row['patients'] = summary['counts']['patients']
                 writer.writerow(row)
         os.replace(temporary, destination)
+        # Monitoring test scores never select a checkpoint. The global patch
+        # EMA remains the sole criterion for checkpoint_best.pth.
+        if self.subset == 'test':
+            return
         best = max(summaries, key=lambda s: s['mean']['postprocessed']['mean'])
         best_checkpoint = Path(self.trainer.output_folder) / 'checkpoint_best_postprocessed.pth'
         temporary_checkpoint = best_checkpoint.with_suffix('.pth.tmp')
@@ -264,6 +353,8 @@ class PeriodicFullValidation:
         os.replace(temporary_checkpoint, best_checkpoint)
         _write_json(self.root / 'best_postprocessed.json', {
             'epoch': best['epoch'], 'mean': best['mean'], 'checkpoint': str(best_checkpoint),
+            **{key: best[key] for key in ('checkpoint_epoch', 'checkpoint_selection', 'patch_validation_ema',
+                                         'checkpoint_source') if key in best},
             **{key: best[key] for key in ('mean_per_volume', 'mean_per_patient', 'counts') if key in best},
         })
 
@@ -274,6 +365,9 @@ def install_periodic_validation(trainer, every: int, validator=None, patch_size=
     if existing is not None:
         existing.every = controller.every
         existing.patch_size = controller.patch_size
+        existing.subset = controller.subset
+        existing.role = controller.role
+        existing.root = controller.root
         if validator is not None:
             existing.validator = validator
         return existing

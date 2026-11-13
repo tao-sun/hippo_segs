@@ -7,7 +7,7 @@ family: snn
 dataset_id: 1
 fold: 0
 gpus: 1
-run_dir: /gpfs/scratch1/shared/apiaghiardelli/SSMLIF_01_pw_ds/outer_fold_0
+run_dir: /gpfs/scratch1/shared/apiaghiardelli/PLIF_01_pw_ds_tm/outer_fold_0
 # Patient-wise outer test; 10% of the other four folds is internal validation.
 data_partition: /gpfs/home6/apiaghiardelli/hippo_segs/data_partitions/brats24_patient_seed42
 snn:
@@ -17,6 +17,7 @@ snn:
   deterministic: true
   augmentation_workers: 8
   lr: 0.01
+  batch_size: 4
   # Baseline originale: 50; validazione del fold completo ogni 50 epoche. 0 la disabilita.
   validation_every: 50
   temporal_axis: 0
@@ -24,18 +25,18 @@ snn:
   variant: paper_unet
   bidirectional: false
   bidirectional_fusion: Shared_SOMA
-  epochs: 400
+  epochs: 300
   # Minibatch per epoca e per GPU; riduci entrambi per prove rapide.
   train_batches_per_epoch: 250  # Baseline originale: 250 minibatch per epoca e per GPU.
   val_batches_per_epoch: 50  # Baseline originale: 50 minibatch per epoca e per GPU.
   # Baseline originale: false; true salta entrambe le validazioni complete a fine training.
   skip_final_validation: false
   training_patch_size:
-  - 81
+  - 128
   - 128
   - 128
   validation_patch_size:
-  - 81
+  - 128
   - 128
   - 128
   k: 81
@@ -44,6 +45,14 @@ snn:
   fptt_rho: 0.0
   fptt_lambda: 2.0
   paper_unet:
+    # Skip from encoder conv_block1 before pooling into the final decoder convolution.
+    full_resolution_skip: true
+    # true: encode all slices, temporal Mamba, then decode; false: current baseline.
+    temporal_mamba: true
+    # Autoregressive feedback requires temporal_mamba: false and bidirectional: false.
+    previous_probability_feedback: false
+    previous_probability_feedback_detach: true
+    previous_probability_feedback_init: zeros
     # Teste ausiliarie solo durante il training; ordine: finale, meta, quarto.
     deep_supervision:
       enabled: true
@@ -127,10 +136,10 @@ snn:
         gate_init: zeros
         static_gate_init: 0.5
         fusion: weighted_sum
-      overrides:
-        conv_block1: selective_multitimescale_lif
-        conv_block2: selective_multitimescale_lif
-        conv_block3: selective_multitimescale_lif
+      # overrides:
+      #   conv_block1: selective_multitimescale_lif
+      #   conv_block2: selective_multitimescale_lif
+      #   conv_block3: selective_multitimescale_lif
     head:
       kernel_size: 3
       padding: 1

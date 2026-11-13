@@ -1,4 +1,4 @@
-"""Paper U-Net losses on full-resolution or native-scale region targets."""
+"""Per-slice model losses on full-resolution or native-scale region targets."""
 import math
 
 import torch.nn.functional as F
@@ -19,8 +19,8 @@ def deep_supervision_loss(outputs, target, loss, weights, *, temporal_axis=0, sp
         raise ValueError('deep supervision requires three positive finite loss weights')
     if type(temporal_axis) is not int or temporal_axis not in (0, 1, 2):
         raise ValueError('temporal_axis must be 0, 1 or 2')
-    if type(spatial_stride) is not int or spatial_stride < 2:
-        raise ValueError('spatial_stride must be an integer >= 2')
+    if type(spatial_stride) is not int or spatial_stride < 1:
+        raise ValueError('spatial_stride must be an integer >= 1')
     if target.ndim != 5 or any(output.ndim != 5 for output in outputs):
         raise ValueError('deep supervision requires [B, C, X, Y, Z] tensors')
     if outputs[0].shape[0] != target.shape[0] or outputs[0].shape[2:] != target.shape[2:]:

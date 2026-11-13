@@ -1,0 +1,62 @@
+# Same nnU-Net pipeline as unet_config.yaml; choose the dedicated Arch2 variant.
+family: snn
+dataset_id: 1
+fold: 0
+gpus: 1
+run_dir: /gpfs/scratch1/shared/apiaghiardelli/spkMAMBA_01_pw/outer_fold_0
+data_partition: data_partitions/brats24_patient_seed42
+snn:
+  variant: arch2
+  seed: 42
+  deterministic: true
+  augmentation_workers: 8
+  lr: 0.01
+  batch_size: 2
+  epochs: 300
+  temporal_axis: 0
+  k: 128
+  use_fptt: false
+  fptt_alpha: 0.5
+  fptt_beta: 0.5
+  fptt_rho: 0.0
+  fptt_lambda: 2.0
+  overfit_num_volumes: 0
+  train_batches_per_epoch: 250
+  val_batches_per_epoch: 50
+  validation_every: 50
+  skip_final_validation: false
+  training_patch_size: [128, 128, 128]
+  validation_patch_size: [128, 128, 128]
+  arch2:
+    # Conv2D kernel=stride=p at all three stages; this is not the 3D training patch.
+    patch_size: 2
+    encoder:
+      channels: [32, 64, 128]
+      # Optional neurons: false replaces PLIF with GELU, keeping GroupNorm.
+      patch_embedding_spiking: true
+      dwconv2d_spiking: true
+      # Activation at the end of every VSS, after residual + GroupNorm.
+      # false uses GELU; this output also feeds the skip and next patch embedding.
+      vss_output_spiking: true
+    decoder:
+      channels: [128, 128, 128]  # deepest to full resolution
+      spiking: true             # independent from optional encoder neurons
+    # Same decoder supervision as paper_unet: main, half, quarter logits.
+    deep_supervision:
+      enabled: true
+      weights: [1.0, 0.5, 0.25]
+      resolution: native
+    ssm:
+      d_state: 16
+      expand: 2
+      dt_rank: auto
+      dwconv2d_kernel_size: 3
+      linear_projection: true
+      residual_connections: true
+    neurons:
+      init_tau: 2.0
+      surrogate_alpha: 2.0
+      v_threshold: 1.0
+      v_reset: 0.0
+      detach_reset: true
+    dropout: 0.1

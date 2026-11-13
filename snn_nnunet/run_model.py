@@ -87,6 +87,8 @@ def _validate_experiment(config: dict[str, Any]) -> dict[str, Any]:
         snn = config.get("snn")
         if not isinstance(snn, dict):
             raise ValueError("snn settings must be a YAML mapping")
+        if snn.get('variant') != 'arch2' and 'arch2' in snn:
+            raise ValueError('snn.arch2 requires snn.variant: arch2')
         if snn.get("variant") == "paper_unet" and config.keys() - {"family", "dataset_id", "fold", "gpus", "run_dir", "snn", "data_partition"}:
             raise ValueError("paper_unet: unknown top-level experiment options")
         if snn.get("variant") != "paper_unet" and "paper_unet" in snn:
@@ -94,15 +96,15 @@ def _validate_experiment(config: dict[str, Any]) -> dict[str, Any]:
         if snn.get('bidirectional', False) and snn.get('variant') != 'paper_unet':
             raise ValueError('bidirectional requires snn.variant: paper_unet')
         from snn_nnunet.config_layout import normalize_snn_layout
-        snn = config["snn"] = (dict(snn) if snn.get("variant") == "paper_unet"
+        snn = config["snn"] = (dict(snn) if snn.get("variant") in {"paper_unet", "arch2"}
                                 else normalize_snn_layout(snn))
         from snn_nnunet.reproducibility import validate_policy
         snn.setdefault('seed', 42)
         snn.setdefault('deterministic', True)
         snn.setdefault('augmentation_workers', 8)
         validate_policy(snn['seed'], snn['deterministic'], snn['augmentation_workers'])
-        if snn.get("variant") not in {"orig", "shallow", "medium", "deep", "paper_unet"}:
-            raise ValueError("snn.variant must be orig, shallow, medium, deep, or paper_unet")
+        if snn.get("variant") not in {"orig", "shallow", "medium", "deep", "paper_unet", "arch2"}:
+            raise ValueError("snn.variant must be orig, shallow, medium, deep, paper_unet, or arch2")
         _integer(snn, "temporal_axis", 0, 2)
         _integer(snn, "k", 1, 4096)
         snn.setdefault("lr", 0.01)
@@ -116,6 +118,8 @@ def _validate_experiment(config: dict[str, Any]) -> dict[str, Any]:
             snn.setdefault(name, default)
             if type(snn[name]) is not int or snn[name] <= 0:
                 raise ValueError(f"snn.{name} must be a positive integer")
+        if 'batch_size' in snn and (type(snn['batch_size']) is not int or snn['batch_size'] <= 0):
+            raise ValueError('snn.batch_size must be a positive integer')
         snn.setdefault("overfit_num_volumes", 0)
         if type(snn["overfit_num_volumes"]) is not int or snn["overfit_num_volumes"] < 0:
             raise ValueError("snn.overfit_num_volumes must be a nonnegative integer")
@@ -139,11 +143,36 @@ def _validate_experiment(config: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("snn.validation_patch_size must contain three positive integers")
         if type(snn.get("use_fptt")) is not bool:
             raise ValueError("snn.use_fptt must be true or false")
+        if snn['variant'] == 'arch2':
+            from snn_nnunet.arch2_config import arch2_options
+            from snn_nnunet.network_adapter import SNNConfig
+            from snn_nnunet.prepare_plans import DEFAULT_SNN_CONFIG
+            allowed = {'variant', 'arch2', 'temporal_axis', 'k', 'use_fptt', 'epochs', 'lr',
+                       'overfit_num_volumes', 'skip_final_validation', 'train_batches_per_epoch',
+                       'val_batches_per_epoch', 'batch_size', 'training_patch_size',
+                       'validation_every', 'validation_patch_size', 'seed', 'deterministic',
+                       'augmentation_workers', 'fptt_alpha', 'fptt_beta', 'fptt_rho', 'fptt_lambda'}
+            if snn.keys() - allowed:
+                raise ValueError(f'arch2: incompatible/unknown snn options {sorted(snn.keys() - allowed)}')
+            if config.keys() - {'family', 'dataset_id', 'fold', 'gpus', 'run_dir', 'snn', 'data_partition'}:
+                raise ValueError('arch2: unknown top-level experiment options')
+            effective = deepcopy(DEFAULT_SNN_CONFIG)
+            for key in ('fptt_alpha', 'fptt_beta', 'fptt_rho', 'fptt_lambda'):
+                snn.setdefault(key, effective[key])
+                effective[key] = snn[key]
+            effective.update(model_name='arch2', model_kwargs=arch2_options(snn.get('arch2', {})),
+                             temporal_axis=snn['temporal_axis'], k=snn['k'], use_fptt=snn['use_fptt'],
+                             num_epochs=snn['epochs'], initial_lr=snn['lr'])
+            effective.update({key: snn[key] for key in (
+                'overfit_num_volumes', 'train_batches_per_epoch', 'val_batches_per_epoch',
+                'validation_every', 'validation_patch_size', 'seed', 'deterministic', 'augmentation_workers')})
+            snn['arch2'] = dict(SNNConfig.from_plans({'snn_config': effective}).model_kwargs)
+            return config
         if snn["variant"] == "paper_unet":
             from snn_nnunet.paper_config import paper_options
             from snn_nnunet.network_adapter import SNNConfig
             from snn_nnunet.prepare_plans import DEFAULT_SNN_CONFIG
-            allowed = {"overfit_num_volumes", "skip_final_validation", "train_batches_per_epoch", "val_batches_per_epoch", "variant", "epochs", "lr", "training_patch_size", "validation_every",
+            allowed = {"overfit_num_volumes", "skip_final_validation", "train_batches_per_epoch", "val_batches_per_epoch", "batch_size", "variant", "epochs", "lr", "training_patch_size", "validation_every",
                        "validation_patch_size", "temporal_axis", "k", "use_fptt", "paper_unet",
                        "fptt_alpha", "fptt_beta", "fptt_rho", "fptt_lambda",
                        "seed", "deterministic", "augmentation_workers", "bidirectional", "bidirectional_fusion"}
@@ -274,12 +303,13 @@ def _require_preprocessed_configuration(
         )
 
 
-def _paper_training_args(config):
-    """Use the same native training command, with paper-only architecture settings."""
+def _dedicated_training_args(config):
+    """Use native training with one self-contained architecture mapping."""
     snn = config["snn"]
+    variant = snn['variant']
     args = ["train", "--dataset-id", str(config["dataset_id"]), "--fold", str(config["fold"]),
             "--run-dir", str(config["run_dir"]), "--gpus", str(config["gpus"]),
-            "--model", "paper_unet", "--paper-unet", json.dumps(snn["paper_unet"]),
+            "--model", variant, "--" + variant.replace('_', '-'), json.dumps(snn[variant]),
             "--temporal-axis", str(snn["temporal_axis"]), "--k", str(snn["k"]),
             "--epochs", str(snn["epochs"]), "--lr", str(snn["lr"]),
             "--overfit-num-volumes", str(snn["overfit_num_volumes"]),
@@ -290,15 +320,23 @@ def _paper_training_args(config):
             "--validation-every", str(snn["validation_every"]),
             "--validation-patch-size", *map(str, snn["validation_patch_size"]),
             "--fptt" if snn["use_fptt"] else "--no-fptt"]
-    args.append('--bidirectional' if snn['bidirectional'] else '--no-bidirectional')
-    args.extend(['--bidirectional-fusion', snn['bidirectional_fusion']])
+    if variant == 'paper_unet':
+        args.append('--bidirectional' if snn['bidirectional'] else '--no-bidirectional')
+        args.extend(['--bidirectional-fusion', snn['bidirectional_fusion']])
     for key in ("fptt_alpha", "fptt_beta", "fptt_rho", "fptt_lambda"):
         args.extend(["--" + key.replace("_", "-"), str(snn[key])])
     if snn.get("training_patch_size") is not None:
         args.extend(["--training-patch-size", *map(str, snn["training_patch_size"])])
+    if 'batch_size' in snn:
+        args.extend(['--batch-size', str(snn['batch_size'])])
     if snn["skip_final_validation"]:
         args.append("--skip-final-validation")
     return args
+
+
+def _paper_training_args(config):
+    """Compatibility wrapper for callers of the paper-specific launcher."""
+    return _dedicated_training_args(config)
 
 
 def run(config_path: Path) -> None:
@@ -357,8 +395,8 @@ def run(config_path: Path) -> None:
         from snn_nnunet import cli
 
         snn = config["snn"]
-        if snn["variant"] == "paper_unet":
-            cli.main(_paper_training_args(config))
+        if snn["variant"] in {"paper_unet", "arch2"}:
+            cli.main(_dedicated_training_args(config))
             return
         architecture_args = (["--skip-final-validation"] if snn["skip_final_validation"] else [])
         architecture_args.extend(["--recurrent-neuron", json.dumps(snn["spatial_mamba"]["recurrent_neuron"])])
@@ -367,6 +405,8 @@ def run(config_path: Path) -> None:
             '--deterministic' if snn['deterministic'] else '--no-deterministic'])
         if snn.get("training_patch_size") is not None:
             architecture_args.extend(["--training-patch-size", *map(str, snn["training_patch_size"])])
+        if 'batch_size' in snn:
+            architecture_args.extend(['--batch-size', str(snn['batch_size'])])
         for key in ("stem_depth", "stem_channels", "downsample_kernel_size", "dwconv2d_kernel_size",
                     "final_skip_fusion", "decoder_block", "neuron_model"):
             architecture_args.extend(["--" + key.replace("_", "-"), str(snn["spatial_mamba"][key])])

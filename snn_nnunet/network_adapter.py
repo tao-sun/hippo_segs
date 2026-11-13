@@ -132,6 +132,11 @@ class SNNConfig:
     def __post_init__(self) -> None:
         object.__setattr__(self, "model_kwargs", MappingProxyType(dict(self.model_kwargs)))
 
+    @property
+    def requires_full_sequence(self) -> bool:
+        return self.bidirectional or (
+            self.model_name == 'paper_unet' and self.model_kwargs.get('temporal_mamba', False))
+
     @classmethod
     def from_plans(cls, plans: Mapping[str, Any]) -> "SNNConfig":
         if not isinstance(plans, Mapping) or "snn_config" not in plans:
@@ -163,14 +168,22 @@ class SNNConfig:
         from snn_nnunet.reproducibility import validate_policy
         validate_policy(data['seed'], data['deterministic'], data['augmentation_workers'])
 
-        if data["model_name"] not in {"orig", "shallow", "medium", "deep", "paper_unet"}:
-            raise ValueError("model_name must be orig, shallow, medium, deep, or paper_unet")
+        if data["model_name"] not in {"orig", "shallow", "medium", "deep", "paper_unet", "arch2"}:
+            raise ValueError("model_name must be orig, shallow, medium, deep, paper_unet, or arch2")
         kwargs = data["model_kwargs"]
         if not isinstance(kwargs, Mapping):
             raise ValueError("model_kwargs must be a mapping")
-        if data["model_name"] == "paper_unet":
+        if data["model_name"] == "arch2":
+            from snn_nnunet.arch2_config import arch2_options
+            kwargs = arch2_options(kwargs)
+        elif data["model_name"] == "paper_unet":
             from snn_nnunet.paper_config import paper_options
             kwargs = paper_options(kwargs)
+            if kwargs['previous_probability_feedback']:
+                if data['bidirectional']:
+                    raise ValueError('previous_probability_feedback requires bidirectional=false')
+                if (data['num_input_channels'], data['num_output_channels']) != (4, 3):
+                    raise ValueError('previous_probability_feedback requires four MRI inputs and three [WT, TC, ET] outputs')
             from snn_nnunet.paper_config import validate_shared_soma_options
             validate_shared_soma_options(
                 kwargs, enabled=data['bidirectional'], fusion=data['bidirectional_fusion'])
@@ -228,17 +241,27 @@ class SNNConfig:
         k = data["k"]
         if type(k) is not int or k <= 0:
             raise ValueError("k must be a positive integer")
-        if data['bidirectional']:
-            data['use_fptt'] = False
+        temporal_mamba = data['model_name'] == 'paper_unet' and kwargs['temporal_mamba']
+        feedback = data['model_name'] == 'paper_unet' and kwargs['previous_probability_feedback']
+        if feedback and plans.get('image_reader_writer') == 'SimpleITKIO':
+            z_axis = plans.get('transpose_forward', [0, 1, 2]).index(0)
+            if axis != z_axis:
+                raise ValueError('previous_probability_feedback temporal_axis must match anatomical Z in the preprocessed SimpleITK plans')
+        if temporal_mamba and data['use_fptt']:
+            raise ValueError('temporal_mamba requires use_fptt=false and full-patch BPTT')
+        if data['bidirectional'] or temporal_mamba:
+            if data['bidirectional']:
+                data['use_fptt'] = False
+            mode = 'bidirectional' if data['bidirectional'] else 'temporal Mamba'
             patch = plans.get('configurations', {}).get('3d_fullres', {}).get('patch_size')
             if patch is not None:
                 if len(patch) != 3 or any(type(n) is not int or n <= 0 for n in patch):
-                    raise ValueError('bidirectional training patch_size must contain three positive integers')
+                    raise ValueError(f'{mode} training patch_size must contain three positive integers')
                 data['k'] = patch[axis]
             if plans.get('image_reader_writer') == 'SimpleITKIO':
                 z_axis = plans.get('transpose_forward', [0, 1, 2]).index(0)
                 if axis != z_axis:
-                    raise ValueError('bidirectional temporal_axis must match anatomical Z in the preprocessed SimpleITK plans')
+                    raise ValueError(f'{mode} temporal_axis must match anatomical Z in the preprocessed SimpleITK plans')
         for name in ("train_batches_per_epoch", "val_batches_per_epoch"):
             if type(data[name]) is not int or data[name] <= 0:
                 raise ValueError(f"{name} must be a positive integer")
@@ -301,6 +324,9 @@ class SNNConfig:
 
 def build_core(config: SNNConfig) -> nn.Module:
     kwargs = dict(config.model_kwargs)
+    if config.model_name == 'arch2':
+        from snn_nnunet.arch2 import Arch2
+        return Arch2(out_channels=config.num_output_channels, **kwargs)
     if config.model_name == "paper_unet":
         from snn_nnunet.paper_unet import PaperUNet
         return PaperUNet(out_channels=config.num_output_channels, bidirectional=config.bidirectional,
@@ -397,17 +423,17 @@ class SNNnnUNetAdapter(FP32Module):
         self._check_input(x)
         if type(return_auxiliary) is not bool:
             raise ValueError('return_auxiliary must be boolean')
-        if return_auxiliary and self.config.model_name != 'paper_unet':
-            raise ValueError('return_auxiliary is supported only for paper_unet')
+        if return_auxiliary and self.config.model_name not in {'paper_unet', 'arch2'}:
+            raise ValueError('return_auxiliary is supported only for paper_unet or arch2')
         size = self.k if chunk_size is None else chunk_size
         if type(size) is not int or size <= 0:
             raise ValueError("chunk_size must be a positive integer")
         length = x.shape[2 + self.temporal_axis]
         if length == 0:
             raise ValueError("temporal dimension must be nonempty")
-        if self.config.bidirectional:
+        if self.config.requires_full_sequence:
             if t0 != 0 or (chunk_size is not None and size < length):
-                raise ValueError('bidirectional mode requires a whole patch, without continuation or truncated chunks')
+                raise ValueError('bidirectional/temporal Mamba mode requires a whole patch, without continuation or truncated chunks')
             return self.forward_window(x, t0=0, return_auxiliary=return_auxiliary)
 
         outputs = []
