@@ -88,6 +88,33 @@ the existing plans value. The active `unet_config.yaml` selects 4. Use a fresh
 editing the YAML does not change running jobs or saved resume plans.
 The LR and minibatch counts per epoch are independent of this setting.
 
+For a global batch of **4** across **two GPUs on one node**, keep
+`snn.batch_size: 4` in the YAML and submit:
+
+```bash
+sbatch --gpus=2 train_validate_snn_brats24_fold0.sbatch
+# Or, for Arch2:
+sbatch --gpus=2 train_arch2.sbatch
+```
+
+Both scripts use one Slurm task. Inside Slurm, the launcher uses the GPUs
+visible to the job and Accelerate starts one process per GPU. nnU-Net splits
+the global minibatch: 1 GPU gets 4 patches, 2 GPUs get 2 each, and 4 GPUs get
+1 each. Outside Slurm, set `gpus: 2` in the YAML as well. With two GPUs,
+`snn.batch_size: 2` would instead mean 1 patch per GPU, 2 globally. DDP
+synchronizes gradients at each backward pass; the SNN trainer can perform
+multiple optimizer updates per spatial patch when it uses temporal windows.
+This does not pool GPU memory: each GPU holds a model replica and its local
+activations.
+
+Rank 0 keeps its stdout/stderr in the Slurm `.out`/`.err` and writes the
+usual nnU-Net training log. Before importing Torch or the trainer, secondary
+ranks redirect output to `<run_dir>/worker_logs/job_<SLURM_JOB_ID>_rank1.out`
+and `.err` (and likewise for higher ranks). Native output and unhandled
+tracebacks are retained there; failures still propagate to Accelerate.
+Logs append on restart. Outside Slurm, `job_local_<parent_pid>_rank1` is used.
+For details from a failed secondary process, inspect its `.err` file.
+
 Set `snn.training_patch_size: [162, 128, 128]` to use the same spatial patch
 size for training and online patch validation. The launcher sets
 `configurations.3d_fullres.patch_size` in the effective plans and saves it

@@ -8,12 +8,31 @@ from __future__ import annotations
 import argparse
 from datetime import timedelta
 import os
+from pathlib import Path
+import sys
 
-import torch
-import torch.distributed as dist
+
+def _redirect_worker_logs():
+    """Keep the primary worker on Slurm streams; retain other ranks' diagnostics."""
+    rank = int(os.environ.get('RANK', os.environ.get('LOCAL_RANK', '0')))
+    if rank == 0:
+        return
+    folder = Path(os.environ['nnUNet_results']) / 'worker_logs'
+    folder.mkdir(parents=True, exist_ok=True)
+    job_id = os.environ.get('SLURM_JOB_ID') or f'local_{os.getppid()}'
+    prefix = folder / f'job_{job_id}_rank{rank}'
+    # Replace descriptors as well as Python output destinations, so native
+    # libraries and child workers inherit the same logs. Append across restarts.
+    for descriptor, stream, extension in ((1, sys.stdout, 'out'), (2, sys.stderr, 'err')):
+        stream.flush()
+        with Path(f'{prefix}.{extension}').open('a', encoding='utf-8') as target:
+            os.dup2(target.fileno(), descriptor)
+        stream.reconfigure(line_buffering=True)
 
 
 def main(argv=None):
+    # Run before imports that can emit initialization messages or tracebacks.
+    _redirect_worker_logs()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--dataset-id', required=True)
     parser.add_argument('--fold', type=int, required=True)
@@ -21,6 +40,9 @@ def main(argv=None):
     parser.add_argument('--save-probabilities', action='store_true')
     parser.add_argument('--skip-final-validation', action='store_true')
     args = parser.parse_args(argv)
+
+    import torch
+    import torch.distributed as dist
 
     from snn_nnunet.cli import configure_runtime
     configure_runtime()
